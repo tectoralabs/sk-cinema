@@ -1,0 +1,8 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Dependency build scripts are blocked unless listed here.
+# esbuild's postinstall only verifies its binary, which already comes from an optional dependency.
+allowBuilds:
+  esbuild: false
