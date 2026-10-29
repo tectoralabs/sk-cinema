@@ -3,3 +3,5 @@ dist
 coverage
 pnpm-lock.yaml
 *.tsbuildinfo
+apps/api/src/generated
+apps/api/prisma/migrations
