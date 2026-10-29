@@ -1,0 +1,170 @@
+// Connection URLs live in prisma.config.ts (migrations) and src/lib/prisma.ts (runtime).
+// All DateTime columns are timestamptz and hold UTC instants; display and date logic use Asia/Colombo.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  EDITOR
+}
+
+enum MovieStatus {
+  UPCOMING
+  NOW_SHOWING
+  ENDED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  STATUS_CHANGE
+  LOGIN
+  LOGOUT
+}
+
+model Admin {
+  id                 String    @id @default(uuid(7)) @db.Uuid
+  /// Stored lowercased.
+  email              String    @unique @db.VarChar(254)
+  name               String    @db.VarChar(100)
+  /// argon2id hash.
+  passwordHash       String
+  role               AdminRole @default(EDITOR)
+  /// Deactivated admins cannot log in or refresh.
+  isActive           Boolean   @default(true)
+  mustChangePassword Boolean   @default(false)
+  failedLoginCount   Int       @default(0)
+  lockedUntil        DateTime? @db.Timestamptz(3)
+  lastLoginAt        DateTime? @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @db.Timestamptz(3)
+
+  refreshTokens   RefreshToken[]
+  auditLogs       AuditLog[]
+  updatedSettings Setting[]
+}
+
+model Movie {
+  id              String      @id @default(uuid(7)) @db.Uuid
+  slug            String      @unique @db.VarChar(160)
+  title           String      @db.VarChar(150)
+  synopsis        String?
+  durationMinutes Int
+  /// e.g. "Sinhala", "Tamil", "English"
+  language        String?     @db.VarChar(50)
+  genres          String[]
+  /// Age certificate, e.g. "PG", "18+"
+  rating          String?     @db.VarChar(20)
+  director        String?     @db.VarChar(150)
+  cast            String[]
+  releaseDate     DateTime?   @db.Date
+  trailerUrl      String?
+  posterUrl       String?
+  posterPublicId  String?
+  bannerUrl       String?
+  bannerPublicId  String?
+  status          MovieStatus @default(UPCOMING)
+  /// false hides the movie publicly without deleting it.
+  isActive        Boolean     @default(true)
+  deletedAt       DateTime?   @db.Timestamptz(3)
+  createdAt       DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime    @updatedAt @db.Timestamptz(3)
+
+  showtimes Showtime[]
+
+  @@index([status])
+}
+
+model Screen {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  name      String    @unique @db.VarChar(50)
+  capacity  Int?
+  isActive  Boolean   @default(true)
+  deletedAt DateTime? @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  showtimes Showtime[]
+}
+
+model Showtime {
+  id                 String    @id @default(uuid(7)) @db.Uuid
+  movieId            String    @db.Uuid
+  screenId           String    @db.Uuid
+  startsAt           DateTime  @db.Timestamptz(3)
+  /// e.g. "2D", "3D"
+  format             String    @default("2D") @db.VarChar(20)
+  /// Must be a validated lk.bookmyshow.com /buytickets/ URL. Takes precedence over the generated link.
+  bookingUrlOverride String?
+  deletedAt          DateTime? @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @db.Timestamptz(3)
+
+  movie  Movie  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  screen Screen @relation(fields: [screenId], references: [id], onDelete: Restrict)
+
+  @@index([startsAt])
+  @@index([movieId, startsAt])
+  @@index([screenId, startsAt])
+}
+
+model Setting {
+  key         String   @id @db.VarChar(100)
+  value       String
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  updatedBy Admin? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+}
+
+model AuditLog {
+  id        String      @id @default(uuid(7)) @db.Uuid
+  /// Null when the actor is unknown (e.g. a login attempt for a non-existent email).
+  adminId   String?     @db.Uuid
+  action    AuditAction
+  /// e.g. "Movie", "Showtime", "Admin"
+  entity    String      @db.VarChar(50)
+  entityId  String?     @db.VarChar(100)
+  /// Changed fields or other context. Never secrets, passwords or tokens.
+  details   Json?
+  ipAddress String?     @db.VarChar(45)
+  userAgent String?     @db.VarChar(500)
+  createdAt DateTime    @default(now()) @db.Timestamptz(3)
+
+  admin Admin? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([adminId, createdAt])
+  @@index([entity, entityId])
+}
+
+model RefreshToken {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  adminId      String    @db.Uuid
+  /// SHA-256 of the token; the raw token is never stored.
+  tokenHash    String    @unique @db.VarChar(64)
+  /// Every token in one rotation chain shares a familyId, so reuse revokes the whole family.
+  familyId     String    @db.Uuid
+  expiresAt    DateTime  @db.Timestamptz(3)
+  revokedAt    DateTime? @db.Timestamptz(3)
+  replacedById String?   @db.Uuid
+  ipAddress    String?   @db.VarChar(45)
+  userAgent    String?   @db.VarChar(500)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+
+  admin Admin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId])
+  @@index([familyId])
+  @@index([expiresAt])
+}

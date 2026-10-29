@@ -6,6 +6,9 @@ dist/
 build/
 *.tsbuildinfo
 
+# Generated Prisma client (run `pnpm --filter api db:generate`)
+apps/api/src/generated/
+
 # Test output
 coverage/
 

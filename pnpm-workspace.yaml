@@ -3,6 +3,10 @@ packages:
   - packages/*
 
 # Dependency build scripts are blocked unless listed here.
-# esbuild's postinstall only verifies its binary, which already comes from an optional dependency.
 allowBuilds:
+  # postinstall only verifies its binary, which already comes from an optional dependency.
   esbuild: false
+  # Downloads Prisma's schema engine, needed by `prisma migrate`.
+  '@prisma/engines': true
+  # preinstall only checks the Node.js version.
+  prisma: true
