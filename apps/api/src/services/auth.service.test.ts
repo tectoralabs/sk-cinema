@@ -1,13 +1,23 @@
+import { randomUUID } from 'node:crypto';
 import { ERROR_CODES } from '@sk-cinema/shared';
 import { adminProfileSchema } from '@sk-cinema/shared';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Admin } from '../generated/prisma/client.js';
+import type { Admin, RefreshToken } from '../generated/prisma/client.js';
 import { AppError } from '../lib/errors.js';
 import type * as PasswordModule from '../lib/password.js';
 import { hashPassword, verifyDummyPassword, verifyPassword } from '../lib/password.js';
 import { hashRefreshToken, verifyAccessToken } from '../lib/tokens.js';
 import { inMemoryAuthDb, testAdmin, testConfig, type InMemoryAuthDb } from '../test/helpers.js';
-import { INVALID_CREDENTIALS_MESSAGE, login, type LoginInput } from './auth.service.js';
+import {
+  INVALID_CREDENTIALS_MESSAGE,
+  SESSION_EXPIRED_MESSAGE,
+  getMe,
+  login,
+  logout,
+  refresh,
+  type LoginInput,
+  type RefreshInput,
+} from './auth.service.js';
 
 // Real argon2, wrapped in spies so tests can see which verify ran.
 vi.mock('../lib/password.js', async (importOriginal) => {
@@ -61,17 +71,20 @@ const attempt = (overrides: Partial<LoginInput> = {}) =>
     deps(),
   );
 
-/** Runs a login that must fail and returns the thrown AppError. */
-async function refused(overrides: Partial<LoginInput> = {}): Promise<AppError> {
-  const error: unknown = await attempt(overrides).then(
+/** Awaits a call that must fail and returns the thrown AppError. */
+async function rejected(promise: Promise<unknown>): Promise<AppError> {
+  const error: unknown = await promise.then(
     () => {
-      throw new Error('expected login to be refused');
+      throw new Error('expected the call to be refused');
     },
     (err: unknown) => err,
   );
   expect(error).toBeInstanceOf(AppError);
   return error as AppError;
 }
+
+/** Runs a login that must fail and returns the thrown AppError. */
+const refused = (overrides: Partial<LoginInput> = {}) => rejected(attempt(overrides));
 
 const errorShape = (error: AppError) =>
   JSON.stringify({
@@ -345,5 +358,402 @@ describe('login: no enumeration or secret leakage', () => {
     }
     // And the refresh-token row holds only the hash.
     expect(JSON.stringify(db.refreshTokens)).not.toContain(result.refreshToken);
+  });
+});
+
+const REFRESH_IP = '198.51.100.23';
+const REFRESH_USER_AGENT = 'Mozilla/5.0 (refresh)';
+
+const rotate = (refreshToken: string, overrides: Partial<RefreshInput> = {}) =>
+  refresh(
+    { refreshToken, ipAddress: REFRESH_IP, userAgent: REFRESH_USER_AGENT, ...overrides },
+    deps(),
+  );
+
+const refreshRefused = (refreshToken: string) => rejected(rotate(refreshToken));
+
+const signOut = (refreshToken?: string) =>
+  logout({ refreshToken, ipAddress: IP, userAgent: USER_AGENT }, deps());
+
+function rowFor(rawToken: string): RefreshToken {
+  const row = db.refreshTokens.find((t) => t.tokenHash === hashRefreshToken(rawToken));
+  if (!row) throw new Error('no refresh-token row for that token');
+  return row;
+}
+
+const familyRows = (familyId: string) => db.refreshTokens.filter((t) => t.familyId === familyId);
+
+const SESSION_EXPIRED = JSON.stringify({
+  status: 401,
+  code: ERROR_CODES.UNAUTHORIZED,
+  message: SESSION_EXPIRED_MESSAGE,
+});
+
+describe('refresh: rotation', () => {
+  it('revokes the old token, links it to a child in the same family and keeps the expiry', async () => {
+    const session = await attempt();
+    const parent = { ...rowFor(session.refreshToken) };
+    clock = new Date(clock.getTime() + 10 * MINUTE_MS);
+
+    const result = await rotate(session.refreshToken);
+
+    expect(result.refreshToken).not.toBe(session.refreshToken);
+    expect(result.refreshExpiresAt).toEqual(session.refreshExpiresAt);
+    expect(result.admin).toEqual(session.admin);
+    expect(adminProfileSchema.safeParse(result.admin).success).toBe(true);
+
+    const child = rowFor(result.refreshToken);
+    expect(rowFor(session.refreshToken)).toMatchObject({
+      revokedAt: clock,
+      replacedById: child.id,
+    });
+    expect(child).toMatchObject({
+      adminId: parent.adminId,
+      familyId: parent.familyId,
+      revokedAt: null,
+      replacedById: null,
+      ipAddress: REFRESH_IP,
+      userAgent: REFRESH_USER_AGENT,
+    });
+    expect(child.expiresAt.getTime()).toBe(parent.expiresAt.getTime());
+    expect(child.tokenHash).not.toBe(result.refreshToken);
+
+    await expect(
+      verifyAccessToken(result.accessToken, { secret: authConfig.jwtAccessSecret, now: clock }),
+    ).resolves.toEqual({ adminId: storedAdmin().id, role: 'EDITOR' });
+    // Successful refreshes are not audited.
+    expect(actions()).toEqual(['LOGIN']);
+  });
+
+  it('can rotate a child again, still within the original absolute expiry', async () => {
+    const session = await attempt();
+    const first = await rotate(session.refreshToken);
+    const second = await rotate(first.refreshToken);
+
+    expect(second.refreshExpiresAt).toEqual(session.refreshExpiresAt);
+    expect(familyRows(rowFor(session.refreshToken).familyId)).toHaveLength(3);
+    expect(rowFor(first.refreshToken).replacedById).toBe(rowFor(second.refreshToken).id);
+  });
+
+  it('signs the new access token with the current role from the database', async () => {
+    const session = await attempt();
+    storedAdmin().role = 'SUPER_ADMIN';
+
+    const result = await rotate(session.refreshToken);
+
+    expect(result.admin.role).toBe('SUPER_ADMIN');
+    await expect(
+      verifyAccessToken(result.accessToken, { secret: authConfig.jwtAccessSecret, now: clock }),
+    ).resolves.toEqual({ adminId: storedAdmin().id, role: 'SUPER_ADMIN' });
+  });
+
+  it('still works 1 ms before the absolute expiry', async () => {
+    const session = await attempt();
+    clock = new Date(session.refreshExpiresAt.getTime() - 1);
+    await expect(rotate(session.refreshToken)).resolves.toMatchObject({
+      refreshExpiresAt: session.refreshExpiresAt,
+    });
+  });
+
+  it('lets a temporarily locked admin refresh without revoking the session', async () => {
+    const session = await attempt();
+    const lockedUntil = new Date(clock.getTime() + 15 * MINUTE_MS);
+    Object.assign(storedAdmin(), { failedLoginCount: MAX, lockedUntil });
+
+    const result = await rotate(session.refreshToken);
+
+    expect(rowFor(result.refreshToken).revokedAt).toBeNull();
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: MAX, lockedUntil });
+    expect(actions()).toEqual(['LOGIN']);
+  });
+});
+
+describe('refresh: reuse detection', () => {
+  it('revokes the whole family and audits when a rotated token is replayed', async () => {
+    const session = await attempt();
+    const first = await rotate(session.refreshToken);
+    const latest = await rotate(first.refreshToken);
+    const { familyId } = rowFor(session.refreshToken);
+    clock = new Date(clock.getTime() + MINUTE_MS);
+
+    const error = await refreshRefused(session.refreshToken);
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    expect(familyRows(familyId).every((t) => t.revokedAt !== null)).toBe(true);
+    expect(rowFor(latest.refreshToken).revokedAt).toEqual(clock);
+    expect(db.auditLogs.filter((a) => a.action === 'TOKEN_REUSE_DETECTED')).toEqual([
+      expect.objectContaining({
+        adminId: storedAdmin().id,
+        entity: 'Admin',
+        entityId: storedAdmin().id,
+        details: { familyId },
+        ipAddress: REFRESH_IP,
+        userAgent: REFRESH_USER_AGENT,
+      }),
+    ]);
+
+    // The newest child is dead too, and refusing it is not a second reuse alarm.
+    expect(errorShape(await refreshRefused(latest.refreshToken))).toBe(SESSION_EXPIRED);
+    expect(actions().filter((a) => a === 'TOKEN_REUSE_DETECTED')).toHaveLength(1);
+  });
+
+  it('leaves other families of the same admin untouched', async () => {
+    const stolen = await attempt();
+    const other = await attempt();
+    await rotate(stolen.refreshToken);
+
+    await refreshRefused(stolen.refreshToken);
+
+    expect(rowFor(other.refreshToken).revokedAt).toBeNull();
+    await expect(rotate(other.refreshToken)).resolves.toBeDefined();
+  });
+});
+
+describe('refresh: concurrent use of one token', () => {
+  it('lets exactly one of two simultaneous refreshes win, then revokes the family', async () => {
+    const session = await attempt();
+    const parent = rowFor(session.refreshToken);
+
+    // Real interleaving: both calls read the live token before either transaction runs, and
+    // the fake serialises transactions like row locks, so the second claim matches 0 rows.
+    const outcomes = await Promise.allSettled([
+      rotate(session.refreshToken),
+      rotate(session.refreshToken),
+    ]);
+
+    const wins = outcomes.filter((o) => o.status === 'fulfilled');
+    const losses = outcomes.filter((o) => o.status === 'rejected');
+    expect(wins).toHaveLength(1);
+    expect(losses).toHaveLength(1);
+    const reason: unknown = losses[0]?.reason;
+    expect(reason).toBeInstanceOf(AppError);
+    expect(errorShape(reason as AppError)).toBe(SESSION_EXPIRED);
+
+    // Both requests reached the claim step, proving this was the race path.
+    const { calls, results } = db.spies.refreshToken.updateMany.mock;
+    const claimIndexes = calls.flatMap(([args], i) =>
+      (args.where as { id?: string }).id === parent.id ? [i] : [],
+    );
+    expect(claimIndexes).toHaveLength(2);
+    const claimCounts: unknown[] = await Promise.all(
+      claimIndexes.map((i): unknown => results[i]?.value),
+    );
+    expect(claimCounts).toEqual([{ count: 1 }, { count: 0 }]);
+
+    expect(familyRows(parent.familyId)).toHaveLength(2);
+    expect(familyRows(parent.familyId).every((t) => t.revokedAt !== null)).toBe(true);
+    expect(actions().filter((a) => a === 'TOKEN_REUSE_DETECTED')).toHaveLength(1);
+
+    const winner = wins[0];
+    if (!winner) throw new Error('no winner');
+    expect(errorShape(await refreshRefused(winner.value.refreshToken))).toBe(SESSION_EXPIRED);
+  });
+
+  it('keeps the family revocation when the losing transaction rolls back', async () => {
+    const session = await attempt();
+    const { familyId } = rowFor(session.refreshToken);
+    // Deterministic variant: the claim reports that another request got there first.
+    db.spies.refreshToken.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    const error = await refreshRefused(session.refreshToken);
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    expect(db.spies.refreshToken.create).toHaveBeenCalledTimes(1); // login only, no child
+    expect(familyRows(familyId)).toHaveLength(1);
+    expect(rowFor(session.refreshToken)).toMatchObject({ revokedAt: clock, replacedById: null });
+    expect(actions()).toEqual(['LOGIN', 'TOKEN_REUSE_DETECTED']);
+  });
+});
+
+describe('refresh: refusals', () => {
+  it('refuses an expired token without rotating or revoking', async () => {
+    const session = await attempt();
+    clock = session.refreshExpiresAt; // expiresAt === now: expired
+
+    const error = await refreshRefused(session.refreshToken);
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    expect(db.refreshTokens).toHaveLength(1);
+    expect(rowFor(session.refreshToken)).toMatchObject({ revokedAt: null, replacedById: null });
+    expect(db.spies.$transaction).toHaveBeenCalledTimes(1); // login only
+    expect(actions()).toEqual(['LOGIN']);
+  });
+
+  it('refuses an unknown token without writing anything', async () => {
+    await attempt();
+
+    const error = await refreshRefused('not-a-real-token');
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    expect(db.spies.refreshToken.updateMany).not.toHaveBeenCalled();
+    expect(actions()).toEqual(['LOGIN']);
+  });
+
+  it('refuses a deactivated admin and revokes the family', async () => {
+    const session = await attempt();
+    const first = await rotate(session.refreshToken);
+    storedAdmin().isActive = false;
+
+    const error = await refreshRefused(first.refreshToken);
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    const { familyId } = rowFor(session.refreshToken);
+    expect(familyRows(familyId)).toHaveLength(2);
+    expect(familyRows(familyId).every((t) => t.revokedAt !== null)).toBe(true);
+    expect(actions()).toEqual(['LOGIN']);
+  });
+
+  it('refuses a token revoked by logout without a reuse alarm', async () => {
+    const session = await attempt();
+    await signOut(session.refreshToken);
+
+    const error = await refreshRefused(session.refreshToken);
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    expect(actions()).toEqual(['LOGIN', 'LOGOUT']);
+  });
+});
+
+describe('logout', () => {
+  it('revokes the whole family and audits LOGOUT once', async () => {
+    const session = await attempt();
+    const other = await attempt();
+    const latest = await rotate(session.refreshToken);
+    const { familyId } = rowFor(session.refreshToken);
+    clock = new Date(clock.getTime() + MINUTE_MS);
+
+    await expect(signOut(latest.refreshToken)).resolves.toBeUndefined();
+
+    expect(familyRows(familyId).every((t) => t.revokedAt !== null)).toBe(true);
+    expect(rowFor(latest.refreshToken).revokedAt).toEqual(clock);
+    expect(rowFor(other.refreshToken).revokedAt).toBeNull();
+    expect(db.auditLogs.filter((a) => a.action === 'LOGOUT')).toEqual([
+      expect.objectContaining({
+        adminId: storedAdmin().id,
+        entity: 'Admin',
+        entityId: storedAdmin().id,
+        ipAddress: IP,
+        userAgent: USER_AGENT,
+      }),
+    ]);
+
+    expect(errorShape(await refreshRefused(latest.refreshToken))).toBe(SESSION_EXPIRED);
+  });
+
+  it('is a silent no-op for a missing or unknown token', async () => {
+    await attempt();
+
+    await expect(signOut()).resolves.toBeUndefined();
+    await expect(signOut('')).resolves.toBeUndefined();
+    await expect(signOut('not-a-real-token')).resolves.toBeUndefined();
+
+    expect(db.spies.refreshToken.updateMany).not.toHaveBeenCalled();
+    expect(db.refreshTokens[0]?.revokedAt).toBeNull();
+    expect(actions()).toEqual(['LOGIN']);
+  });
+
+  it('does not throw or audit again for an already-revoked token', async () => {
+    const session = await attempt();
+    await signOut(session.refreshToken);
+
+    await expect(signOut(session.refreshToken)).resolves.toBeUndefined();
+
+    expect(actions()).toEqual(['LOGIN', 'LOGOUT']);
+  });
+});
+
+describe('getMe', () => {
+  it('returns exactly the five profile fields', async () => {
+    const admin = storedAdmin();
+
+    const profile = await getMe(admin.id, deps());
+
+    expect(Object.keys(profile).sort()).toEqual([
+      'email',
+      'id',
+      'mustChangePassword',
+      'name',
+      'role',
+    ]);
+    expect(profile).toEqual({
+      id: admin.id,
+      email: EMAIL,
+      name: admin.name,
+      role: 'EDITOR',
+      mustChangePassword: false,
+    });
+    expect(adminProfileSchema.safeParse(profile).success).toBe(true);
+  });
+
+  it('refuses a deactivated or missing admin with the session error', async () => {
+    storedAdmin().isActive = false;
+    const inactive = await rejected(getMe(storedAdmin().id, deps()));
+    const missing = await rejected(getMe(randomUUID(), deps()));
+
+    expect(errorShape(inactive)).toBe(SESSION_EXPIRED);
+    expect(errorShape(missing)).toBe(SESSION_EXPIRED);
+  });
+});
+
+describe('refresh: no oracle or secret leakage', () => {
+  it('gives every refusal a byte-identical error', async () => {
+    const errors: AppError[] = [];
+
+    errors.push(await refreshRefused('not-a-real-token'));
+
+    const reused = await attempt();
+    await rotate(reused.refreshToken);
+    errors.push(await refreshRefused(reused.refreshToken));
+
+    const loggedOut = await attempt();
+    await signOut(loggedOut.refreshToken);
+    errors.push(await refreshRefused(loggedOut.refreshToken));
+
+    const raced = await attempt();
+    db.spies.refreshToken.updateMany.mockResolvedValueOnce({ count: 0 });
+    errors.push(await refreshRefused(raced.refreshToken));
+
+    const expiring = await attempt();
+    clock = expiring.refreshExpiresAt;
+    errors.push(await refreshRefused(expiring.refreshToken));
+
+    clock = new Date('2026-10-30T04:30:00.000Z');
+    const inactive = await attempt();
+    storedAdmin().isActive = false;
+    errors.push(await refreshRefused(inactive.refreshToken));
+
+    expect(errors).toHaveLength(6);
+    for (const error of errors) {
+      expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    }
+  });
+
+  it('never puts raw or hashed tokens in audit rows, errors or other results', async () => {
+    const session = await attempt();
+    const first = await rotate(session.refreshToken);
+    const second = await rotate(first.refreshToken);
+    const errors = [errorShape(await refreshRefused(session.refreshToken))];
+
+    const other = await attempt();
+    await signOut(other.refreshToken);
+    errors.push(errorShape(await refreshRefused(other.refreshToken)));
+
+    const results = [session, first, second, other];
+    const rawTokens = results.map((r) => r.refreshToken);
+    const secrets = [...rawTokens, ...rawTokens.map(hashRefreshToken)];
+
+    const serialised = JSON.stringify({ audits: db.auditLogs, errors });
+    for (const secret of [...secrets, ...results.map((r) => r.accessToken)]) {
+      expect(serialised).not.toContain(secret);
+    }
+
+    // Each rotation result carries only its own new raw token.
+    for (const result of [first, second]) {
+      const rest = JSON.stringify({ ...result, refreshToken: undefined });
+      for (const secret of secrets) {
+        expect(rest).not.toContain(secret);
+      }
+    }
+    expect(JSON.stringify(db.refreshTokens)).not.toContain(first.refreshToken);
   });
 });

@@ -25,6 +25,14 @@ export const INVALID_CREDENTIALS_MESSAGE = 'Invalid email or password';
 const invalidCredentials = () =>
   new AppError(401, ERROR_CODES.INVALID_CREDENTIALS, INVALID_CREDENTIALS_MESSAGE);
 
+/**
+ * Every refused refresh (unknown, revoked, reused, expired, inactive admin) and every
+ * refused getMe gets exactly this error, so responses never reveal which case it was.
+ */
+export const SESSION_EXPIRED_MESSAGE = 'Session expired';
+
+const sessionExpired = () => new AppError(401, ERROR_CODES.UNAUTHORIZED, SESSION_EXPIRED_MESSAGE);
+
 export type AuthDb = Pick<PrismaClient, 'admin' | 'refreshToken' | 'auditLog' | '$transaction'>;
 
 export interface AuthServiceDeps {
@@ -50,6 +58,26 @@ export interface LoginResult {
   refreshExpiresAt: Date;
 }
 
+export interface RefreshInput {
+  /** Raw token from the refresh cookie. */
+  refreshToken: string;
+  ipAddress?: string | undefined;
+  userAgent?: string | undefined;
+}
+
+export type RefreshResult = LoginResult;
+
+export interface LogoutInput {
+  refreshToken?: string | undefined;
+  ipAddress?: string | undefined;
+  userAgent?: string | undefined;
+}
+
+interface ClientInfo {
+  ipAddress: string | null;
+  userAgent: string | null;
+}
+
 type FailureReason = 'unknown_email' | 'locked' | 'inactive' | 'bad_password';
 
 const adminLoginSelect = {
@@ -65,7 +93,36 @@ const adminLoginSelect = {
 
 type LoginAdmin = Pick<Admin, keyof typeof adminLoginSelect>;
 
-function toAdminProfile(admin: LoginAdmin): AdminProfile {
+const adminSessionSelect = {
+  id: true,
+  email: true,
+  name: true,
+  role: true,
+  isActive: true,
+  mustChangePassword: true,
+} as const satisfies Prisma.AdminSelect;
+
+const refreshTokenSelect = {
+  id: true,
+  adminId: true,
+  familyId: true,
+  expiresAt: true,
+  revokedAt: true,
+  replacedById: true,
+  admin: { select: adminSessionSelect },
+} as const satisfies Prisma.RefreshTokenSelect;
+
+const clientInfo = (input: {
+  ipAddress?: string | undefined;
+  userAgent?: string | undefined;
+}): ClientInfo => ({
+  ipAddress: fitColumn(input.ipAddress, IP_ADDRESS_MAX_LENGTH),
+  userAgent: fitColumn(input.userAgent, USER_AGENT_MAX_LENGTH),
+});
+
+function toAdminProfile(
+  admin: Pick<Admin, 'id' | 'email' | 'name' | 'role' | 'mustChangePassword'>,
+): AdminProfile {
   return {
     id: admin.id,
     email: admin.email,
@@ -83,10 +140,7 @@ function toAdminProfile(admin: LoginAdmin): AdminProfile {
 export async function login(input: LoginInput, deps: AuthServiceDeps): Promise<LoginResult> {
   const { db, config } = deps;
   const now = deps.now?.() ?? new Date();
-  const client = {
-    ipAddress: fitColumn(input.ipAddress, IP_ADDRESS_MAX_LENGTH),
-    userAgent: fitColumn(input.userAgent, USER_AGENT_MAX_LENGTH),
-  };
+  const client = clientInfo(input);
 
   const refuse = async (reason: FailureReason, adminId: string | null): Promise<never> => {
     await writeAudit(db, {
@@ -177,7 +231,7 @@ async function recordFailedAttempt(
   admin: LoginAdmin,
   now: Date,
   { db, config }: AuthServiceDeps,
-  client: { ipAddress: string | null; userAgent: string | null },
+  client: ClientInfo,
 ): Promise<void> {
   if (admin.lockedUntil) {
     await db.admin.updateMany({
@@ -212,4 +266,153 @@ async function recordFailedAttempt(
     },
     ...client,
   });
+}
+
+/** Thrown inside the rotation transaction when another request already claimed the token. */
+class RotationConflict extends Error {}
+
+/**
+ * Rotates a refresh token: the presented token is revoked and replaced by a child in the
+ * same family with the same absolute expiry. Presenting a rotated token again, or losing a
+ * concurrent race for it, is treated as theft: the whole family is revoked and
+ * TOKEN_REUSE_DETECTED is audited. Throws a 401 UNAUTHORIZED AppError for every refusal.
+ * Successful refreshes are not audited.
+ *
+ * A temporary login lock deliberately neither blocks refresh nor revokes sessions: anyone
+ * who knows an admin's email can trigger a lock, so revoking would let attackers log out
+ * real admins. Deactivation (isActive=false) does revoke.
+ */
+export async function refresh(input: RefreshInput, deps: AuthServiceDeps): Promise<RefreshResult> {
+  const { db, config } = deps;
+  const now = deps.now?.() ?? new Date();
+  const client = clientInfo(input);
+
+  const token = await db.refreshToken.findUnique({
+    where: { tokenHash: hashRefreshToken(input.refreshToken) },
+    select: refreshTokenSelect,
+  });
+
+  if (!token) throw sessionExpired();
+
+  const reuseDetected = async (): Promise<never> => {
+    await revokeFamily(db, token.familyId, now);
+    await writeAudit(db, {
+      action: 'TOKEN_REUSE_DETECTED',
+      adminId: token.adminId,
+      entity: AUDIT_ENTITY,
+      entityId: token.adminId,
+      details: { familyId: token.familyId },
+      ...client,
+    });
+    throw sessionExpired();
+  };
+
+  if (token.revokedAt) {
+    // Revoked with a successor is a replay; without one it was a logout or family revocation.
+    if (token.replacedById) return reuseDetected();
+    throw sessionExpired();
+  }
+
+  if (token.expiresAt.getTime() <= now.getTime()) throw sessionExpired();
+
+  const { admin } = token;
+  if (!admin.isActive) {
+    await revokeFamily(db, token.familyId, now);
+    throw sessionExpired();
+  }
+
+  const refreshToken = generateRefreshToken();
+  try {
+    await db.$transaction(async (tx) => {
+      // Claims the parent. A concurrent request for the same token matches 0 rows here.
+      const claimed = await tx.refreshToken.updateMany({
+        where: { id: token.id, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      if (claimed.count !== 1) throw new RotationConflict();
+
+      const child = await tx.refreshToken.create({
+        data: {
+          adminId: token.adminId,
+          tokenHash: hashRefreshToken(refreshToken),
+          familyId: token.familyId,
+          expiresAt: token.expiresAt,
+          ...client,
+        },
+        select: { id: true },
+      });
+      await tx.refreshToken.update({
+        where: { id: token.id },
+        data: { replacedById: child.id },
+        select: { id: true },
+      });
+    });
+  } catch (error) {
+    // Handled after the rollback, so the family revocation commits on its own.
+    if (error instanceof RotationConflict) return reuseDetected();
+    throw error;
+  }
+
+  const accessToken = await signAccessToken(
+    { adminId: admin.id, role: admin.role },
+    { secret: config.jwtAccessSecret, ttlSeconds: config.accessTokenTtlSeconds, now },
+  );
+
+  return {
+    admin: toAdminProfile(admin),
+    accessToken,
+    refreshToken,
+    refreshExpiresAt: token.expiresAt,
+  };
+}
+
+/**
+ * Revokes every live token in the presented token's family. Idempotent: a missing, unknown
+ * or already-revoked token is a no-op. LOGOUT is audited only when something was revoked.
+ */
+export async function logout(input: LogoutInput, deps: AuthServiceDeps): Promise<void> {
+  if (!input.refreshToken) return;
+  const { db } = deps;
+  const now = deps.now?.() ?? new Date();
+
+  const token = await db.refreshToken.findUnique({
+    where: { tokenHash: hashRefreshToken(input.refreshToken) },
+    select: { adminId: true, familyId: true },
+  });
+  if (!token) return;
+
+  await db.$transaction(async (tx) => {
+    const revoked = await revokeFamily(tx, token.familyId, now);
+    if (revoked === 0) return;
+    await writeAudit(tx, {
+      action: 'LOGOUT',
+      adminId: token.adminId,
+      entity: AUDIT_ENTITY,
+      entityId: token.adminId,
+      ...clientInfo(input),
+    });
+  });
+}
+
+/** The signed-in admin's profile. Throws 401 UNAUTHORIZED if missing or deactivated. */
+export async function getMe(
+  adminId: string,
+  { db }: Pick<AuthServiceDeps, 'db'>,
+): Promise<AdminProfile> {
+  const admin = await db.admin.findUnique({ where: { id: adminId }, select: adminSessionSelect });
+  if (!admin?.isActive) throw sessionExpired();
+  return toAdminProfile(admin);
+}
+
+/** Revokes every live token in a family and returns how many were revoked. */
+async function revokeFamily(
+  db: Pick<Prisma.TransactionClient, 'refreshToken'>,
+  familyId: string,
+  now: Date,
+): Promise<number> {
+  const { count } = await db.refreshToken.updateMany({
+    where: { familyId, revokedAt: null },
+    data: { revokedAt: now },
+  });
+  return count;
 }

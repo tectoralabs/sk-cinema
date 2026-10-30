@@ -91,14 +91,48 @@ function applyData(row: Row, data: Row): void {
   }
 }
 
+interface Projection {
+  select?: Record<string, unknown>;
+  include?: Record<string, unknown>;
+}
+
+/**
+ * Applies a Prisma `select` (scalars plus `{ relation: { select } }`) or `include`
+ * (`{ relation: true }`) so services only see the fields they asked for.
+ */
+function project(row: Row, args: Projection, relation: (key: string) => Row | undefined): Row {
+  const nested = (key: string, spec: unknown): Row | null => {
+    const related = relation(key);
+    if (!related) return null;
+    return spec !== null && typeof spec === 'object'
+      ? project(related, spec, () => undefined)
+      : { ...related };
+  };
+  if (args.select) {
+    const out: Row = {};
+    for (const [key, spec] of Object.entries(args.select)) {
+      if (spec === true) out[key] = row[key];
+      else if (spec) out[key] = nested(key, spec);
+    }
+    return out;
+  }
+  const out: Row = { ...row };
+  for (const [key, spec] of Object.entries(args.include ?? {})) {
+    if (spec) out[key] = nested(key, spec);
+  }
+  return out;
+}
+
 function notFoundError(): Error {
   return Object.assign(new Error('Record to update not found'), { code: 'P2025' });
 }
 
 /**
  * An in-memory stand-in for the admin, refreshToken and auditLog delegates plus
- * interactive $transaction (rolled back if the callback throws). Every method is a vi.fn,
- * so tests can assert on the exact Prisma calls. Rows are returned as copies.
+ * interactive $transaction (rolled back if the callback throws). Transactions run one at a
+ * time, the way Postgres row locks serialise conflicting writers, so a whole-store rollback
+ * never undoes another transaction's writes. Every method is a vi.fn, so tests can assert
+ * on the exact Prisma calls. Rows are returned as copies; findUnique honours select/include.
  */
 export function inMemoryAuthDb(seed: { admins?: Admin[] } = {}) {
   const store = {
@@ -107,11 +141,12 @@ export function inMemoryAuthDb(seed: { admins?: Admin[] } = {}) {
     auditLogs: [] as AuditLog[],
   };
   const findAdmin = (where: Where) => store.admins.find((a) => matches(a, where));
+  const findToken = (where: Where) => store.refreshTokens.find((t) => matches(t, where));
 
   const admin = {
-    findUnique: vi.fn(({ where }: { where: Where }) => {
+    findUnique: vi.fn(({ where, ...args }: { where: Where } & Projection) => {
       const found = findAdmin(where);
-      return Promise.resolve(found ? { ...found } : null);
+      return Promise.resolve(found ? project(found, args, () => undefined) : null);
     }),
     update: vi.fn(({ where, data }: { where: Where; data: Row }) => {
       const found = findAdmin(where);
@@ -145,6 +180,26 @@ export function inMemoryAuthDb(seed: { admins?: Admin[] } = {}) {
       store.refreshTokens.push(row);
       return Promise.resolve({ ...row });
     }),
+    findUnique: vi.fn(({ where, ...args }: { where: Where } & Projection) => {
+      const found = findToken(where);
+      if (!found) return Promise.resolve(null);
+      const relation = (key: string) =>
+        key === 'admin' ? findAdmin({ id: found.adminId }) : undefined;
+      return Promise.resolve(project(found, args, relation));
+    }),
+    update: vi.fn(({ where, data }: { where: Where; data: Row }) => {
+      const found = findToken(where);
+      if (!found) return Promise.reject(notFoundError());
+      applyData(found, data);
+      return Promise.resolve({ ...found });
+    }),
+    updateMany: vi.fn(({ where, data }: { where: Where; data: Row }) => {
+      const hits = store.refreshTokens.filter((t) => matches(t, where));
+      hits.forEach((t) => {
+        applyData(t, data);
+      });
+      return Promise.resolve({ count: hits.length });
+    }),
   };
 
   const auditLog = {
@@ -167,19 +222,24 @@ export function inMemoryAuthDb(seed: { admins?: Admin[] } = {}) {
   const prisma = fakePrisma({ admin, refreshToken, auditLog });
   const snapshot = () => ({
     admins: store.admins.map((a) => ({ ...a })),
-    refreshTokens: [...store.refreshTokens],
+    refreshTokens: store.refreshTokens.map((t) => ({ ...t })),
     auditLogs: [...store.auditLogs],
   });
-  const $transaction = vi.fn(async (fn: (tx: PrismaClient) => Promise<unknown>) => {
-    const before = snapshot();
-    try {
-      return await fn(prisma);
-    } catch (error) {
-      store.admins.splice(0, Infinity, ...before.admins);
-      store.refreshTokens.splice(0, Infinity, ...before.refreshTokens);
-      store.auditLogs.splice(0, Infinity, ...before.auditLogs);
-      throw error;
-    }
+  let queue: Promise<unknown> = Promise.resolve();
+  const $transaction = vi.fn((fn: (tx: PrismaClient) => Promise<unknown>) => {
+    const run = queue.then(async () => {
+      const before = snapshot();
+      try {
+        return await fn(prisma);
+      } catch (error) {
+        store.admins.splice(0, Infinity, ...before.admins);
+        store.refreshTokens.splice(0, Infinity, ...before.refreshTokens);
+        store.auditLogs.splice(0, Infinity, ...before.auditLogs);
+        throw error;
+      }
+    });
+    queue = run.catch(() => undefined);
+    return run;
   });
   Object.assign(prisma, { $transaction });
 
