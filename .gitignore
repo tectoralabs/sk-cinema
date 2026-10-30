@@ -27,6 +27,7 @@ pnpm-debug.log*
 Thumbs.db
 
 # Claude Code local settings
+.claude
 .claude/settings.local.json
 
 # Local project notes (not committed)
