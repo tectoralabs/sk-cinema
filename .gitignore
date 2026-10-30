@@ -12,10 +12,10 @@ apps/api/src/generated/
 # Test output
 coverage/
 
-# Env files (none are committed)
+# Env files (only placeholder .env.example files are committed)
 .env
 .env.*
-.env.example
+!.env.example
 
 # Logs
 *.log

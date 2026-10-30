@@ -17,6 +17,16 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     corsOrigins: ['http://localhost:5173', 'http://localhost:5174'],
     trustProxy: 0,
     rateLimit: { windowMs: 60_000, max: 1000 },
+    auth: {
+      // Test-only placeholders; distinct and at least 32 characters, like the env schema requires.
+      jwtAccessSecret: 'test-jwt-access-secret-0123456789abcdef',
+      csrfSecret: 'test-csrf-secret-0123456789abcdef-0123',
+      accessTokenTtlSeconds: 900,
+      refreshTokenTtlHours: 168,
+      loginMaxFailedAttempts: 5,
+      loginLockoutMinutes: 15,
+      loginRateLimit: { windowMs: 900_000, max: 10 },
+    },
     ...overrides,
   };
 }
