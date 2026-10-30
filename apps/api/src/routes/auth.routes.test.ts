@@ -15,24 +15,30 @@ import {
   REFRESH_COOKIE_PATH,
 } from '../lib/authCookies.js';
 import { hashPassword } from '../lib/password.js';
-import { CSRF_HEADER } from '../middleware/csrf.js';
 import { REFRESH_RATE_LIMIT } from '../middleware/rateLimiter.js';
 import { INVALID_CREDENTIALS_MESSAGE, SESSION_EXPIRED_MESSAGE } from '../services/auth.service.js';
 import {
+  ADMIN_BASE,
+  TEST_USER_AGENT,
+  authClient,
   buildTestApp,
+  cookiePair,
+  fetchCsrf,
   inMemoryAuthDb,
   parseSetCookies,
+  sessionFrom,
   testAdmin,
   testConfig,
+  type AuthClient,
   type InMemoryAuthDb,
+  type SendOptions,
+  type Session,
 } from '../test/helpers.js';
 
-const BASE = '/api/admin';
-const ALLOWED_ORIGIN = 'http://localhost:5174';
+const BASE = ADMIN_BASE;
 const EMAIL = 'editor@skcinema.lk';
 const PASSWORD = 'correct horse battery staple';
 const WRONG_PASSWORD = 'Tr0ub4dor&3-wrong-guess';
-const USER_AGENT = 'Mozilla/5.0 (auth routes test)';
 const EPOCH_EXPIRES = new Date(1).toUTCString();
 
 const UNAUTHORIZED_BODY = { error: { code: 'UNAUTHORIZED', message: SESSION_EXPIRED_MESSAGE } };
@@ -74,83 +80,7 @@ function storedAdmin(db: InMemoryAuthDb, id: string): Admin {
   return row;
 }
 
-const cookiePair = (name: string, value: string) => `${name}=${value}`;
-
-interface Csrf {
-  cookie: string;
-  token: string;
-}
-
-/** GET /csrf, keeping the CSRF cookie and token, as the admin app does on load. */
-async function fetchCsrf(app: Express): Promise<Csrf> {
-  const res = await request(app).get(`${BASE}/auth/csrf`);
-  const cookie = parseSetCookies(res)[CSRF_COOKIE_NAME];
-  if (!cookie) throw new Error('no CSRF cookie');
-  return {
-    cookie: cookiePair(CSRF_COOKIE_NAME, cookie.value),
-    token: csrfTokenResponseSchema.parse(res.body).csrfToken,
-  };
-}
-
-interface SendOptions {
-  body?: object | string;
-  /** Extra cookie pairs ("name=value"). */
-  cookies?: string[];
-  /** null: omit the header. */
-  origin?: string | null;
-  /** null: omit the header. */
-  token?: string | null;
-  /** false: do not send the CSRF cookie. */
-  csrfCookie?: boolean;
-}
-
-/** A browser-like client that has done the CSRF dance. */
-async function client(app: Express) {
-  const csrf = await fetchCsrf(app);
-
-  const post = (path: string, options: SendOptions = {}) => {
-    const { body, cookies = [], origin = ALLOWED_ORIGIN, token = csrf.token } = options;
-    const all = [...(options.csrfCookie === false ? [] : [csrf.cookie]), ...cookies];
-    let req = request(app).post(`${BASE}${path}`).set('User-Agent', USER_AGENT);
-    if (all.length > 0) req = req.set('Cookie', all.join('; '));
-    if (origin !== null) req = req.set('Origin', origin);
-    if (token !== null) req = req.set(CSRF_HEADER, token);
-    return body === undefined ? req : req.send(body);
-  };
-
-  /** No CSRF header or Origin: safe methods must not need them. */
-  const get = (path: string, cookies: string[] = []) => {
-    const req = request(app).get(`${BASE}${path}`);
-    return cookies.length > 0 ? req.set('Cookie', cookies.join('; ')) : req;
-  };
-
-  return { csrf, post, get };
-}
-
-type Client = Awaited<ReturnType<typeof client>>;
-
-interface Session {
-  access: string;
-  refresh: string;
-  /** Raw values, to look for leaks. */
-  accessValue: string;
-  refreshValue: string;
-}
-
-function sessionFrom(res: request.Response): Session {
-  const cookies = parseSetCookies(res);
-  const access = cookies[ACCESS_COOKIE_NAME]?.value;
-  const refresh = cookies[REFRESH_COOKIE_NAME]?.value;
-  if (!access || !refresh) throw new Error(`no auth cookies (status ${res.status})`);
-  return {
-    access: cookiePair(ACCESS_COOKIE_NAME, access),
-    refresh: cookiePair(REFRESH_COOKIE_NAME, refresh),
-    accessValue: access,
-    refreshValue: refresh,
-  };
-}
-
-async function logIn(c: Client): Promise<Session> {
+async function logIn(c: AuthClient): Promise<Session> {
   const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
   expect(res.status).toBe(200);
   return sessionFrom(res);
@@ -234,7 +164,7 @@ describe('GET /api/admin/auth/csrf', () => {
 describe('POST /api/admin/auth/login', () => {
   it('returns only { admin } and sets the session cookies', async () => {
     const { app, db, admin } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
 
     expect(res.status).toBe(200);
@@ -250,7 +180,7 @@ describe('POST /api/admin/auth/login', () => {
     vi.setSystemTime(now);
     const { app } = setup();
     const config = testConfig();
-    const c = await client(app);
+    const c = await authClient(app);
 
     const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
     const cookies = parseSetCookies(res);
@@ -278,15 +208,15 @@ describe('POST /api/admin/auth/login', () => {
 
   it('records the client IP and user agent on the session', async () => {
     const { app, db } = setup();
-    await logIn(await client(app));
+    await logIn(await authClient(app));
 
-    expect(db.refreshTokens[0]?.userAgent).toBe(USER_AGENT);
+    expect(db.refreshTokens[0]?.userAgent).toBe(TEST_USER_AGENT);
     expect(db.refreshTokens[0]?.ipAddress).toMatch(/127\.0\.0\.1|::1/);
   });
 
   it('normalises the email before looking the admin up', async () => {
     const { app } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const res = await c.post('/auth/login', {
       body: { email: '  Editor@SKCinema.LK ', password: PASSWORD },
     });
@@ -304,7 +234,7 @@ describe('POST /api/admin/auth/login', () => {
       ['an array body', [PASSWORD]],
     ])('rejects %s with 400 and never echoes the password', async (_name, body) => {
       const { app, db } = setup();
-      const c = await client(app);
+      const c = await authClient(app);
       const res = await c.post('/auth/login', { body });
 
       expect(res.status).toBe(400);
@@ -317,7 +247,7 @@ describe('POST /api/admin/auth/login', () => {
 
     it('rejects a request with no body', async () => {
       const { app, db } = setup();
-      const res = await (await client(app)).post('/auth/login');
+      const res = await (await authClient(app)).post('/auth/login');
 
       expect(res.status).toBe(400);
       expect(apiErrorSchema.parse(res.body).error.code).toBe('VALIDATION_ERROR');
@@ -327,7 +257,7 @@ describe('POST /api/admin/auth/login', () => {
     it('reports field paths and messages only, never input values', async () => {
       const { app } = setup();
       const res = await (
-        await client(app)
+        await authClient(app)
       ).post('/auth/login', { body: { email: 'bad', password: PASSWORD, extra: PASSWORD } });
 
       const details = apiErrorSchema.parse(res.body).error.details as {
@@ -347,7 +277,7 @@ describe('POST /api/admin/auth/login', () => {
     it('answers a wrong password with 401 INVALID_CREDENTIALS and no auth cookies', async () => {
       const { app, admin, db } = setup();
       const res = await (
-        await client(app)
+        await authClient(app)
       ).post('/auth/login', { body: { email: EMAIL, password: WRONG_PASSWORD } });
 
       expect(res.status).toBe(401);
@@ -360,7 +290,7 @@ describe('POST /api/admin/auth/login', () => {
     it('answers an unknown email exactly like a wrong password', async () => {
       const { app } = setup();
       const res = await (
-        await client(app)
+        await authClient(app)
       ).post('/auth/login', { body: { email: 'nobody@skcinema.lk', password: PASSWORD } });
 
       expect(res.status).toBe(401);
@@ -371,7 +301,7 @@ describe('POST /api/admin/auth/login', () => {
     it('refuses a deactivated admin with the same 401', async () => {
       const { app } = setup({ admin: { isActive: false } });
       const res = await (
-        await client(app)
+        await authClient(app)
       ).post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
 
       expect(res.status).toBe(401);
@@ -389,7 +319,7 @@ describe('POST /api/admin/auth/login', () => {
       ['no Origin or Referer', { origin: null }],
     ])('rejects %s with 403 before the service runs', async (_name, options) => {
       const { app, db } = setup();
-      const c = await client(app);
+      const c = await authClient(app);
       const res = await c.post('/auth/login', {
         body: { email: EMAIL, password: PASSWORD },
         ...options,
@@ -406,7 +336,7 @@ describe('POST /api/admin/auth/login', () => {
   describe('rate limiting', () => {
     it('answers the 11th attempt from one IP within the window with 429', async () => {
       const { app, db } = setup();
-      const c = await client(app);
+      const c = await authClient(app);
       expect(testConfig().auth.loginRateLimit.max).toBe(10);
 
       for (let i = 0; i < 10; i++) {
@@ -429,7 +359,7 @@ describe('POST /api/admin/auth/login', () => {
     it('counts successful logins too', async () => {
       const auth = { ...testConfig().auth, loginRateLimit: { windowMs: 60_000, max: 2 } };
       const { app } = setup({ config: { auth } });
-      const c = await client(app);
+      const c = await authClient(app);
 
       await logIn(c);
       await logIn(c);
@@ -441,7 +371,7 @@ describe('POST /api/admin/auth/login', () => {
     it('limits only login, and each app instance counts on its own', async () => {
       const auth = { ...testConfig().auth, loginRateLimit: { windowMs: 60_000, max: 1 } };
       const { app } = setup({ config: { auth } });
-      const c = await client(app);
+      const c = await authClient(app);
       const session = await logIn(c);
       expect((await c.post('/auth/login', { body: {} })).status).toBe(429);
 
@@ -451,7 +381,7 @@ describe('POST /api/admin/auth/login', () => {
 
       // A second app has fresh counters.
       const other = setup({ config: { auth } });
-      await logIn(await client(other.app));
+      await logIn(await authClient(other.app));
     });
   });
 });
@@ -459,7 +389,7 @@ describe('POST /api/admin/auth/login', () => {
 describe('POST /api/admin/auth/refresh', () => {
   it('rotates the session and returns only { admin }', async () => {
     const { app, db, admin } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const first = await logIn(c);
 
     const res = await c.post('/auth/refresh', { cookies: [first.refresh] });
@@ -493,7 +423,7 @@ describe('POST /api/admin/auth/refresh', () => {
     const loginAt = new Date('2026-11-01T04:30:00.000Z');
     vi.setSystemTime(loginAt);
     const { app } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const first = await logIn(c);
 
     vi.setSystemTime(new Date(loginAt.getTime() + 3_600_000));
@@ -508,7 +438,7 @@ describe('POST /api/admin/auth/refresh', () => {
 
   it('accepts an explicit empty JSON body', async () => {
     const { app } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     const res = await c.post('/auth/refresh', { cookies: [session.refresh], body: {} });
     expect(res.status).toBe(200);
@@ -516,7 +446,7 @@ describe('POST /api/admin/auth/refresh', () => {
 
   it('refuses a replayed (already rotated) refresh cookie and clears the cookies', async () => {
     const { app } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const first = await logIn(c);
     expect((await c.post('/auth/refresh', { cookies: [first.refresh] })).status).toBe(200);
 
@@ -530,7 +460,7 @@ describe('POST /api/admin/auth/refresh', () => {
 
   it('answers a missing refresh cookie with the same 401 and clears the cookies', async () => {
     const { app, db } = setup();
-    const res = await (await client(app)).post('/auth/refresh');
+    const res = await (await authClient(app)).post('/auth/refresh');
 
     expect(res.status).toBe(401);
     expect(res.body).toEqual(UNAUTHORIZED_BODY);
@@ -541,7 +471,7 @@ describe('POST /api/admin/auth/refresh', () => {
   it('answers an unknown refresh cookie with the same 401', async () => {
     const { app } = setup();
     const res = await (
-      await client(app)
+      await authClient(app)
     ).post('/auth/refresh', { cookies: [cookiePair(REFRESH_COOKIE_NAME, 'not-a-real-token')] });
 
     expect(res.status).toBe(401);
@@ -551,7 +481,7 @@ describe('POST /api/admin/auth/refresh', () => {
 
   it('refuses a deactivated admin', async () => {
     const { app, db, admin } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     storedAdmin(db, admin.id).isActive = false;
 
@@ -567,7 +497,7 @@ describe('POST /api/admin/auth/refresh', () => {
     ['an array body', []],
   ])('rejects %s in the body with 400 before the service runs', async (_name, body) => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     db.spies.refreshToken.findUnique.mockClear();
 
@@ -583,7 +513,7 @@ describe('POST /api/admin/auth/refresh', () => {
     ['a foreign Origin', { origin: 'https://evil.example' }],
   ])('rejects %s with 403 and leaves the session alone', async (_name, options) => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     db.spies.refreshToken.findUnique.mockClear();
 
@@ -598,7 +528,7 @@ describe('POST /api/admin/auth/refresh', () => {
 
   it(`answers attempt ${REFRESH_RATE_LIMIT.max + 1} from one IP within the window with 429`, async () => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     expect(REFRESH_RATE_LIMIT).toEqual({ windowMs: 15 * 60_000, max: 60 });
 
     for (let i = 0; i < REFRESH_RATE_LIMIT.max; i++) {
@@ -616,7 +546,7 @@ describe('POST /api/admin/auth/refresh', () => {
 describe('POST /api/admin/auth/logout', () => {
   it('revokes the session, clears both cookies and returns 204', async () => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
 
     const res = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
@@ -633,7 +563,7 @@ describe('POST /api/admin/auth/logout', () => {
 
   it('works without a valid access cookie, so an expired session can still log out', async () => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
 
     const res = await c.post('/auth/logout', {
@@ -646,7 +576,7 @@ describe('POST /api/admin/auth/logout', () => {
 
   it('returns 204 and clears cookies when there is no session at all', async () => {
     const { app } = setup();
-    const res = await (await client(app)).post('/auth/logout');
+    const res = await (await authClient(app)).post('/auth/logout');
 
     expect(res.status).toBe(204);
     expectAuthCookiesCleared(res);
@@ -654,7 +584,7 @@ describe('POST /api/admin/auth/logout', () => {
 
   it('still clears the cookies when revoking fails, and hides the error', async () => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     db.spies.refreshToken.findUnique.mockRejectedValueOnce(new Error('connection lost: secret'));
 
@@ -669,7 +599,7 @@ describe('POST /api/admin/auth/logout', () => {
 
   it('rejects a body with keys with 400', async () => {
     const { app, db } = setup();
-    const res = await (await client(app)).post('/auth/logout', { body: { all: true } });
+    const res = await (await authClient(app)).post('/auth/logout', { body: { all: true } });
 
     expect(res.status).toBe(400);
     expect(apiErrorSchema.parse(res.body).error.code).toBe('VALIDATION_ERROR');
@@ -678,7 +608,7 @@ describe('POST /api/admin/auth/logout', () => {
 
   it('rejects a request without CSRF with 403 and keeps the session', async () => {
     const { app, db } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     db.spies.refreshToken.findUnique.mockClear();
 
@@ -695,7 +625,7 @@ describe('POST /api/admin/auth/logout', () => {
 describe('GET /api/admin/me', () => {
   it('returns { admin } for the access cookie, without CSRF', async () => {
     const { app, admin } = setup({ admin: { role: 'SUPER_ADMIN', mustChangePassword: true } });
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
 
     const res = await c.get('/me', [session.access]);
@@ -734,7 +664,7 @@ describe('GET /api/admin/me', () => {
 
   it('answers 401 once the admin is deactivated', async () => {
     const { app, db, admin } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
     storedAdmin(db, admin.id).isActive = false;
 
@@ -746,7 +676,7 @@ describe('GET /api/admin/me', () => {
 
   it('does not accept the refresh cookie as a session', async () => {
     const { app } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
     const session = await logIn(c);
 
     const res = await c.get('/me', [cookiePair(ACCESS_COOKIE_NAME, session.refreshValue)]);
@@ -767,7 +697,7 @@ describe('admin router', () => {
 
   it('checks CSRF before routing unsafe methods, then 404s unknown routes', async () => {
     const { app } = setup();
-    const c = await client(app);
+    const c = await authClient(app);
 
     const withoutCsrf = await c.post('/does-not-exist', { token: null });
     expect(withoutCsrf.status).toBe(403);

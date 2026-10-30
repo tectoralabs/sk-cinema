@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { pino } from 'pino';
-import type request from 'supertest';
+import { csrfTokenResponseSchema } from '@sk-cinema/shared';
+import type { Express } from 'express';
+import { pino, type Logger } from 'pino';
+import request from 'supertest';
 import { vi } from 'vitest';
 import { createApp } from '../app.js';
 import type { Config } from '../config/env.js';
 import type { Admin, AuditLog, PrismaClient, RefreshToken } from '../generated/prisma/client.js';
+import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_NAME } from '../lib/authCookies.js';
 import { MemoryCache } from '../lib/cache.js';
+import { CSRF_HEADER } from '../middleware/csrf.js';
 
 export const silentLogger = pino({ level: 'silent' });
 
@@ -250,12 +254,14 @@ export function inMemoryAuthDb(seed: { admins?: Admin[] } = {}) {
 
 export type InMemoryAuthDb = ReturnType<typeof inMemoryAuthDb>;
 
-export function buildTestApp(options: { config?: Partial<Config>; prisma?: PrismaClient } = {}) {
+export function buildTestApp(
+  options: { config?: Partial<Config>; prisma?: PrismaClient; logger?: Logger } = {},
+) {
   const prisma = options.prisma ?? fakePrisma();
   const cache = new MemoryCache();
   const app = createApp({
     config: testConfig(options.config),
-    logger: silentLogger,
+    logger: options.logger ?? silentLogger,
     prisma,
     cache,
   });
@@ -284,4 +290,107 @@ export function parseSetCookies(res: request.Response): Record<string, ParsedCoo
     parsed[pair.slice(0, eq)] = { value: pair.slice(eq + 1), attributes };
   }
   return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// A browser-like client for the admin API (CSRF dance, cookies, Origin).
+// ---------------------------------------------------------------------------
+
+export const ADMIN_BASE = '/api/admin';
+/** One of testConfig().corsOrigins: the admin app's origin. */
+export const ALLOWED_ORIGIN = 'http://localhost:5174';
+export const TEST_USER_AGENT = 'Mozilla/5.0 (SK Cinema API test)';
+
+/** A "name=value" pair for a Cookie request header. */
+export const cookiePair = (name: string, value: string) => `${name}=${value}`;
+
+export interface Csrf {
+  /** "name=value" for the Cookie header. */
+  cookie: string;
+  /** The raw CSRF cookie value, to look for leaks. */
+  cookieValue: string;
+  /** The X-CSRF-Token value from the response body. */
+  token: string;
+  /** The GET /csrf response itself. */
+  response: request.Response;
+}
+
+/** GET /csrf, keeping the CSRF cookie and token, as the admin app does on load. */
+export async function fetchCsrf(app: Express): Promise<Csrf> {
+  const res = await request(app).get(`${ADMIN_BASE}/auth/csrf`);
+  const cookie = parseSetCookies(res)[CSRF_COOKIE_NAME];
+  if (!cookie) throw new Error('no CSRF cookie');
+  return {
+    cookie: cookiePair(CSRF_COOKIE_NAME, cookie.value),
+    cookieValue: cookie.value,
+    token: csrfTokenResponseSchema.parse(res.body).csrfToken,
+    response: res,
+  };
+}
+
+export interface SendOptions {
+  body?: object | string;
+  /** Extra cookie pairs ("name=value"). */
+  cookies?: string[];
+  /** null: omit the header. */
+  origin?: string | null;
+  /** null: omit the header. */
+  token?: string | null;
+  /** false: do not send the CSRF cookie. */
+  csrfCookie?: boolean;
+}
+
+export interface AuthClientOptions {
+  /** Sent as X-Forwarded-For; only honoured when the app's trustProxy is at least 1. */
+  ip?: string;
+}
+
+/** A browser-like client that has done the CSRF dance. */
+export async function authClient(app: Express, options: AuthClientOptions = {}) {
+  const csrf = await fetchCsrf(app);
+  const withIp = (req: request.Test) =>
+    options.ip === undefined ? req : req.set('X-Forwarded-For', options.ip);
+
+  const post = (path: string, send: SendOptions = {}) => {
+    const { body, cookies = [], origin = ALLOWED_ORIGIN, token = csrf.token } = send;
+    const all = [...(send.csrfCookie === false ? [] : [csrf.cookie]), ...cookies];
+    let req = withIp(request(app).post(`${ADMIN_BASE}${path}`).set('User-Agent', TEST_USER_AGENT));
+    if (all.length > 0) req = req.set('Cookie', all.join('; '));
+    if (origin !== null) req = req.set('Origin', origin);
+    if (token !== null) req = req.set(CSRF_HEADER, token);
+    return body === undefined ? req : req.send(body);
+  };
+
+  /** No CSRF header or Origin: safe methods must not need them. */
+  const get = (path: string, cookies: string[] = []) => {
+    const req = withIp(request(app).get(`${ADMIN_BASE}${path}`));
+    return cookies.length > 0 ? req.set('Cookie', cookies.join('; ')) : req;
+  };
+
+  return { csrf, post, get };
+}
+
+export type AuthClient = Awaited<ReturnType<typeof authClient>>;
+
+export interface Session {
+  /** "name=value" pairs for the Cookie header. */
+  access: string;
+  refresh: string;
+  /** Raw values, to look for leaks. */
+  accessValue: string;
+  refreshValue: string;
+}
+
+/** The access and refresh cookies a login or refresh response set. Throws if either is missing. */
+export function sessionFrom(res: request.Response): Session {
+  const cookies = parseSetCookies(res);
+  const access = cookies[ACCESS_COOKIE_NAME]?.value;
+  const refresh = cookies[REFRESH_COOKIE_NAME]?.value;
+  if (!access || !refresh) throw new Error(`no auth cookies (status ${res.status})`);
+  return {
+    access: cookiePair(ACCESS_COOKIE_NAME, access),
+    refresh: cookiePair(REFRESH_COOKIE_NAME, refresh),
+    accessValue: access,
+    refreshValue: refresh,
+  };
 }
