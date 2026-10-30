@@ -20,12 +20,28 @@ export async function verifyPassword(storedHash: string, password: string): Prom
   }
 }
 
+/** Builds the dummy hash once and caches it. A failed build is not cached, so it is retried. */
+function getDummyHash(): Promise<string> {
+  dummyHash ??= hashPassword(randomBytes(32).toString('base64url')).catch((error: unknown) => {
+    dummyHash = undefined;
+    throw error;
+  });
+  return dummyHash;
+}
+
+/**
+ * Pre-computes the dummy hash so the first unknown-email login costs one verify,
+ * like a real login, instead of a hash plus a verify. Call once at startup.
+ */
+export async function warmUpDummyPassword(): Promise<void> {
+  await getDummyHash();
+}
+
 /**
  * Burns the same argon2 work as a real verify so a login for an unknown
  * email is not distinguishable by timing. Always resolves false.
  */
 export async function verifyDummyPassword(password: string): Promise<false> {
-  dummyHash ??= hashPassword(randomBytes(32).toString('base64url'));
-  await verifyPassword(await dummyHash, password);
+  await verifyPassword(await getDummyHash(), password);
   return false;
 }
