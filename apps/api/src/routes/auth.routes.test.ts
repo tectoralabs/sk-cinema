@@ -1,0 +1,794 @@
+import {
+  adminProfileResponseSchema,
+  apiErrorSchema,
+  csrfTokenResponseSchema,
+} from '@sk-cinema/shared';
+import type { Express } from 'express';
+import request from 'supertest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { Config } from '../config/env.js';
+import type { Admin } from '../generated/prisma/client.js';
+import {
+  ACCESS_COOKIE_NAME,
+  CSRF_COOKIE_NAME,
+  REFRESH_COOKIE_NAME,
+  REFRESH_COOKIE_PATH,
+} from '../lib/authCookies.js';
+import { hashPassword } from '../lib/password.js';
+import { CSRF_HEADER } from '../middleware/csrf.js';
+import { REFRESH_RATE_LIMIT } from '../middleware/rateLimiter.js';
+import { INVALID_CREDENTIALS_MESSAGE, SESSION_EXPIRED_MESSAGE } from '../services/auth.service.js';
+import {
+  buildTestApp,
+  inMemoryAuthDb,
+  parseSetCookies,
+  testAdmin,
+  testConfig,
+  type InMemoryAuthDb,
+} from '../test/helpers.js';
+
+const BASE = '/api/admin';
+const ALLOWED_ORIGIN = 'http://localhost:5174';
+const EMAIL = 'editor@skcinema.lk';
+const PASSWORD = 'correct horse battery staple';
+const WRONG_PASSWORD = 'Tr0ub4dor&3-wrong-guess';
+const USER_AGENT = 'Mozilla/5.0 (auth routes test)';
+const EPOCH_EXPIRES = new Date(1).toUTCString();
+
+const UNAUTHORIZED_BODY = { error: { code: 'UNAUTHORIZED', message: SESSION_EXPIRED_MESSAGE } };
+const INVALID_CREDENTIALS_BODY = {
+  error: { code: 'INVALID_CREDENTIALS', message: INVALID_CREDENTIALS_MESSAGE },
+};
+const CSRF_BODY = { error: { code: 'CSRF_INVALID', message: 'CSRF validation failed' } };
+
+let passwordHash: string;
+
+beforeAll(async () => {
+  passwordHash = await hashPassword(PASSWORD);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+interface Setup {
+  app: Express;
+  db: InMemoryAuthDb;
+  admin: Admin;
+}
+
+function setup(options: { admin?: Partial<Admin>; config?: Partial<Config> } = {}): Setup {
+  const admin = testAdmin({ email: EMAIL, passwordHash, ...options.admin });
+  const db = inMemoryAuthDb({ admins: [admin] });
+  const { app } = buildTestApp({
+    prisma: db.prisma,
+    ...(options.config && { config: options.config }),
+  });
+  return { app, db, admin };
+}
+
+/** The stored row (rollbacks replace row objects, so always look it up again). */
+function storedAdmin(db: InMemoryAuthDb, id: string): Admin {
+  const row = db.admins.find((a) => a.id === id);
+  if (!row) throw new Error('admin not found');
+  return row;
+}
+
+const cookiePair = (name: string, value: string) => `${name}=${value}`;
+
+interface Csrf {
+  cookie: string;
+  token: string;
+}
+
+/** GET /csrf, keeping the CSRF cookie and token, as the admin app does on load. */
+async function fetchCsrf(app: Express): Promise<Csrf> {
+  const res = await request(app).get(`${BASE}/auth/csrf`);
+  const cookie = parseSetCookies(res)[CSRF_COOKIE_NAME];
+  if (!cookie) throw new Error('no CSRF cookie');
+  return {
+    cookie: cookiePair(CSRF_COOKIE_NAME, cookie.value),
+    token: csrfTokenResponseSchema.parse(res.body).csrfToken,
+  };
+}
+
+interface SendOptions {
+  body?: object | string;
+  /** Extra cookie pairs ("name=value"). */
+  cookies?: string[];
+  /** null: omit the header. */
+  origin?: string | null;
+  /** null: omit the header. */
+  token?: string | null;
+  /** false: do not send the CSRF cookie. */
+  csrfCookie?: boolean;
+}
+
+/** A browser-like client that has done the CSRF dance. */
+async function client(app: Express) {
+  const csrf = await fetchCsrf(app);
+
+  const post = (path: string, options: SendOptions = {}) => {
+    const { body, cookies = [], origin = ALLOWED_ORIGIN, token = csrf.token } = options;
+    const all = [...(options.csrfCookie === false ? [] : [csrf.cookie]), ...cookies];
+    let req = request(app).post(`${BASE}${path}`).set('User-Agent', USER_AGENT);
+    if (all.length > 0) req = req.set('Cookie', all.join('; '));
+    if (origin !== null) req = req.set('Origin', origin);
+    if (token !== null) req = req.set(CSRF_HEADER, token);
+    return body === undefined ? req : req.send(body);
+  };
+
+  /** No CSRF header or Origin: safe methods must not need them. */
+  const get = (path: string, cookies: string[] = []) => {
+    const req = request(app).get(`${BASE}${path}`);
+    return cookies.length > 0 ? req.set('Cookie', cookies.join('; ')) : req;
+  };
+
+  return { csrf, post, get };
+}
+
+type Client = Awaited<ReturnType<typeof client>>;
+
+interface Session {
+  access: string;
+  refresh: string;
+  /** Raw values, to look for leaks. */
+  accessValue: string;
+  refreshValue: string;
+}
+
+function sessionFrom(res: request.Response): Session {
+  const cookies = parseSetCookies(res);
+  const access = cookies[ACCESS_COOKIE_NAME]?.value;
+  const refresh = cookies[REFRESH_COOKIE_NAME]?.value;
+  if (!access || !refresh) throw new Error(`no auth cookies (status ${res.status})`);
+  return {
+    access: cookiePair(ACCESS_COOKIE_NAME, access),
+    refresh: cookiePair(REFRESH_COOKIE_NAME, refresh),
+    accessValue: access,
+    refreshValue: refresh,
+  };
+}
+
+async function logIn(c: Client): Promise<Session> {
+  const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+  expect(res.status).toBe(200);
+  return sessionFrom(res);
+}
+
+const setCookieNames = (res: request.Response) => Object.keys(parseSetCookies(res));
+
+function expectAuthCookiesCleared(res: request.Response) {
+  const cookies = parseSetCookies(res);
+  expect(cookies[ACCESS_COOKIE_NAME]).toEqual({
+    value: '',
+    attributes: {
+      path: '/',
+      expires: EPOCH_EXPIRES,
+      httponly: true,
+      secure: true,
+      samesite: 'Strict',
+    },
+  });
+  expect(cookies[REFRESH_COOKIE_NAME]).toEqual({
+    value: '',
+    attributes: {
+      path: REFRESH_COOKIE_PATH,
+      expires: EPOCH_EXPIRES,
+      httponly: true,
+      secure: true,
+      samesite: 'Strict',
+    },
+  });
+}
+
+function expectNoAuthCookiesSet(res: request.Response) {
+  expect(setCookieNames(res)).not.toContain(ACCESS_COOKIE_NAME);
+  expect(setCookieNames(res)).not.toContain(REFRESH_COOKIE_NAME);
+}
+
+/** The body may only be `{ admin }`, with no token or hash anywhere in it. */
+function expectProfileOnly(res: request.Response, admin: Admin, db: InMemoryAuthDb) {
+  expect(res.body).toEqual({
+    admin: {
+      id: admin.id,
+      email: admin.email,
+      name: admin.name,
+      role: admin.role,
+      mustChangePassword: admin.mustChangePassword,
+    },
+  });
+  adminProfileResponseSchema.parse(res.body);
+  const session = sessionFrom(res);
+  expect(res.text).not.toContain(session.accessValue);
+  expect(res.text).not.toContain(session.refreshValue);
+  expect(res.text).not.toContain(passwordHash);
+  for (const token of db.refreshTokens) expect(res.text).not.toContain(token.tokenHash);
+}
+
+describe('GET /api/admin/auth/csrf', () => {
+  it('returns a token and sets the CSRF cookie, without needing a session', async () => {
+    const { app } = setup();
+    const res = await request(app).get(`${BASE}/auth/csrf`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(csrfTokenResponseSchema.parse(res.body).csrfToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(parseSetCookies(res)[CSRF_COOKIE_NAME]).toEqual({
+      value: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/) as unknown,
+      attributes: { path: '/', httponly: true, secure: true, samesite: 'Strict' },
+    });
+  });
+
+  it('reuses an existing CSRF cookie, so every tab shares one token', async () => {
+    const { app } = setup();
+    const first = await fetchCsrf(app);
+    const res = await request(app).get(`${BASE}/auth/csrf`).set('Cookie', first.cookie);
+
+    expect(res.status).toBe(200);
+    expect(csrfTokenResponseSchema.parse(res.body).csrfToken).toBe(first.token);
+    expect(setCookieNames(res)).not.toContain(CSRF_COOKIE_NAME);
+  });
+});
+
+describe('POST /api/admin/auth/login', () => {
+  it('returns only { admin } and sets the session cookies', async () => {
+    const { app, db, admin } = setup();
+    const c = await client(app);
+    const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expectProfileOnly(res, admin, db);
+    expect(db.refreshTokens).toHaveLength(1);
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+  });
+
+  it('sets the access and refresh cookies with exact flags and paths', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const now = new Date('2026-11-01T04:30:00.000Z');
+    vi.setSystemTime(now);
+    const { app } = setup();
+    const config = testConfig();
+    const c = await client(app);
+
+    const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+    const cookies = parseSetCookies(res);
+    const accessMs = config.auth.accessTokenTtlSeconds * 1000;
+    const refreshMs = config.auth.refreshTokenTtlHours * 3_600_000;
+
+    expect(Object.keys(cookies).sort()).toEqual([ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME].sort());
+    expect(cookies[ACCESS_COOKIE_NAME]?.attributes).toEqual({
+      'max-age': String(accessMs / 1000),
+      path: '/',
+      expires: new Date(now.getTime() + accessMs).toUTCString(),
+      httponly: true,
+      secure: true,
+      samesite: 'Strict',
+    });
+    expect(cookies[REFRESH_COOKIE_NAME]?.attributes).toEqual({
+      'max-age': String(refreshMs / 1000),
+      path: '/api/admin/auth',
+      expires: new Date(now.getTime() + refreshMs).toUTCString(),
+      httponly: true,
+      secure: true,
+      samesite: 'Strict',
+    });
+  });
+
+  it('records the client IP and user agent on the session', async () => {
+    const { app, db } = setup();
+    await logIn(await client(app));
+
+    expect(db.refreshTokens[0]?.userAgent).toBe(USER_AGENT);
+    expect(db.refreshTokens[0]?.ipAddress).toMatch(/127\.0\.0\.1|::1/);
+  });
+
+  it('normalises the email before looking the admin up', async () => {
+    const { app } = setup();
+    const c = await client(app);
+    const res = await c.post('/auth/login', {
+      body: { email: '  Editor@SKCinema.LK ', password: PASSWORD },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  describe('validation', () => {
+    it.each([
+      ['a missing email', { password: PASSWORD }],
+      ['a malformed email', { email: 'not-an-email', password: PASSWORD }],
+      ['a missing password', { email: EMAIL }],
+      ['a password over 128 characters', { email: EMAIL, password: `${PASSWORD}-`.repeat(5) }],
+      ['an unknown key', { email: EMAIL, password: PASSWORD, remember: true }],
+      ['an empty body', {}],
+      ['an array body', [PASSWORD]],
+    ])('rejects %s with 400 and never echoes the password', async (_name, body) => {
+      const { app, db } = setup();
+      const c = await client(app);
+      const res = await c.post('/auth/login', { body });
+
+      expect(res.status).toBe(400);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(apiErrorSchema.parse(res.body).error.code).toBe('VALIDATION_ERROR');
+      expect(res.text).not.toContain(PASSWORD);
+      expectNoAuthCookiesSet(res);
+      expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects a request with no body', async () => {
+      const { app, db } = setup();
+      const res = await (await client(app)).post('/auth/login');
+
+      expect(res.status).toBe(400);
+      expect(apiErrorSchema.parse(res.body).error.code).toBe('VALIDATION_ERROR');
+      expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('reports field paths and messages only, never input values', async () => {
+      const { app } = setup();
+      const res = await (
+        await client(app)
+      ).post('/auth/login', { body: { email: 'bad', password: PASSWORD, extra: PASSWORD } });
+
+      const details = apiErrorSchema.parse(res.body).error.details as {
+        path: unknown[];
+        message: string;
+      }[];
+      expect(details.length).toBeGreaterThan(0);
+      for (const issue of details) {
+        expect(Object.keys(issue).sort()).toEqual(['message', 'path']);
+        expect(issue.path[0]).toBe('body');
+      }
+      expect(res.text).not.toContain(PASSWORD);
+    });
+  });
+
+  describe('refused credentials', () => {
+    it('answers a wrong password with 401 INVALID_CREDENTIALS and no auth cookies', async () => {
+      const { app, admin, db } = setup();
+      const res = await (
+        await client(app)
+      ).post('/auth/login', { body: { email: EMAIL, password: WRONG_PASSWORD } });
+
+      expect(res.status).toBe(401);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.body).toEqual(INVALID_CREDENTIALS_BODY);
+      expectNoAuthCookiesSet(res);
+      expect(storedAdmin(db, admin.id).failedLoginCount).toBe(1);
+    });
+
+    it('answers an unknown email exactly like a wrong password', async () => {
+      const { app } = setup();
+      const res = await (
+        await client(app)
+      ).post('/auth/login', { body: { email: 'nobody@skcinema.lk', password: PASSWORD } });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(INVALID_CREDENTIALS_BODY);
+      expectNoAuthCookiesSet(res);
+    });
+
+    it('refuses a deactivated admin with the same 401', async () => {
+      const { app } = setup({ admin: { isActive: false } });
+      const res = await (
+        await client(app)
+      ).post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(INVALID_CREDENTIALS_BODY);
+      expectNoAuthCookiesSet(res);
+    });
+  });
+
+  describe('CSRF', () => {
+    it.each<[string, SendOptions]>([
+      ['no CSRF header', { token: null }],
+      ['a wrong CSRF token', { token: 'A'.repeat(43) }],
+      ['no CSRF cookie', { csrfCookie: false }],
+      ['a foreign Origin', { origin: 'https://evil.example' }],
+      ['no Origin or Referer', { origin: null }],
+    ])('rejects %s with 403 before the service runs', async (_name, options) => {
+      const { app, db } = setup();
+      const c = await client(app);
+      const res = await c.post('/auth/login', {
+        body: { email: EMAIL, password: PASSWORD },
+        ...options,
+      });
+
+      expect(res.status).toBe(403);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.body).toEqual(CSRF_BODY);
+      expectNoAuthCookiesSet(res);
+      expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('rate limiting', () => {
+    it('answers the 11th attempt from one IP within the window with 429', async () => {
+      const { app, db } = setup();
+      const c = await client(app);
+      expect(testConfig().auth.loginRateLimit.max).toBe(10);
+
+      for (let i = 0; i < 10; i++) {
+        // Invalid bodies still count: the limiter runs before validation.
+        expect((await c.post('/auth/login', { body: { email: 'x', password: 'y' } })).status).toBe(
+          400,
+        );
+      }
+      const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+
+      expect(res.status).toBe(429);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(res.body).toEqual({
+        error: { code: 'RATE_LIMITED', message: 'Too many requests, try again later' },
+      });
+      expectNoAuthCookiesSet(res);
+      expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('counts successful logins too', async () => {
+      const auth = { ...testConfig().auth, loginRateLimit: { windowMs: 60_000, max: 2 } };
+      const { app } = setup({ config: { auth } });
+      const c = await client(app);
+
+      await logIn(c);
+      await logIn(c);
+      const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+
+      expect(res.status).toBe(429);
+    });
+
+    it('limits only login, and each app instance counts on its own', async () => {
+      const auth = { ...testConfig().auth, loginRateLimit: { windowMs: 60_000, max: 1 } };
+      const { app } = setup({ config: { auth } });
+      const c = await client(app);
+      const session = await logIn(c);
+      expect((await c.post('/auth/login', { body: {} })).status).toBe(429);
+
+      // Other auth routes still work from the same IP.
+      expect((await c.post('/auth/refresh', { cookies: [session.refresh] })).status).toBe(200);
+      expect((await c.get('/auth/csrf')).status).toBe(200);
+
+      // A second app has fresh counters.
+      const other = setup({ config: { auth } });
+      await logIn(await client(other.app));
+    });
+  });
+});
+
+describe('POST /api/admin/auth/refresh', () => {
+  it('rotates the session and returns only { admin }', async () => {
+    const { app, db, admin } = setup();
+    const c = await client(app);
+    const first = await logIn(c);
+
+    const res = await c.post('/auth/refresh', { cookies: [first.refresh] });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expectProfileOnly(res, admin, db);
+    const second = sessionFrom(res);
+    expect(second.refreshValue).not.toBe(first.refreshValue);
+    expect(second.accessValue).not.toBe(first.accessValue);
+    const cookies = parseSetCookies(res);
+    expect(cookies[ACCESS_COOKIE_NAME]?.attributes).toMatchObject({
+      path: '/',
+      httponly: true,
+      secure: true,
+      samesite: 'Strict',
+    });
+    expect(cookies[REFRESH_COOKIE_NAME]?.attributes).toMatchObject({
+      path: REFRESH_COOKIE_PATH,
+      httponly: true,
+      secure: true,
+      samesite: 'Strict',
+    });
+
+    // The new access cookie is a working session.
+    expect((await c.get('/me', [second.access])).status).toBe(200);
+  });
+
+  it('keeps the original absolute expiry on the new refresh cookie', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const loginAt = new Date('2026-11-01T04:30:00.000Z');
+    vi.setSystemTime(loginAt);
+    const { app } = setup();
+    const c = await client(app);
+    const first = await logIn(c);
+
+    vi.setSystemTime(new Date(loginAt.getTime() + 3_600_000));
+    const res = await c.post('/auth/refresh', { cookies: [first.refresh] });
+
+    const refreshMs = testConfig().auth.refreshTokenTtlHours * 3_600_000;
+    expect(parseSetCookies(res)[REFRESH_COOKIE_NAME]?.attributes).toMatchObject({
+      'max-age': String((refreshMs - 3_600_000) / 1000),
+      expires: new Date(loginAt.getTime() + refreshMs).toUTCString(),
+    });
+  });
+
+  it('accepts an explicit empty JSON body', async () => {
+    const { app } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    const res = await c.post('/auth/refresh', { cookies: [session.refresh], body: {} });
+    expect(res.status).toBe(200);
+  });
+
+  it('refuses a replayed (already rotated) refresh cookie and clears the cookies', async () => {
+    const { app } = setup();
+    const c = await client(app);
+    const first = await logIn(c);
+    expect((await c.post('/auth/refresh', { cookies: [first.refresh] })).status).toBe(200);
+
+    const res = await c.post('/auth/refresh', { cookies: [first.refresh] });
+
+    expect(res.status).toBe(401);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    expectAuthCookiesCleared(res);
+  });
+
+  it('answers a missing refresh cookie with the same 401 and clears the cookies', async () => {
+    const { app, db } = setup();
+    const res = await (await client(app)).post('/auth/refresh');
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    expectAuthCookiesCleared(res);
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('answers an unknown refresh cookie with the same 401', async () => {
+    const { app } = setup();
+    const res = await (
+      await client(app)
+    ).post('/auth/refresh', { cookies: [cookiePair(REFRESH_COOKIE_NAME, 'not-a-real-token')] });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    expectAuthCookiesCleared(res);
+  });
+
+  it('refuses a deactivated admin', async () => {
+    const { app, db, admin } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    storedAdmin(db, admin.id).isActive = false;
+
+    const res = await c.post('/auth/refresh', { cookies: [session.refresh] });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    expectAuthCookiesCleared(res);
+  });
+
+  it.each([
+    ['an unknown key', { refreshToken: 'smuggled' }],
+    ['an array body', []],
+  ])('rejects %s in the body with 400 before the service runs', async (_name, body) => {
+    const { app, db } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    db.spies.refreshToken.findUnique.mockClear();
+
+    const res = await c.post('/auth/refresh', { cookies: [session.refresh], body });
+
+    expect(res.status).toBe(400);
+    expect(apiErrorSchema.parse(res.body).error.code).toBe('VALIDATION_ERROR');
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, SendOptions]>([
+    ['no CSRF header', { token: null }],
+    ['a foreign Origin', { origin: 'https://evil.example' }],
+  ])('rejects %s with 403 and leaves the session alone', async (_name, options) => {
+    const { app, db } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    db.spies.refreshToken.findUnique.mockClear();
+
+    const res = await c.post('/auth/refresh', { cookies: [session.refresh], ...options });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(CSRF_BODY);
+    expect(setCookieNames(res)).toEqual([]);
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+    expect((await c.post('/auth/refresh', { cookies: [session.refresh] })).status).toBe(200);
+  });
+
+  it(`answers attempt ${REFRESH_RATE_LIMIT.max + 1} from one IP within the window with 429`, async () => {
+    const { app, db } = setup();
+    const c = await client(app);
+    expect(REFRESH_RATE_LIMIT).toEqual({ windowMs: 15 * 60_000, max: 60 });
+
+    for (let i = 0; i < REFRESH_RATE_LIMIT.max; i++) {
+      expect((await c.post('/auth/refresh')).status).toBe(401);
+    }
+    const res = await c.post('/auth/refresh');
+
+    expect(res.status).toBe(429);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(apiErrorSchema.parse(res.body).error.code).toBe('RATE_LIMITED');
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/admin/auth/logout', () => {
+  it('revokes the session, clears both cookies and returns 204', async () => {
+    const { app, db } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+
+    const res = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
+
+    expect(res.status).toBe(204);
+    expect(res.text).toBe('');
+    expect(res.headers['cache-control']).toBe('no-store');
+    expectAuthCookiesCleared(res);
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN', 'LOGOUT']);
+
+    const after = await c.post('/auth/refresh', { cookies: [session.refresh] });
+    expect(after.status).toBe(401);
+  });
+
+  it('works without a valid access cookie, so an expired session can still log out', async () => {
+    const { app, db } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+
+    const res = await c.post('/auth/logout', {
+      cookies: [cookiePair(ACCESS_COOKIE_NAME, 'expired.or.garbage'), session.refresh],
+    });
+
+    expect(res.status).toBe(204);
+    expect(db.refreshTokens.every((t) => t.revokedAt !== null)).toBe(true);
+  });
+
+  it('returns 204 and clears cookies when there is no session at all', async () => {
+    const { app } = setup();
+    const res = await (await client(app)).post('/auth/logout');
+
+    expect(res.status).toBe(204);
+    expectAuthCookiesCleared(res);
+  });
+
+  it('still clears the cookies when revoking fails, and hides the error', async () => {
+    const { app, db } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    db.spies.refreshToken.findUnique.mockRejectedValueOnce(new Error('connection lost: secret'));
+
+    const res = await c.post('/auth/logout', { cookies: [session.refresh] });
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({
+      error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' },
+    });
+    expectAuthCookiesCleared(res);
+  });
+
+  it('rejects a body with keys with 400', async () => {
+    const { app, db } = setup();
+    const res = await (await client(app)).post('/auth/logout', { body: { all: true } });
+
+    expect(res.status).toBe(400);
+    expect(apiErrorSchema.parse(res.body).error.code).toBe('VALIDATION_ERROR');
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('rejects a request without CSRF with 403 and keeps the session', async () => {
+    const { app, db } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    db.spies.refreshToken.findUnique.mockClear();
+
+    const res = await c.post('/auth/logout', { cookies: [session.refresh], token: null });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(CSRF_BODY);
+    expect(setCookieNames(res)).toEqual([]);
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+    expect((await c.post('/auth/refresh', { cookies: [session.refresh] })).status).toBe(200);
+  });
+});
+
+describe('GET /api/admin/me', () => {
+  it('returns { admin } for the access cookie, without CSRF', async () => {
+    const { app, admin } = setup({ admin: { role: 'SUPER_ADMIN', mustChangePassword: true } });
+    const c = await client(app);
+    const session = await logIn(c);
+
+    const res = await c.get('/me', [session.access]);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(adminProfileResponseSchema.parse(res.body)).toEqual({
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        name: admin.name,
+        role: 'SUPER_ADMIN',
+        mustChangePassword: true,
+      },
+    });
+  });
+
+  it('answers a missing access cookie with 401', async () => {
+    const { app } = setup();
+    const res = await request(app).get(`${BASE}/me`);
+
+    expect(res.status).toBe(401);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+  });
+
+  it('answers an invalid access cookie with 401', async () => {
+    const { app } = setup();
+    const res = await request(app)
+      .get(`${BASE}/me`)
+      .set('Cookie', cookiePair(ACCESS_COOKIE_NAME, 'not.a.jwt'));
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+  });
+
+  it('answers 401 once the admin is deactivated', async () => {
+    const { app, db, admin } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+    storedAdmin(db, admin.id).isActive = false;
+
+    const res = await c.get('/me', [session.access]);
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+  });
+
+  it('does not accept the refresh cookie as a session', async () => {
+    const { app } = setup();
+    const c = await client(app);
+    const session = await logIn(c);
+
+    const res = await c.get('/me', [cookiePair(ACCESS_COOKIE_NAME, session.refreshValue)]);
+
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('admin router', () => {
+  it('returns the standard 404 for unknown GET routes, with no-store', async () => {
+    const { app } = setup();
+    const res = await request(app).get(`${BASE}/does-not-exist`);
+
+    expect(res.status).toBe(404);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(apiErrorSchema.parse(res.body).error.code).toBe('NOT_FOUND');
+  });
+
+  it('checks CSRF before routing unsafe methods, then 404s unknown routes', async () => {
+    const { app } = setup();
+    const c = await client(app);
+
+    const withoutCsrf = await c.post('/does-not-exist', { token: null });
+    expect(withoutCsrf.status).toBe(403);
+    expect(withoutCsrf.body).toEqual(CSRF_BODY);
+
+    const withCsrf = await c.post('/does-not-exist');
+    expect(withCsrf.status).toBe(404);
+    expect(withCsrf.headers['cache-control']).toBe('no-store');
+    expect(apiErrorSchema.parse(withCsrf.body).error.code).toBe('NOT_FOUND');
+  });
+
+  it('does not answer GET on POST-only auth routes', async () => {
+    const { app, db } = setup();
+    const res = await request(app).get(`${BASE}/auth/login`);
+
+    expect(res.status).toBe(404);
+    expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('does not add no-store to public routes', async () => {
+    const res = await request(buildTestApp().app).get('/api/does-not-exist');
+    expect(res.headers['cache-control']).toBeUndefined();
+  });
+});

@@ -2,7 +2,7 @@ import cookieParser from 'cookie-parser';
 import express, { type Request, type Response } from 'express';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { testConfig } from '../test/helpers.js';
+import { parseSetCookies, testConfig } from '../test/helpers.js';
 import {
   ACCESS_COOKIE_NAME,
   CSRF_COOKIE_NAME,
@@ -18,30 +18,6 @@ import {
 
 const NOW = new Date('2026-11-01T04:30:00.000Z');
 const EPOCH_EXPIRES = new Date(1).toUTCString();
-
-interface ParsedCookie {
-  value: string;
-  attributes: Record<string, string | true>;
-}
-
-/** Parses Set-Cookie headers by cookie name; attribute names are lower-cased. */
-function parseSetCookies(res: request.Response): Record<string, ParsedCookie> {
-  const header = res.headers['set-cookie'] as string[] | string | undefined;
-  const lines = header === undefined ? [] : Array.isArray(header) ? header : [header];
-  const parsed: Record<string, ParsedCookie> = {};
-  for (const line of lines) {
-    const [pair = '', ...attrs] = line.split('; ');
-    const eq = pair.indexOf('=');
-    const attributes: Record<string, string | true> = {};
-    for (const attr of attrs) {
-      const i = attr.indexOf('=');
-      if (i === -1) attributes[attr.toLowerCase()] = true;
-      else attributes[attr.slice(0, i).toLowerCase()] = attr.slice(i + 1);
-    }
-    parsed[pair.slice(0, eq)] = { value: pair.slice(eq + 1), attributes };
-  }
-  return parsed;
-}
 
 function appWith(handler: (req: Request, res: Response) => void) {
   const app = express();

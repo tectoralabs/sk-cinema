@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { pino } from 'pino';
+import type request from 'supertest';
 import { vi } from 'vitest';
 import { createApp } from '../app.js';
 import type { Config } from '../config/env.js';
@@ -259,4 +260,28 @@ export function buildTestApp(options: { config?: Partial<Config>; prisma?: Prism
     cache,
   });
   return { app, prisma, cache };
+}
+
+export interface ParsedCookie {
+  value: string;
+  attributes: Record<string, string | true>;
+}
+
+/** Parses Set-Cookie headers by cookie name; attribute names are lower-cased. */
+export function parseSetCookies(res: request.Response): Record<string, ParsedCookie> {
+  const header = res.headers['set-cookie'] as string[] | string | undefined;
+  const lines = header === undefined ? [] : Array.isArray(header) ? header : [header];
+  const parsed: Record<string, ParsedCookie> = {};
+  for (const line of lines) {
+    const [pair = '', ...attrs] = line.split('; ');
+    const eq = pair.indexOf('=');
+    const attributes: Record<string, string | true> = {};
+    for (const attr of attrs) {
+      const i = attr.indexOf('=');
+      if (i === -1) attributes[attr.toLowerCase()] = true;
+      else attributes[attr.slice(0, i).toLowerCase()] = attr.slice(i + 1);
+    }
+    parsed[pair.slice(0, eq)] = { value: pair.slice(eq + 1), attributes };
+  }
+  return parsed;
 }
