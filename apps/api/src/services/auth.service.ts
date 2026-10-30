@@ -31,7 +31,9 @@ const invalidCredentials = () =>
  */
 export const SESSION_EXPIRED_MESSAGE = 'Session expired';
 
-const sessionExpired = () => new AppError(401, ERROR_CODES.UNAUTHORIZED, SESSION_EXPIRED_MESSAGE);
+/** The one 401 for every refused session (refresh, getMe, requireAuth). */
+export const sessionExpired = () =>
+  new AppError(401, ERROR_CODES.UNAUTHORIZED, SESSION_EXPIRED_MESSAGE);
 
 export type AuthDb = Pick<PrismaClient, 'admin' | 'refreshToken' | 'auditLog' | '$transaction'>;
 
@@ -101,6 +103,15 @@ const adminSessionSelect = {
   isActive: true,
   mustChangePassword: true,
 } as const satisfies Prisma.AdminSelect;
+
+/** Just enough to authorise a request: who, which role, and whether still allowed in. */
+const adminAuthSelect = {
+  id: true,
+  role: true,
+  isActive: true,
+} as const satisfies Prisma.AdminSelect;
+
+export type AdminAuthState = Pick<Admin, keyof typeof adminAuthSelect>;
 
 const refreshTokenSelect = {
   id: true,
@@ -402,6 +413,17 @@ export async function getMe(
   const admin = await db.admin.findUnique({ where: { id: adminId }, select: adminSessionSelect });
   if (!admin?.isActive) throw sessionExpired();
   return toAdminProfile(admin);
+}
+
+/**
+ * The current id, role and active flag of an admin, or null if there is no such admin.
+ * Used by requireAuth on every request, so the DB (not the token) decides role and access.
+ */
+export function findAdminAuthState(
+  adminId: string,
+  { db }: { db: Pick<AuthDb, 'admin'> },
+): Promise<AdminAuthState | null> {
+  return db.admin.findUnique({ where: { id: adminId }, select: adminAuthSelect });
 }
 
 /** Revokes every live token in a family and returns how many were revoked. */
