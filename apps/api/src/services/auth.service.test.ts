@@ -42,6 +42,8 @@ const MAX = authConfig.loginMaxFailedAttempts;
 let passwordHash: string;
 let db: InMemoryAuthDb;
 let clock: Date;
+/** The injected service logger; only logout's best-effort audit uses it. */
+const logger = { error: vi.fn() };
 
 beforeAll(async () => {
   passwordHash = await hashPassword(PASSWORD);
@@ -63,7 +65,7 @@ function storedAdmin(): Admin {
   return admin;
 }
 
-const deps = () => ({ db: db.prisma, config: authConfig, now: () => clock });
+const deps = () => ({ db: db.prisma, config: authConfig, logger, now: () => clock });
 
 const attempt = (overrides: Partial<LoginInput> = {}) =>
   login(
@@ -854,6 +856,73 @@ describe('logout', () => {
 
     expect(actions()).toEqual(['LOGIN', 'LOGOUT']);
   });
+
+  it('commits the revocation on its own, outside a transaction, and logs nothing', async () => {
+    const session = await attempt();
+    db.spies.$transaction.mockClear();
+
+    await signOut(session.refreshToken);
+
+    expect(db.spies.$transaction).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('logout: the LOGOUT audit is best-effort', () => {
+  it('a failing audit write still revokes the family, resolves, and logs ids only', async () => {
+    const session = await attempt();
+    const rotatedAt = clock;
+    const latest = await rotate(session.refreshToken);
+    const { adminId, familyId } = rowFor(session.refreshToken);
+    clock = new Date(clock.getTime() + MINUTE_MS);
+    const failure = new Error('audit insert failed');
+    let revokedAt: unknown = 'not reached';
+    db.spies.auditLog.create.mockImplementationOnce(() => {
+      revokedAt = rowFor(latest.refreshToken).revokedAt;
+      return Promise.reject(failure);
+    });
+
+    await expect(signOut(latest.refreshToken)).resolves.toBeUndefined();
+
+    expect(revokedAt).toEqual(clock); // revoked before the audit was attempted
+    expect(rowFor(latest.refreshToken).revokedAt).toEqual(clock); // and it stayed revoked
+    expect(rowFor(session.refreshToken).revokedAt).toEqual(rotatedAt);
+    expect(familyRows(familyId).every((t) => t.revokedAt !== null)).toBe(true);
+    expect(actions()).toEqual(['LOGIN']);
+    await expect(findSessionAuthState(adminId, familyId, deps())).resolves.toMatchObject({
+      sessionLive: false,
+    });
+    // A revoked token without a successor: a plain refusal, not a reuse alarm.
+    expect(errorShape(await refreshRefused(latest.refreshToken))).toBe(SESSION_EXPIRED);
+    expect(actions()).toEqual(['LOGIN']);
+
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    const [fields, message] = logger.error.mock.calls[0] as [Record<string, unknown>, string];
+    expect(fields).toEqual({ err: failure, adminId, familyId, revokedCount: 1 });
+    expect(message).toMatch(/LOGOUT audit write failed/);
+    const logged = JSON.stringify([{ ...fields, err: String(failure) }, message]);
+    for (const secret of [
+      session.refreshToken,
+      latest.refreshToken,
+      hashRefreshToken(session.refreshToken),
+      hashRefreshToken(latest.refreshToken),
+    ]) {
+      expect(logged).not.toContain(secret);
+    }
+  });
+
+  it('a failing revocation rejects, revokes nothing, audits nothing and logs nothing', async () => {
+    const session = await attempt();
+    const failure = new Error('connection lost');
+    db.spies.refreshToken.updateMany.mockRejectedValueOnce(failure);
+
+    await expect(signOut(session.refreshToken)).rejects.toBe(failure);
+
+    expect(rowFor(session.refreshToken).revokedAt).toBeNull();
+    expect(actions()).toEqual(['LOGIN']);
+    expect(db.spies.auditLog.create).toHaveBeenCalledTimes(1); // LOGIN only
+    expect(logger.error).not.toHaveBeenCalled();
+  });
 });
 
 /**
@@ -1016,40 +1085,6 @@ describe('transactions roll back after a real write', () => {
         expect.objectContaining({ tokenHash: hashRefreshToken(result.refreshToken) }),
       ]);
       expect(actions()).toEqual(['LOGIN']);
-    });
-  });
-
-  describe('logout', () => {
-    it('the LOGOUT audit write fails after the revocation: the family stays live; a retry logs out', async () => {
-      const session = await attempt();
-      const rotatedAt = clock;
-      const latest = await rotate(session.refreshToken);
-      const { adminId, familyId } = rowFor(session.refreshToken);
-      clock = new Date(clock.getTime() + MINUTE_MS);
-      const failure = new Error('audit insert failed');
-      let revokedAt: unknown = 'not reached';
-      db.spies.auditLog.create.mockImplementationOnce(() => {
-        revokedAt = rowFor(latest.refreshToken).revokedAt;
-        return Promise.reject(failure);
-      });
-
-      await expect(signOut(latest.refreshToken)).rejects.toBe(failure);
-
-      expect(revokedAt).toEqual(clock); // the revocation had been written
-      expect(rowFor(latest.refreshToken).revokedAt).toBeNull();
-      expect(rowFor(session.refreshToken).revokedAt).toEqual(rotatedAt);
-      expect(actions()).toEqual(['LOGIN']);
-      await expect(findSessionAuthState(adminId, familyId, deps())).resolves.toMatchObject({
-        sessionLive: true,
-      });
-
-      await signOut(latest.refreshToken);
-
-      expect(rowFor(latest.refreshToken).revokedAt).toEqual(clock);
-      expect(actions()).toEqual(['LOGIN', 'LOGOUT']);
-      await expect(findSessionAuthState(adminId, familyId, deps())).resolves.toMatchObject({
-        sessionLive: false,
-      });
     });
   });
 });

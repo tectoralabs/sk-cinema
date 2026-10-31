@@ -13,6 +13,7 @@ import type {
   PrismaClient,
   RefreshToken,
 } from '../generated/prisma/client.js';
+import { ADMIN_API_PATH } from '../lib/apiPaths.js';
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_NAME } from '../lib/authCookies.js';
 import { MemoryCache } from '../lib/cache.js';
 import { generateRefreshToken, hashRefreshToken } from '../lib/tokens.js';
@@ -752,7 +753,8 @@ export function parseSetCookies(res: request.Response): Record<string, ParsedCoo
 // A browser-like client for the admin API (CSRF dance, cookies, Origin).
 // ---------------------------------------------------------------------------
 
-export const ADMIN_BASE = '/api/admin';
+/** The admin router's mount, from the same constants app.ts and the CORS policy use. */
+export const ADMIN_BASE = ADMIN_API_PATH;
 export const TEST_USER_AGENT = 'Mozilla/5.0 (SK Cinema API test)';
 
 /** A "name=value" pair for a Cookie request header. */

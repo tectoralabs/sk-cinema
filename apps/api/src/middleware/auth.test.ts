@@ -441,7 +441,7 @@ describe('requireAuth with sessions from the auth service', () => {
   function serviceSetup() {
     const admin = testAdmin({ email: 'session@skcinema.lk', passwordHash });
     const { app, db } = authApp([admin], { refreshTokens: [] });
-    const deps: AuthServiceDeps = { db: db.prisma, config: config.auth };
+    const deps: AuthServiceDeps = { db: db.prisma, config: config.auth, logger: silentLogger };
     const logIn = () => login({ email: admin.email, password: PASSWORD }, deps);
     const rotate = (refreshToken: string) => refresh({ refreshToken }, deps);
     const setActive = (isActive: boolean) => {

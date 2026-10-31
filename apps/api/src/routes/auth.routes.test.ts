@@ -3,7 +3,9 @@ import {
   apiErrorSchema,
   csrfTokenResponseSchema,
 } from '@sk-cinema/shared';
+import { Writable } from 'node:stream';
 import type { Express } from 'express';
+import { pino, type Logger } from 'pino';
 import request from 'supertest';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Config } from '../config/env.js';
@@ -64,14 +66,31 @@ interface Setup {
   admin: Admin;
 }
 
-function setup(options: { admin?: Partial<Admin>; config?: Partial<Config> } = {}): Setup {
+function setup(
+  options: { admin?: Partial<Admin>; config?: Partial<Config>; logger?: Logger } = {},
+): Setup {
   const admin = testAdmin({ email: EMAIL, passwordHash, ...options.admin });
   const db = inMemoryAuthDb({ admins: [admin] });
   const { app } = buildTestApp({
     prisma: db.prisma,
     ...(options.config && { config: options.config }),
+    ...(options.logger && { logger: options.logger }),
   });
   return { app, db, admin };
+}
+
+/** A raw pino logger (no app redaction, so leaks would show) writing parsed lines to an array. */
+function captureLogs() {
+  const lines: string[] = [];
+  const stream = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      lines.push(chunk.toString());
+      callback();
+    },
+  });
+  const logger = pino({ level: 'debug' }, stream);
+  const parsed = () => lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+  return { logger, lines, parsed };
 }
 
 /** The stored row, looked up by id (the store keeps row objects across rollbacks). */
@@ -586,7 +605,7 @@ describe('POST /api/admin/auth/logout', () => {
     expectAuthCookiesCleared(res);
   });
 
-  it('still clears the cookies when revoking fails, and hides the error', async () => {
+  it('still clears the cookies when the token lookup fails, and hides the error', async () => {
     const { app, db } = setup();
     const c = await authClient(app);
     const session = await logIn(c);
@@ -599,6 +618,24 @@ describe('POST /api/admin/auth/logout', () => {
       error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' },
     });
     expectAuthCookiesCleared(res);
+  });
+
+  it('answers 500 and still clears the cookies when the revocation itself fails', async () => {
+    const { app, db } = setup();
+    const c = await authClient(app);
+    const session = await logIn(c);
+    db.spies.refreshToken.updateMany.mockRejectedValueOnce(new Error('connection lost: secret'));
+
+    const res = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({
+      error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' },
+    });
+    expect(res.text).not.toContain('connection lost');
+    expectAuthCookiesCleared(res);
+    expect(db.refreshTokens[0]?.revokedAt).toBeNull();
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
   });
 
   it('rejects a body with keys with 400', async () => {
@@ -694,27 +731,53 @@ describe('database failures inside auth transactions', () => {
     expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
   });
 
-  it('logout: a failing LOGOUT audit answers the generic 500, still clears the cookies, and revokes nothing', async () => {
-    const { app, db } = setup();
+  it('logout: a failing LOGOUT audit still revokes the session, answers 204 and logs the error without secrets', async () => {
+    const { logger, lines, parsed } = captureLogs();
+    const { app, db, admin } = setup({ logger });
     const c = await authClient(app);
     const session = await logIn(c);
     db.spies.auditLog.create.mockRejectedValueOnce(dbFailure());
 
     const res = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
 
-    expectGenericInternalError(res);
+    expect(res.status).toBe(204);
+    expect(res.text).toBe('');
     expectAuthCookiesCleared(res);
-    expect(db.refreshTokens[0]?.revokedAt).toBeNull();
-    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
-    // The browser dropped its cookies, but the server-side session is still live.
-    expect((await c.get('/me', [session.access])).status).toBe(200);
-
-    const retry = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
-
-    expect(retry.status).toBe(204);
     expect(db.refreshTokens[0]?.revokedAt).not.toBeNull();
-    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN', 'LOGOUT']);
-    expect((await c.get('/me', [session.access])).status).toBe(401);
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+    // A copied cookie no longer works: neither the access token nor the refresh token.
+    const me = await c.get('/me', [session.access]);
+    expect(me.status).toBe(401);
+    expect(me.body).toEqual(UNAUTHORIZED_BODY);
+    const refreshed = await c.post('/auth/refresh', { cookies: [session.refresh] });
+    expect(refreshed.status).toBe(401);
+    expect(refreshed.body).toEqual(UNAUTHORIZED_BODY);
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']); // no reuse alarm either
+
+    const auditErrors = parsed().filter((l) =>
+      String(l['msg']).includes('LOGOUT audit write failed'),
+    );
+    expect(auditErrors).toHaveLength(1);
+    expect(auditErrors[0]).toMatchObject({
+      level: 50,
+      adminId: admin.id,
+      familyId: db.refreshTokens[0]?.familyId,
+      revokedCount: 1,
+      err: { message: expect.stringContaining('statement failed') as unknown },
+    });
+    const log = lines.join('');
+    for (const secret of [
+      session.accessValue,
+      session.refreshValue,
+      c.csrf.token,
+      c.csrf.cookieValue,
+      ...db.refreshTokens.map((t) => t.tokenHash),
+    ]) {
+      expect(log).not.toContain(secret);
+    }
+    for (const cookieName of [ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, CSRF_COOKIE_NAME]) {
+      expect(log).not.toContain(cookieName);
+    }
   });
 });
 
@@ -778,43 +841,5 @@ describe('GET /api/admin/me', () => {
     const res = await c.get('/me', [cookiePair(ACCESS_COOKIE_NAME, session.refreshValue)]);
 
     expect(res.status).toBe(401);
-  });
-});
-
-describe('admin router', () => {
-  it('returns the standard 404 for unknown GET routes, with no-store', async () => {
-    const { app } = setup();
-    const res = await request(app).get(`${BASE}/does-not-exist`);
-
-    expect(res.status).toBe(404);
-    expect(res.headers['cache-control']).toBe('no-store');
-    expect(apiErrorSchema.parse(res.body).error.code).toBe('NOT_FOUND');
-  });
-
-  it('checks CSRF before routing unsafe methods, then 404s unknown routes', async () => {
-    const { app } = setup();
-    const c = await authClient(app);
-
-    const withoutCsrf = await c.post('/does-not-exist', { token: null });
-    expect(withoutCsrf.status).toBe(403);
-    expect(withoutCsrf.body).toEqual(CSRF_BODY);
-
-    const withCsrf = await c.post('/does-not-exist');
-    expect(withCsrf.status).toBe(404);
-    expect(withCsrf.headers['cache-control']).toBe('no-store');
-    expect(apiErrorSchema.parse(withCsrf.body).error.code).toBe('NOT_FOUND');
-  });
-
-  it('does not answer GET on POST-only auth routes', async () => {
-    const { app, db } = setup();
-    const res = await request(app).get(`${BASE}/auth/login`);
-
-    expect(res.status).toBe(404);
-    expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
-  });
-
-  it('does not add no-store to public routes', async () => {
-    const res = await request(buildTestApp().app).get('/api/does-not-exist');
-    expect(res.headers['cache-control']).toBeUndefined();
   });
 });

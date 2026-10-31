@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ERROR_CODES, type AdminProfile } from '@sk-cinema/shared';
+import type { Logger } from 'pino';
 import type { Config } from '../config/env.js';
 import type { Admin, Prisma, PrismaClient } from '../generated/prisma/client.js';
 import { AppError } from '../lib/errors.js';
@@ -40,6 +41,11 @@ export type AuthDb = Pick<PrismaClient, 'admin' | 'refreshToken' | 'auditLog' | 
 export interface AuthServiceDeps {
   db: AuthDb;
   config: Config['auth'];
+  /**
+   * For failures the service handles itself instead of throwing (today: a best-effort LOGOUT
+   * audit). The app logger, so its redaction applies. Never given tokens, hashes or cookies.
+   */
+  logger: Pick<Logger, 'error'>;
   /** Injectable clock for tests. Defaults to the current time. */
   now?: () => Date;
 }
@@ -437,10 +443,16 @@ export async function refresh(input: RefreshInput, deps: AuthServiceDeps): Promi
 /**
  * Revokes every live token in the presented token's family. Idempotent: a missing, unknown
  * or already-revoked token is a no-op. LOGOUT is audited only when something was revoked.
+ *
+ * The revocation commits on its own, before the audit: the client drops its cookies whatever
+ * happens, so a revocation rolled back with a failed audit would leave a session nobody can
+ * end (a copied cookie would keep working until the family expires). Lookup and revocation
+ * errors still reject (500). The audit is best-effort: if it fails, the error is logged and
+ * the logout still succeeds.
  */
 export async function logout(input: LogoutInput, deps: AuthServiceDeps): Promise<void> {
   if (!input.refreshToken) return;
-  const { db } = deps;
+  const { db, logger } = deps;
   const now = deps.now?.() ?? new Date();
 
   const token = await db.refreshToken.findUnique({
@@ -449,17 +461,24 @@ export async function logout(input: LogoutInput, deps: AuthServiceDeps): Promise
   });
   if (!token) return;
 
-  await db.$transaction(async (tx) => {
-    const revoked = await revokeFamily(tx, token.familyId, now);
-    if (revoked === 0) return;
-    await writeAudit(tx, {
+  const revokedCount = await revokeFamily(db, token.familyId, now);
+  if (revokedCount === 0) return;
+
+  try {
+    await writeAudit(db, {
       action: 'LOGOUT',
       adminId: token.adminId,
       entity: AUDIT_ENTITY,
       entityId: token.adminId,
       ...clientInfo(input),
     });
-  });
+  } catch (err) {
+    // Ids only: never the token, its hash or a cookie.
+    logger.error(
+      { err, adminId: token.adminId, familyId: token.familyId, revokedCount },
+      'LOGOUT audit write failed; the session was revoked',
+    );
+  }
 }
 
 /** The signed-in admin's profile. Throws 401 UNAUTHORIZED if missing or deactivated. */

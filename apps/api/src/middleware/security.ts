@@ -2,6 +2,7 @@ import cors, { type CorsOptions } from 'cors';
 import { Router, type RequestHandler } from 'express';
 import helmet from 'helmet';
 import type { Config } from '../config/env.js';
+import { ADMIN_API_PATH } from '../lib/apiPaths.js';
 import { CSRF_HEADER } from './csrf.js';
 import { REQUEST_ID_HEADER } from './requestLogger.js';
 
@@ -25,9 +26,6 @@ export function securityHeaders() {
     strictTransportSecurity: { maxAge: 31_536_000, includeSubDomains: true },
   });
 }
-
-/** Where apiRouter mounts the admin routes (`/api` + `/admin`). */
-export const ADMIN_API_PATH = '/api/admin';
 
 const SHARED_CORS_OPTIONS = {
   exposedHeaders: [REQUEST_ID_HEADER],
