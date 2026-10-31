@@ -15,6 +15,7 @@ export function apiRouter({ config, prisma, cache, logger }: AppDeps): Router {
   router.use(healthRoutes(createHealthController(healthService)));
 
   const authService: AuthServiceDeps = { db: prisma, config: config.auth };
+  // Must stay in step with ADMIN_API_PATH (middleware/security.ts), which picks the admin CORS.
   router.use(
     '/admin',
     adminRoutes({

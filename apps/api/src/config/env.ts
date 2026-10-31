@@ -10,6 +10,17 @@ const originSchema = z.url({ protocol: /^https?$/ }).refine((value) => {
   return url.origin === value.replace(/\/$/, '') && url.username === '' && url.password === '';
 }, 'must be a bare origin like https://example.com');
 
+/** Comma-separated bare origins; trailing slashes and blank entries are dropped. */
+const originListSchema = z
+  .string({ error: 'is required' })
+  .transform((value) =>
+    value
+      .split(',')
+      .map((origin) => origin.trim().replace(/\/$/, ''))
+      .filter(Boolean),
+  )
+  .pipe(z.array(originSchema).min(1, 'must list at least one origin'));
+
 /** Integer env var within [min, max], with a default when unset. */
 function intInRange(min: number, max: number, defaultValue: number) {
   return z.coerce
@@ -35,15 +46,13 @@ const envSchema = z
     DATABASE_URL: z
       .string()
       .regex(/^postgres(ql)?:\/\//, 'must be a postgresql:// connection string'),
-    CORS_ORIGINS: z
-      .string()
-      .transform((value) =>
-        value
-          .split(',')
-          .map((origin) => origin.trim().replace(/\/$/, ''))
-          .filter(Boolean),
-      )
-      .pipe(z.array(originSchema).min(1, 'must list at least one origin')),
+    /** Public site origins: CORS without credentials, never on /api/admin. */
+    CORS_ORIGINS: originListSchema,
+    /**
+     * Admin app origins: the only origins given credentialed CORS and accepted by the CSRF
+     * Origin check on /api/admin. Must not include the public site.
+     */
+    ADMIN_ORIGINS: originListSchema,
     /** Number of reverse proxies in front of the app (e.g. Cloudflare + nginx = 2). 0 = none. */
     TRUST_PROXY: z.coerce.number().int().min(0).max(10).default(0),
     RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
@@ -70,16 +79,30 @@ const envSchema = z
       });
     }
 
-    if (env.NODE_ENV !== 'production') return;
-    env.CORS_ORIGINS.forEach((origin, index) => {
-      if (!origin.startsWith('https://')) {
+    // An origin in both lists would be trusted as admin, so each must be one or the other.
+    const publicOrigins = new Set(env.CORS_ORIGINS);
+    env.ADMIN_ORIGINS.forEach((origin, index) => {
+      if (publicOrigins.has(origin)) {
         ctx.addIssue({
           code: 'custom',
-          path: ['CORS_ORIGINS', index],
-          message: 'must use https in production',
+          path: ['ADMIN_ORIGINS', index],
+          message: 'must not also be listed in CORS_ORIGINS',
         });
       }
     });
+
+    if (env.NODE_ENV !== 'production') return;
+    for (const name of ['CORS_ORIGINS', 'ADMIN_ORIGINS'] as const) {
+      env[name].forEach((origin, index) => {
+        if (!origin.startsWith('https://')) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [name, index],
+            message: 'must use https in production',
+          });
+        }
+      });
+    }
   });
 
 export interface Config {
@@ -88,7 +111,10 @@ export interface Config {
   port: number;
   logLevel: (typeof LOG_LEVELS)[number];
   databaseUrl: string;
+  /** Public site origins (CORS_ORIGINS): CORS without credentials, never on /api/admin. */
   corsOrigins: string[];
+  /** Admin app origins (ADMIN_ORIGINS): credentialed CORS and the CSRF Origin allowlist. */
+  adminOrigins: string[];
   trustProxy: number;
   rateLimit: { windowMs: number; max: number };
   auth: {
@@ -129,6 +155,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
     logLevel: env.LOG_LEVEL,
     databaseUrl: env.DATABASE_URL,
     corsOrigins: env.CORS_ORIGINS,
+    adminOrigins: env.ADMIN_ORIGINS,
     trustProxy: env.TRUST_PROXY,
     rateLimit: { windowMs: env.RATE_LIMIT_WINDOW_MS, max: env.RATE_LIMIT_MAX },
     auth: {

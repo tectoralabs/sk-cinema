@@ -14,6 +14,11 @@ import { CSRF_HEADER } from '../middleware/csrf.js';
 
 export const silentLogger = pino({ level: 'silent' });
 
+/** testConfig().corsOrigins: the public site. Never trusted by /api/admin. */
+export const PUBLIC_ORIGIN = 'http://localhost:5173';
+/** testConfig().adminOrigins: the admin app, the only origin /api/admin trusts. */
+export const ADMIN_ORIGIN = 'http://localhost:5174';
+
 export function testConfig(overrides: Partial<Config> = {}): Config {
   return {
     nodeEnv: 'test',
@@ -21,7 +26,9 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     port: 0,
     logLevel: 'silent',
     databaseUrl: 'postgresql://user:pass@localhost:5432/test',
-    corsOrigins: ['http://localhost:5173', 'http://localhost:5174'],
+    // The public site (CORS without credentials) and the admin app (credentialed CORS, CSRF).
+    corsOrigins: [PUBLIC_ORIGIN],
+    adminOrigins: [ADMIN_ORIGIN],
     trustProxy: 0,
     rateLimit: { windowMs: 60_000, max: 1000 },
     auth: {
@@ -382,8 +389,6 @@ export function parseSetCookies(res: request.Response): Record<string, ParsedCoo
 // ---------------------------------------------------------------------------
 
 export const ADMIN_BASE = '/api/admin';
-/** One of testConfig().corsOrigins: the admin app's origin. */
-export const ALLOWED_ORIGIN = 'http://localhost:5174';
 export const TEST_USER_AGENT = 'Mozilla/5.0 (SK Cinema API test)';
 
 /** A "name=value" pair for a Cookie request header. */
@@ -437,7 +442,7 @@ export async function authClient(app: Express, options: AuthClientOptions = {}) 
     options.ip === undefined ? req : req.set('X-Forwarded-For', options.ip);
 
   const post = (path: string, send: SendOptions = {}) => {
-    const { body, cookies = [], origin = ALLOWED_ORIGIN, token = csrf.token } = send;
+    const { body, cookies = [], origin = ADMIN_ORIGIN, token = csrf.token } = send;
     const all = [...(send.csrfCookie === false ? [] : [csrf.cookie]), ...cookies];
     let req = withIp(request(app).post(`${ADMIN_BASE}${path}`).set('User-Agent', TEST_USER_AGENT));
     if (all.length > 0) req = req.set('Cookie', all.join('; '));

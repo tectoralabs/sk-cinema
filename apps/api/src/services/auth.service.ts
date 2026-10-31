@@ -177,6 +177,10 @@ export async function login(input: LoginInput, deps: AuthServiceDeps): Promise<L
   }
 
   // Locked and inactive accounts never reach the real hash, but burn the same argon2 work.
+  // Timing is not perfectly uniform: only real active accounts do the extra DB writes below
+  // (the attempt reservation, and possibly the lock), which the unknown-email, already-locked
+  // and inactive paths skip, so they differ by about one DB round trip. Accepted: the argon2 cost, which
+  // dominates, is equalised, and admin emails are low-secrecy.
   if (admin.lockedUntil && admin.lockedUntil.getTime() > now.getTime()) {
     await verifyDummyPassword(input.password);
     return refuse('locked', admin.id);
@@ -357,13 +361,15 @@ export async function refresh(input: RefreshInput, deps: AuthServiceDeps): Promi
   if (!token) throw sessionExpired();
 
   const reuseDetected = async (): Promise<never> => {
-    await revokeFamily(db, token.familyId, now);
+    const revokedCount = await revokeFamily(db, token.familyId, now);
+    // Always audited, even when nothing was left to revoke. revokedCount > 0 means the family
+    // was still live (likely theft); 0 means a replay after logout or an earlier revocation.
     await writeAudit(db, {
       action: 'TOKEN_REUSE_DETECTED',
       adminId: token.adminId,
       entity: AUDIT_ENTITY,
       entityId: token.adminId,
-      details: { familyId: token.familyId },
+      details: { familyId: token.familyId, revokedCount },
       ...client,
     });
     throw sessionExpired();

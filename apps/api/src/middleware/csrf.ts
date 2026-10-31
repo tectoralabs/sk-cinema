@@ -74,12 +74,16 @@ function checkToken(req: Request, csrfSecret: string): CsrfFailure | undefined {
 
 /**
  * Signed double-submit CSRF protection for cookie-authenticated routes. Unsafe requests
- * need an allowlisted Origin (or Referer when Origin is absent) and an X-CSRF-Token header
- * matching the CSRF cookie. Every failure gets the same 403 so clients can't tell which
- * check failed.
+ * need an Origin (or Referer when Origin is absent) from ADMIN_ORIGINS and an X-CSRF-Token
+ * header matching the CSRF cookie. Every failure gets the same 403 so clients can't tell
+ * which check failed.
+ *
+ * Only the admin app's origins count, never CORS_ORIGINS: the public site is same-site with
+ * the API, so its requests carry the SameSite=Strict cookies, and an XSS there must not be
+ * able to act as a logged-in admin.
  */
-export function csrfProtection(config: Pick<Config, 'auth' | 'corsOrigins'>): RequestHandler {
-  const allowedOrigins = new Set(config.corsOrigins);
+export function csrfProtection(config: Pick<Config, 'auth' | 'adminOrigins'>): RequestHandler {
+  const allowedOrigins = new Set(config.adminOrigins);
   const { csrfSecret } = config.auth;
 
   return (req, _res, next) => {

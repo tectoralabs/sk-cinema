@@ -7,7 +7,7 @@ import type { AuthDb } from '../services/auth.service.js';
 import { authRoutes } from './auth.routes.js';
 
 export interface AdminRoutesDeps {
-  config: Pick<Config, 'auth' | 'corsOrigins'>;
+  config: Pick<Config, 'auth' | 'adminOrigins'>;
   /** Only handed to requireAuth, which loads the admin through the auth service. */
   db: Pick<AuthDb, 'admin'>;
   authController: AuthController;

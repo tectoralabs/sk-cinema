@@ -19,6 +19,7 @@ import { REFRESH_RATE_LIMIT } from '../middleware/rateLimiter.js';
 import { INVALID_CREDENTIALS_MESSAGE, SESSION_EXPIRED_MESSAGE } from '../services/auth.service.js';
 import {
   ADMIN_BASE,
+  PUBLIC_ORIGIN,
   TEST_USER_AGENT,
   authClient,
   buildTestApp,
@@ -316,6 +317,8 @@ describe('POST /api/admin/auth/login', () => {
       ['a wrong CSRF token', { token: 'A'.repeat(43) }],
       ['no CSRF cookie', { csrfCookie: false }],
       ['a foreign Origin', { origin: 'https://evil.example' }],
+      // The public site is same-site, so it would carry the cookies: only ADMIN_ORIGINS count.
+      ['the public site Origin with a valid token', { origin: PUBLIC_ORIGIN }],
       ['no Origin or Referer', { origin: null }],
     ])('rejects %s with 403 before the service runs', async (_name, options) => {
       const { app, db } = setup();
@@ -511,6 +514,7 @@ describe('POST /api/admin/auth/refresh', () => {
   it.each<[string, SendOptions]>([
     ['no CSRF header', { token: null }],
     ['a foreign Origin', { origin: 'https://evil.example' }],
+    ['the public site Origin', { origin: PUBLIC_ORIGIN }],
   ])('rejects %s with 403 and leaves the session alone', async (_name, options) => {
     const { app, db } = setup();
     const c = await authClient(app);

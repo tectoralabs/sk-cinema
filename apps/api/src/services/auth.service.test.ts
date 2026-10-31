@@ -657,7 +657,8 @@ describe('refresh: reuse detection', () => {
         adminId: storedAdmin().id,
         entity: 'Admin',
         entityId: storedAdmin().id,
-        details: { familyId },
+        // Only `latest` was still live when the replay came in.
+        details: { familyId, revokedCount: 1 },
         ipAddress: REFRESH_IP,
         userAgent: REFRESH_USER_AGENT,
       }),
@@ -677,6 +678,22 @@ describe('refresh: reuse detection', () => {
 
     expect(rowFor(other.refreshToken).revokedAt).toBeNull();
     await expect(rotate(other.refreshToken)).resolves.toBeDefined();
+  });
+
+  it('still audits a replay after logout, with revokedCount 0', async () => {
+    const session = await attempt();
+    const latest = await rotate(session.refreshToken);
+    await signOut(latest.refreshToken);
+    const { familyId } = rowFor(session.refreshToken);
+
+    const error = await refreshRefused(session.refreshToken);
+
+    expect(errorShape(error)).toBe(SESSION_EXPIRED);
+    expect(actions()).toEqual(['LOGIN', 'LOGOUT', 'TOKEN_REUSE_DETECTED']);
+    expect(db.auditLogs.at(-1)).toMatchObject({
+      adminId: storedAdmin().id,
+      details: { familyId, revokedCount: 0 },
+    });
   });
 });
 
@@ -714,6 +731,11 @@ describe('refresh: concurrent use of one token', () => {
     expect(familyRows(parent.familyId)).toHaveLength(2);
     expect(familyRows(parent.familyId).every((t) => t.revokedAt !== null)).toBe(true);
     expect(actions().filter((a) => a === 'TOKEN_REUSE_DETECTED')).toHaveLength(1);
+    // The winner's child was the one live token left in the family.
+    expect(db.auditLogs.at(-1)?.details).toEqual({
+      familyId: parent.familyId,
+      revokedCount: 1,
+    });
 
     const winner = wins[0];
     if (!winner) throw new Error('no winner');
@@ -733,6 +755,8 @@ describe('refresh: concurrent use of one token', () => {
     expect(familyRows(familyId)).toHaveLength(1);
     expect(rowFor(session.refreshToken)).toMatchObject({ revokedAt: clock, replacedById: null });
     expect(actions()).toEqual(['LOGIN', 'TOKEN_REUSE_DETECTED']);
+    // The claim lost, so the token was still live and the family revocation took it.
+    expect(db.auditLogs.at(-1)?.details).toEqual({ familyId, revokedCount: 1 });
   });
 });
 

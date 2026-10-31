@@ -1,5 +1,8 @@
-import cors from 'cors';
+import cors, { type CorsOptions } from 'cors';
+import { Router, type RequestHandler } from 'express';
 import helmet from 'helmet';
+import type { Config } from '../config/env.js';
+import { CSRF_HEADER } from './csrf.js';
 import { REQUEST_ID_HEADER } from './requestLogger.js';
 
 /**
@@ -23,18 +26,64 @@ export function securityHeaders() {
   });
 }
 
-/** Only allowlisted origins get CORS headers; others are refused by the browser. */
-export function corsPolicy(allowedOrigins: string[]) {
-  const allowed = new Set(allowedOrigins);
-  return cors({
-    origin: (origin, callback) => {
-      // Requests without an Origin header (curl, same-origin GET, health checks) are not CORS.
-      callback(null, origin === undefined || allowed.has(origin));
-    },
+/** Where apiRouter mounts the admin routes (`/api` + `/admin`). */
+export const ADMIN_API_PATH = '/api/admin';
+
+const SHARED_CORS_OPTIONS = {
+  exposedHeaders: [REQUEST_ID_HEADER],
+  maxAge: 600,
+} satisfies CorsOptions;
+
+/** Allows requests without an Origin (curl, health checks: not CORS) and listed origins. */
+const allowlist =
+  (origins: ReadonlySet<string>): CorsOptions['origin'] =>
+  (origin, callback) => {
+    callback(null, origin === undefined || origins.has(origin));
+  };
+
+/** Leaves the CORS router so the request continues with the next app middleware. */
+const exitRouter: RequestHandler = (_req, _res, next) => {
+  next('router');
+};
+
+/**
+ * Two CORS policies, chosen per request:
+ * - ADMIN_ORIGINS (the admin app) get credentialed CORS, with X-CSRF-Token, everywhere.
+ * - CORS_ORIGINS (the public site) get CORS without credentials, and only outside
+ *   /api/admin. There they get no CORS headers at all, so the browser blocks the response
+ *   and fails the preflight: an XSS on the public site can't read a CSRF token or admin data.
+ * Unlisted origins get no CORS headers anywhere. A refused preflight is not answered here; it
+ * falls through to the routes and gets no CORS headers either.
+ *
+ * The /api/admin branch is a mounted path, so Express matches it exactly as it matches the
+ * admin router (case-insensitive, trailing slash), rather than a hand-written path test.
+ */
+export function corsPolicy(config: Pick<Config, 'corsOrigins' | 'adminOrigins'>): Router {
+  const adminOrigins = new Set(config.adminOrigins);
+  const publicOrigins = new Set(config.corsOrigins);
+
+  const adminCors = cors({
+    ...SHARED_CORS_OPTIONS,
+    origin: allowlist(adminOrigins),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'X-CSRF-Token', REQUEST_ID_HEADER],
-    exposedHeaders: [REQUEST_ID_HEADER],
-    maxAge: 600,
+    allowedHeaders: ['Content-Type', CSRF_HEADER, REQUEST_ID_HEADER],
   });
+  // Public routes are read-only and cookie-free.
+  const publicCors = cors({
+    ...SHARED_CORS_OPTIONS,
+    origin: allowlist(publicOrigins),
+    credentials: false,
+    methods: ['GET', 'HEAD'],
+    allowedHeaders: ['Content-Type', REQUEST_ID_HEADER],
+  });
+
+  const router = Router();
+  router.use(ADMIN_API_PATH, adminCors, exitRouter);
+  router.use((req, res, next) => {
+    const { origin } = req.headers;
+    const policy = origin !== undefined && adminOrigins.has(origin) ? adminCors : publicCors;
+    policy(req, res, next);
+  });
+  return router;
 }

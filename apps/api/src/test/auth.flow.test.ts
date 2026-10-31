@@ -689,10 +689,9 @@ describe('refresh token reuse', () => {
 
     expect(auditCount(db, 'TOKEN_REUSE_DETECTED')).toBe(1);
     const reuse = db.auditLogs.find((l) => l.action === 'TOKEN_REUSE_DETECTED');
-    expect(reuse).toMatchObject({
-      adminId: admin.id,
-      details: { familyId: db.refreshTokens[0]?.familyId },
-    });
+    expect(reuse).toMatchObject({ adminId: admin.id });
+    // tokenB was still live, so the replay revoked one token: a live-family theft.
+    expect(reuse?.details).toEqual({ familyId: db.refreshTokens[0]?.familyId, revokedCount: 1 });
     expect(db.refreshTokens.every((t) => t.revokedAt !== null)).toBe(true);
     // Reuse ends the stolen family only; the account itself is not locked.
     await logIn(c);
@@ -989,6 +988,12 @@ describe('audit trail', () => {
       ['LOGIN', admin.id, undefined],
       ['LOGOUT', admin.id, undefined],
     ]);
+    const familyA = db.refreshTokens[0]?.familyId;
+    expect(familyA).toBeDefined();
+    expect(db.auditLogs.find((l) => l.action === 'TOKEN_REUSE_DETECTED')?.details).toEqual({
+      familyId: familyA,
+      revokedCount: 1,
+    });
     for (const row of db.auditLogs) {
       expect(row).toMatchObject({
         entity: 'Admin',

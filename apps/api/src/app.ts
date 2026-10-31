@@ -29,7 +29,8 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(requestLogger(logger));
   app.use(securityHeaders());
-  app.use(corsPolicy(config.corsOrigins));
+  // Before the rate limiter, so 429s are readable by allowed origins.
+  app.use(corsPolicy(config));
   app.use(globalRateLimiter(config.rateLimit));
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
   app.use(cookieParser());

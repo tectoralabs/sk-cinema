@@ -6,13 +6,13 @@ import { pino, type Logger } from 'pino';
 import request from 'supertest';
 import { describe, expect, it } from 'vitest';
 import { CSRF_COOKIE_NAME } from '../lib/authCookies.js';
-import { silentLogger, testConfig } from '../test/helpers.js';
+import { ADMIN_ORIGIN, PUBLIC_ORIGIN, silentLogger, testConfig } from '../test/helpers.js';
 import { CSRF_HEADER, csrfProtection, issueCsrfToken } from './csrf.js';
 import { errorHandler } from './errorHandler.js';
 import { requestLogger } from './requestLogger.js';
 
 const config = testConfig();
-const ALLOWED_ORIGIN = 'http://localhost:5174';
+const ALLOWED_ORIGIN = ADMIN_ORIGIN;
 const CSRF_ERROR = { error: { code: 'CSRF_INVALID', message: 'CSRF validation failed' } };
 
 const newCookieValue = () => randomBytes(32).toString('base64url');
@@ -115,6 +115,13 @@ describe('csrfProtection', () => {
       expectRejected(await attempt({ origin: 'https://evil.example' }));
       expectRejected(await attempt({ origin: 'null' }));
       expectRejected(await attempt({ origin: `${ALLOWED_ORIGIN}.evil.example` }));
+    });
+
+    it('when the Origin is a public site origin (CORS_ORIGINS), even with a valid token', async () => {
+      expect(config.corsOrigins).toContain(PUBLIC_ORIGIN);
+      expect(config.adminOrigins).not.toContain(PUBLIC_ORIGIN);
+      expectRejected(await attempt({ origin: PUBLIC_ORIGIN }));
+      expectRejected(await attempt({ origin: '', referer: `${PUBLIC_ORIGIN}/movies` }));
     });
 
     it('when the Origin is not allowed, even with an allowed Referer', async () => {
