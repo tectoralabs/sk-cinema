@@ -104,14 +104,14 @@ const adminSessionSelect = {
   mustChangePassword: true,
 } as const satisfies Prisma.AdminSelect;
 
-/** Just enough to authorise a request: who, which role, and whether still allowed in. */
-const adminAuthSelect = {
-  id: true,
-  role: true,
-  isActive: true,
-} as const satisfies Prisma.AdminSelect;
-
-export type AdminAuthState = Pick<Admin, keyof typeof adminAuthSelect>;
+/**
+ * Just enough to authorise a request: who, which role, whether still allowed in, and whether
+ * the access token's session (refresh family) is still live.
+ */
+export interface SessionAuthState extends Pick<Admin, 'id' | 'role' | 'isActive'> {
+  /** The family has at least one unrevoked, unexpired refresh token belonging to this admin. */
+  sessionLive: boolean;
+}
 
 const refreshTokenSelect = {
   id: true,
@@ -196,8 +196,11 @@ export async function login(input: LoginInput, deps: AuthServiceDeps): Promise<L
 
   const refreshToken = generateRefreshToken();
   const refreshExpiresAt = new Date(now.getTime() + config.refreshTokenTtlHours * HOUR_MS);
+  // A new family per login; rotations keep this id and this absolute expiry. The access token
+  // carries it as `sid`, so it dies with the family.
+  const familyId = randomUUID();
   const accessToken = await signAccessToken(
-    { adminId: admin.id, role: admin.role },
+    { adminId: admin.id, role: admin.role, sessionId: familyId },
     { secret: config.jwtAccessSecret, ttlSeconds: config.accessTokenTtlSeconds, now },
   );
 
@@ -211,8 +214,7 @@ export async function login(input: LoginInput, deps: AuthServiceDeps): Promise<L
       data: {
         adminId: admin.id,
         tokenHash: hashRefreshToken(refreshToken),
-        // A new family per login; rotations keep this id and this absolute expiry.
-        familyId: randomUUID(),
+        familyId,
         expiresAt: refreshExpiresAt,
         ...client,
       },
@@ -365,7 +367,7 @@ export async function refresh(input: RefreshInput, deps: AuthServiceDeps): Promi
   }
 
   const accessToken = await signAccessToken(
-    { adminId: admin.id, role: admin.role },
+    { adminId: admin.id, role: admin.role, sessionId: token.familyId },
     { secret: config.jwtAccessSecret, ttlSeconds: config.accessTokenTtlSeconds, now },
   );
 
@@ -416,14 +418,45 @@ export async function getMe(
 }
 
 /**
- * The current id, role and active flag of an admin, or null if there is no such admin.
- * Used by requireAuth on every request, so the DB (not the token) decides role and access.
+ * The current id, role and active flag of an admin plus whether the session `sessionId`
+ * (a refresh-token familyId) is still live for that admin, or null if there is no such admin.
+ * Used by requireAuth on every request, so the DB (not the token) decides role and access, and
+ * logout, reuse detection or family revocation end access tokens immediately.
+ *
+ * One SQL statement: Prisma 7 compiles a filtered relation `_count` into a LEFT JOIN on a
+ * grouped subquery in the same SELECT, whereas a nested `refreshTokens` select would be a
+ * second query (relation joins are a preview feature, not enabled). The subquery can use the
+ * existing RefreshToken familyId/adminId indexes and counts the live rows of one family
+ * (normally 1).
  */
-export function findAdminAuthState(
+export async function findSessionAuthState(
   adminId: string,
-  { db }: { db: Pick<AuthDb, 'admin'> },
-): Promise<AdminAuthState | null> {
-  return db.admin.findUnique({ where: { id: adminId }, select: adminAuthSelect });
+  sessionId: string,
+  deps: { db: Pick<AuthDb, 'admin'> } & Pick<AuthServiceDeps, 'now'>,
+): Promise<SessionAuthState | null> {
+  const now = deps.now?.() ?? new Date();
+  const admin = await deps.db.admin.findUnique({
+    where: { id: adminId },
+    select: {
+      id: true,
+      role: true,
+      isActive: true,
+      _count: {
+        select: {
+          refreshTokens: {
+            where: { adminId, familyId: sessionId, revokedAt: null, expiresAt: { gt: now } },
+          },
+        },
+      },
+    },
+  });
+  if (!admin) return null;
+  return {
+    id: admin.id,
+    role: admin.role,
+    isActive: admin.isActive,
+    sessionLive: admin._count.refreshTokens > 0,
+  };
 }
 
 /** Revokes every live token in a family and returns how many were revoked. */

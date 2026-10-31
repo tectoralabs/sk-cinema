@@ -9,6 +9,7 @@ import type { Config } from '../config/env.js';
 import type { Admin, AuditLog, PrismaClient, RefreshToken } from '../generated/prisma/client.js';
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_NAME } from '../lib/authCookies.js';
 import { MemoryCache } from '../lib/cache.js';
+import { generateRefreshToken, hashRefreshToken } from '../lib/tokens.js';
 import { CSRF_HEADER } from '../middleware/csrf.js';
 
 export const silentLogger = pino({ level: 'silent' });
@@ -61,6 +62,27 @@ export function testAdmin(overrides: Partial<Admin> = {}): Admin {
     lastLoginAt: null,
     createdAt: now,
     updatedAt: now,
+    ...overrides,
+  };
+}
+
+/**
+ * A live RefreshToken row (unrevoked, expiring in a week) with safe defaults. Pass `adminId`
+ * and, to bind an access token to it, use its `familyId` as the token's `sessionId`.
+ */
+export function testRefreshToken(
+  overrides: Partial<RefreshToken> & Pick<RefreshToken, 'adminId'>,
+): RefreshToken {
+  return {
+    id: randomUUID(),
+    tokenHash: hashRefreshToken(generateRefreshToken()),
+    familyId: randomUUID(),
+    expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000),
+    revokedAt: null,
+    replacedById: null,
+    ipAddress: null,
+    userAgent: null,
+    createdAt: new Date(),
     ...overrides,
   };
 }
@@ -137,21 +159,40 @@ function notFoundError(): Error {
  * interactive $transaction (rolled back if the callback throws). Transactions run one at a
  * time, the way Postgres row locks serialise conflicting writers, so a whole-store rollback
  * never undoes another transaction's writes. Every method is a vi.fn, so tests can assert
- * on the exact Prisma calls. Rows are returned as copies; findUnique honours select/include.
+ * on the exact Prisma calls. Rows are returned as copies; findUnique honours select/include,
+ * and admin.findUnique also a `_count: { select: { refreshTokens: { where } } }` selection.
  */
-export function inMemoryAuthDb(seed: { admins?: Admin[] } = {}) {
+export function inMemoryAuthDb(seed: { admins?: Admin[]; refreshTokens?: RefreshToken[] } = {}) {
   const store = {
     admins: (seed.admins ?? []).map((a) => ({ ...a })),
-    refreshTokens: [] as RefreshToken[],
+    refreshTokens: (seed.refreshTokens ?? []).map((t) => ({ ...t })),
     auditLogs: [] as AuditLog[],
   };
   const findAdmin = (where: Where) => store.admins.find((a) => matches(a, where));
   const findToken = (where: Where) => store.refreshTokens.find((t) => matches(t, where));
 
+  /** Prisma's relation `_count`: the admin's refresh tokens matching an optional `where`. */
+  const countFor = (adminRow: Admin, spec: unknown): Row => {
+    const relations = (spec as { select?: Record<string, unknown> } | undefined)?.select ?? {};
+    const out: Row = {};
+    for (const [key, relationSpec] of Object.entries(relations)) {
+      if (key !== 'refreshTokens') throw new Error(`inMemoryAuthDb: no _count for ${key}`);
+      const where = relationSpec === true ? {} : ((relationSpec as { where?: Where }).where ?? {});
+      out[key] = store.refreshTokens.filter(
+        (t) => t.adminId === adminRow.id && matches(t, where),
+      ).length;
+    }
+    return out;
+  };
+
   const admin = {
     findUnique: vi.fn(({ where, ...args }: { where: Where } & Projection) => {
       const found = findAdmin(where);
-      return Promise.resolve(found ? project(found, args, () => undefined) : null);
+      if (!found) return Promise.resolve(null);
+      const { _count: countSpec, ...select } = args.select ?? {};
+      const projected = project(found, args.select ? { select } : args, () => undefined);
+      if (countSpec) projected['_count'] = countFor(found, countSpec);
+      return Promise.resolve(projected);
     }),
     update: vi.fn(({ where, data }: { where: Where; data: Row }) => {
       const found = findAdmin(where);

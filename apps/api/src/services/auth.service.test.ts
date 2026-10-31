@@ -11,6 +11,7 @@ import { inMemoryAuthDb, testAdmin, testConfig, type InMemoryAuthDb } from '../t
 import {
   INVALID_CREDENTIALS_MESSAGE,
   SESSION_EXPIRED_MESSAGE,
+  findSessionAuthState,
   getMe,
   login,
   logout,
@@ -113,7 +114,11 @@ describe('login: success', () => {
 
     await expect(
       verifyAccessToken(result.accessToken, { secret: authConfig.jwtAccessSecret, now: clock }),
-    ).resolves.toEqual({ adminId: admin.id, role: 'EDITOR' });
+    ).resolves.toEqual({
+      adminId: admin.id,
+      role: 'EDITOR',
+      sessionId: db.refreshTokens[0]?.familyId,
+    });
 
     const expectedExpiry = new Date(clock.getTime() + authConfig.refreshTokenTtlHours * 3_600_000);
     expect(result.refreshExpiresAt).toEqual(expectedExpiry);
@@ -420,7 +425,7 @@ describe('refresh: rotation', () => {
 
     await expect(
       verifyAccessToken(result.accessToken, { secret: authConfig.jwtAccessSecret, now: clock }),
-    ).resolves.toEqual({ adminId: storedAdmin().id, role: 'EDITOR' });
+    ).resolves.toEqual({ adminId: storedAdmin().id, role: 'EDITOR', sessionId: parent.familyId });
     // Successful refreshes are not audited.
     expect(actions()).toEqual(['LOGIN']);
   });
@@ -444,7 +449,11 @@ describe('refresh: rotation', () => {
     expect(result.admin.role).toBe('SUPER_ADMIN');
     await expect(
       verifyAccessToken(result.accessToken, { secret: authConfig.jwtAccessSecret, now: clock }),
-    ).resolves.toEqual({ adminId: storedAdmin().id, role: 'SUPER_ADMIN' });
+    ).resolves.toEqual({
+      adminId: storedAdmin().id,
+      role: 'SUPER_ADMIN',
+      sessionId: rowFor(session.refreshToken).familyId,
+    });
   });
 
   it('still works 1 ms before the absolute expiry', async () => {
@@ -692,6 +701,108 @@ describe('getMe', () => {
 
     expect(errorShape(inactive)).toBe(SESSION_EXPIRED);
     expect(errorShape(missing)).toBe(SESSION_EXPIRED);
+  });
+});
+
+describe('findSessionAuthState', () => {
+  /** The session the access token of `result` is bound to. */
+  const sessionOf = async (result: { accessToken: string }) => {
+    const subject = await verifyAccessToken(result.accessToken, {
+      secret: authConfig.jwtAccessSecret,
+      now: clock,
+    });
+    if (!subject) throw new Error('access token did not verify');
+    return subject;
+  };
+  const stateOf = async (result: { accessToken: string }) => {
+    const { adminId, sessionId } = await sessionOf(result);
+    return findSessionAuthState(adminId, sessionId, deps());
+  };
+
+  it('reports a live session after login, with the DB id, role and active flag', async () => {
+    const session = await attempt();
+    const admin = storedAdmin();
+
+    await expect(stateOf(session)).resolves.toEqual({
+      id: admin.id,
+      role: 'EDITOR',
+      isActive: true,
+      sessionLive: true,
+    });
+  });
+
+  it('uses one admin lookup and no refresh-token query', async () => {
+    const session = await attempt();
+    vi.clearAllMocks();
+
+    await stateOf(session);
+
+    expect(db.spies.admin.findUnique).toHaveBeenCalledTimes(1);
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
+    expect(db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('stays live across a normal rotation, for the old and the new access token', async () => {
+    const session = await attempt();
+    const rotated = await rotate(session.refreshToken);
+
+    expect((await sessionOf(rotated)).sessionId).toBe((await sessionOf(session)).sessionId);
+    expect((await stateOf(session))?.sessionLive).toBe(true);
+    expect((await stateOf(rotated))?.sessionLive).toBe(true);
+  });
+
+  it('ends at once on logout, for that family only', async () => {
+    const session = await attempt();
+    const other = await attempt();
+
+    await signOut(session.refreshToken);
+
+    expect((await stateOf(session))?.sessionLive).toBe(false);
+    expect((await stateOf(other))?.sessionLive).toBe(true);
+  });
+
+  it('ends at once on reuse detection, for every access token of the family', async () => {
+    const session = await attempt();
+    const rotated = await rotate(session.refreshToken);
+
+    await refreshRefused(session.refreshToken);
+
+    expect((await stateOf(session))?.sessionLive).toBe(false);
+    expect((await stateOf(rotated))?.sessionLive).toBe(false);
+  });
+
+  it('ends at the absolute expiry of the family, not a millisecond earlier', async () => {
+    const session = await attempt();
+    // Read now: the access token itself expires long before the family does.
+    const { adminId, sessionId } = await sessionOf(session);
+    const stateAt = (at: Date) =>
+      findSessionAuthState(adminId, sessionId, { ...deps(), now: () => at });
+
+    expect((await stateAt(new Date(session.refreshExpiresAt.getTime() - 1)))?.sessionLive).toBe(
+      true,
+    );
+    expect((await stateAt(session.refreshExpiresAt))?.sessionLive).toBe(false);
+  });
+
+  it("is not live for another admin's family", async () => {
+    const other = testAdmin({ email: 'other@skcinema.lk', passwordHash });
+    db = inMemoryAuthDb({ admins: [testAdmin({ email: EMAIL, passwordHash }), other] });
+    const mine = await attempt();
+    const theirs = await attempt({ email: other.email });
+    const { sessionId: theirSessionId } = await sessionOf(theirs);
+
+    const state = await findSessionAuthState(storedAdmin().id, theirSessionId, deps());
+
+    expect(state).toMatchObject({ id: storedAdmin().id, sessionLive: false });
+    expect((await stateOf(mine))?.sessionLive).toBe(true);
+  });
+
+  it('reports a deactivated admin and returns null for an unknown one', async () => {
+    const session = await attempt();
+    storedAdmin().isActive = false;
+
+    await expect(stateOf(session)).resolves.toMatchObject({ isActive: false, sessionLive: true });
+    await expect(findSessionAuthState(randomUUID(), randomUUID(), deps())).resolves.toBeNull();
   });
 });
 

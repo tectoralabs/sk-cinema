@@ -2,14 +2,28 @@ import { randomUUID } from 'node:crypto';
 import { Writable } from 'node:stream';
 import cookieParser from 'cookie-parser';
 import express from 'express';
+import { SignJWT } from 'jose';
 import { pino, type Logger } from 'pino';
 import request from 'supertest';
-import { describe, expect, it } from 'vitest';
-import type { Admin } from '../generated/prisma/client.js';
+import { beforeAll, describe, expect, it } from 'vitest';
+import type { Admin, RefreshToken } from '../generated/prisma/client.js';
 import { ACCESS_COOKIE_NAME } from '../lib/authCookies.js';
+import { hashPassword } from '../lib/password.js';
 import { signAccessToken } from '../lib/tokens.js';
-import { SESSION_EXPIRED_MESSAGE } from '../services/auth.service.js';
-import { inMemoryAuthDb, silentLogger, testAdmin, testConfig } from '../test/helpers.js';
+import {
+  SESSION_EXPIRED_MESSAGE,
+  login,
+  logout,
+  refresh,
+  type AuthServiceDeps,
+} from '../services/auth.service.js';
+import {
+  inMemoryAuthDb,
+  silentLogger,
+  testAdmin,
+  testConfig,
+  testRefreshToken,
+} from '../test/helpers.js';
 import { FORBIDDEN_MESSAGE, requireAuth, requireRole } from './auth.js';
 import { errorHandler } from './errorHandler.js';
 import { requestLogger } from './requestLogger.js';
@@ -22,13 +36,36 @@ const editor = testAdmin({ role: 'EDITOR', email: 'editor@skcinema.lk' });
 const superAdmin = testAdmin({ role: 'SUPER_ADMIN', email: 'super@skcinema.lk' });
 const inactive = testAdmin({ role: 'SUPER_ADMIN', email: 'gone@skcinema.lk', isActive: false });
 
-function authApp(admins: Admin[] = [editor, superAdmin, inactive], logger: Logger = silentLogger) {
-  const db = inMemoryAuthDb({ admins });
+/** One session (refresh family) id per admin; authApp seeds a live token for it. */
+const familyIds = new Map<string, string>();
+function familyOf(adminId: string): string {
+  let familyId = familyIds.get(adminId);
+  if (!familyId) {
+    familyId = randomUUID();
+    familyIds.set(adminId, familyId);
+  }
+  return familyId;
+}
+
+interface AuthAppOptions {
+  logger?: Logger;
+  /** Replaces the default live refresh token seeded for every admin. */
+  refreshTokens?: RefreshToken[];
+  now?: () => Date;
+}
+
+function authApp(admins: Admin[] = [editor, superAdmin, inactive], options: AuthAppOptions = {}) {
+  const db = inMemoryAuthDb({
+    admins,
+    refreshTokens:
+      options.refreshTokens ??
+      admins.map((a) => testRefreshToken({ adminId: a.id, familyId: familyOf(a.id) })),
+  });
   const app = express();
-  app.use(requestLogger(logger));
+  app.use(requestLogger(options.logger ?? silentLogger));
   app.use(cookieParser());
 
-  const auth = requireAuth({ db: db.prisma, config });
+  const auth = requireAuth({ db: db.prisma, config, ...(options.now && { now: options.now }) });
   const sendAdmin: express.RequestHandler = (req, res) => {
     res.json({ admin: req.admin });
   };
@@ -41,12 +78,13 @@ function authApp(admins: Admin[] = [editor, superAdmin, inactive], logger: Logge
   return { app, db };
 }
 
+/** Signs an access token for the admin's seeded session unless `sessionId` says otherwise. */
 const sign = (
   admin: Pick<Admin, 'id' | 'role'>,
-  options: { secret?: string; now?: Date; ttlSeconds?: number } = {},
+  options: { secret?: string; now?: Date; ttlSeconds?: number; sessionId?: string } = {},
 ) =>
   signAccessToken(
-    { adminId: admin.id, role: admin.role },
+    { adminId: admin.id, role: admin.role, sessionId: options.sessionId ?? familyOf(admin.id) },
     {
       secret: options.secret ?? config.auth.jwtAccessSecret,
       ttlSeconds: options.ttlSeconds ?? config.auth.accessTokenTtlSeconds,
@@ -78,11 +116,29 @@ describe('requireAuth', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ admin: { id: editor.id, role: 'EDITOR' } });
+    // One lookup (one SQL statement) loads the admin and counts the live session rows.
     expect(db.spies.admin.findUnique).toHaveBeenCalledTimes(1);
     expect(db.spies.admin.findUnique).toHaveBeenCalledWith({
       where: { id: editor.id },
-      select: { id: true, role: true, isActive: true },
+      select: {
+        id: true,
+        role: true,
+        isActive: true,
+        _count: {
+          select: {
+            refreshTokens: {
+              where: {
+                adminId: editor.id,
+                familyId: familyOf(editor.id),
+                revokedAt: null,
+                expiresAt: { gt: expect.any(Date) as unknown },
+              },
+            },
+          },
+        },
+      },
     });
+    expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
   });
 
   it('looks the admin up on every request', async () => {
@@ -165,6 +221,58 @@ describe('requireAuth', () => {
       expectUnauthorized(await get(app, '/me', token));
     });
 
+    it('when the session family was revoked (logout, reuse detection)', async () => {
+      const { app, db } = authApp();
+      const token = await sign(editor);
+      expect((await get(app, '/me', token)).status).toBe(200);
+
+      for (const t of db.refreshTokens) if (t.adminId === editor.id) t.revokedAt = new Date();
+      expectUnauthorized(await get(app, '/me', token));
+    });
+
+    it('when the session family has expired, from its expiresAt on', async () => {
+      const now = new Date('2026-11-01T04:30:00.000Z');
+      const familyId = randomUUID();
+      const { app, db } = authApp([editor], {
+        now: () => now,
+        refreshTokens: [testRefreshToken({ adminId: editor.id, familyId, expiresAt: now })],
+      });
+      const token = await sign(editor, { sessionId: familyId, now });
+      expectUnauthorized(await get(app, '/me', token));
+
+      const [row] = db.refreshTokens;
+      if (row) row.expiresAt = new Date(now.getTime() + 1);
+      expect((await get(app, '/me', token)).status).toBe(200);
+    });
+
+    it("for a token whose sid is another admin's live session", async () => {
+      // Forged with the test secret: a valid signature alone must not borrow a session.
+      const { app } = authApp();
+      const token = await sign(editor, { sessionId: familyOf(superAdmin.id) });
+      expectUnauthorized(await get(app, '/me', token));
+      expect((await get(app, '/me', await sign(superAdmin))).status).toBe(200);
+    });
+
+    it('for a token whose sid matches no refresh token at all', async () => {
+      const { app } = authApp();
+      expectUnauthorized(await get(app, '/me', await sign(editor, { sessionId: randomUUID() })));
+    });
+
+    it('for a token without a sid claim (issued before sessions were bound)', async () => {
+      const { app, db } = authApp();
+      const token = await new SignJWT({ role: 'EDITOR', typ: 'access' })
+        .setProtectedHeader({ alg: 'HS256' })
+        .setSubject(editor.id)
+        .setIssuer('sk-cinema-api')
+        .setAudience('sk-cinema-admin')
+        .setIssuedAt()
+        .setExpirationTime('15m')
+        .setJti(randomUUID())
+        .sign(new TextEncoder().encode(config.auth.jwtAccessSecret));
+      expectUnauthorized(await get(app, '/me', token));
+      expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+    });
+
     it('with the exact same body for every failure', async () => {
       const { app } = authApp();
       const [, payload] = (await sign(editor)).split('.');
@@ -176,6 +284,8 @@ describe('requireAuth', () => {
         get(app, '/me', await sign(editor, { secret: 'another-jwt-secret-0123456789abcdef' })),
         get(app, '/me', await sign({ id: randomUUID(), role: 'EDITOR' })),
         get(app, '/me', await sign(inactive)),
+        get(app, '/me', await sign(editor, { sessionId: familyOf(superAdmin.id) })),
+        get(app, '/me', await sign(editor, { sessionId: randomUUID() })),
         get(app, '/role-only', await sign(editor)),
       ]);
       for (const res of responses) {
@@ -281,29 +391,108 @@ describe('auth logging', () => {
 
   it('logs failure reasons at debug level but never the token', async () => {
     const { logger, output } = capture();
-    const { app } = authApp(undefined, logger);
+    const { app } = authApp(undefined, { logger });
     const inactiveToken = await sign(inactive);
     const badToken = await sign(editor, { secret: 'another-jwt-secret-0123456789abcdef' });
     const okToken = await sign(editor);
     const forbiddenToken = await sign(editor);
+    const foreignSid = familyOf(superAdmin.id);
+    const endedToken = await sign(editor, { sessionId: foreignSid });
 
     await get(app, '/me');
     await get(app, '/me', badToken);
     await get(app, '/me', await sign({ id: randomUUID(), role: 'EDITOR' }));
     await get(app, '/me', inactiveToken);
+    await get(app, '/me', endedToken);
     await get(app, '/me', okToken);
     await get(app, '/super', forbiddenToken);
 
     const log = output();
-    for (const reason of ['no_cookie', 'invalid_token', 'unknown_admin', 'inactive']) {
+    for (const reason of [
+      'no_cookie',
+      'invalid_token',
+      'unknown_admin',
+      'inactive',
+      'session_ended',
+    ]) {
       expect(log).toContain(`"reason":"${reason}"`);
     }
     expect(log).toContain('Role not allowed');
-    for (const token of [inactiveToken, badToken, okToken, forbiddenToken]) {
+    // Only the reason: no admin id or session id is logged with a refusal.
+    expect(log).not.toContain(foreignSid);
+    for (const token of [inactiveToken, badToken, okToken, forbiddenToken, endedToken]) {
       expect(log).not.toContain(token);
       // Not even the signature segment on its own.
       expect(log).not.toContain(token.split('.')[2]);
     }
     expect(log).not.toContain(ACCESS_COOKIE_NAME);
+  });
+});
+
+describe('requireAuth with sessions from the auth service', () => {
+  const PASSWORD = 'correct horse battery staple';
+  let passwordHash: string;
+
+  beforeAll(async () => {
+    passwordHash = await hashPassword(PASSWORD);
+  });
+
+  /** A store with one admin and no seeded sessions: only the service creates them. */
+  function serviceSetup() {
+    const admin = testAdmin({ email: 'session@skcinema.lk', passwordHash });
+    const { app, db } = authApp([admin], { refreshTokens: [] });
+    const deps: AuthServiceDeps = { db: db.prisma, config: config.auth };
+    const logIn = () => login({ email: admin.email, password: PASSWORD }, deps);
+    const rotate = (refreshToken: string) => refresh({ refreshToken }, deps);
+    const setActive = (isActive: boolean) => {
+      const row = db.admins.find((a) => a.id === admin.id);
+      if (row) row.isActive = isActive;
+    };
+    return { app, db, admin, deps, logIn, rotate, setActive };
+  }
+
+  it('logout ends the access token at once, and only for that session', async () => {
+    const { app, deps, logIn } = serviceSetup();
+    const session = await logIn();
+    const other = await logIn();
+    expect((await get(app, '/me', session.accessToken)).status).toBe(200);
+
+    await logout({ refreshToken: session.refreshToken }, deps);
+
+    expectUnauthorized(await get(app, '/me', session.accessToken));
+    expect((await get(app, '/me', other.accessToken)).status).toBe(200);
+  });
+
+  it('reuse detection ends every access token of the family at once', async () => {
+    const { app, rotate, logIn } = serviceSetup();
+    const first = await logIn();
+    const second = await rotate(first.refreshToken);
+    expect((await get(app, '/me', second.accessToken)).status).toBe(200);
+
+    await expect(rotate(first.refreshToken)).rejects.toMatchObject({ status: 401 });
+
+    expectUnauthorized(await get(app, '/me', first.accessToken));
+    expectUnauthorized(await get(app, '/me', second.accessToken));
+  });
+
+  it('a normal rotation keeps the pre-rotation access token valid (the family is alive)', async () => {
+    const { app, db, rotate, logIn } = serviceSetup();
+    const first = await logIn();
+    const second = await rotate(first.refreshToken);
+
+    expect(db.refreshTokens.filter((t) => t.revokedAt === null)).toHaveLength(1);
+    expect((await get(app, '/me', first.accessToken)).status).toBe(200);
+    expect((await get(app, '/me', second.accessToken)).status).toBe(200);
+  });
+
+  it('re-activation does not revive an access token whose session ended while deactivated', async () => {
+    const { app, rotate, logIn, setActive } = serviceSetup();
+    const session = await logIn();
+    setActive(false);
+    // A refresh while deactivated is refused and revokes the family.
+    await expect(rotate(session.refreshToken)).rejects.toMatchObject({ status: 401 });
+
+    setActive(true);
+    expectUnauthorized(await get(app, '/me', session.accessToken));
   });
 });

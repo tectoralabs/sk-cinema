@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { SignJWT, UnsecuredJWT } from 'jose';
 import { describe, expect, it } from 'vitest';
 import {
@@ -9,7 +10,8 @@ import {
 
 const SECRET = 'test-access-secret-at-least-32-characters-long';
 const ADMIN_ID = '0192f3a4-5b6c-7d8e-9f01-23456789abcd';
-const subject = { adminId: ADMIN_ID, role: 'EDITOR' } as const;
+const SESSION_ID = '0192f3a4-5b6c-7d8e-9f01-0000000000aa';
+const subject = { adminId: ADMIN_ID, role: 'EDITOR', sessionId: SESSION_ID } as const;
 const key = new TextEncoder().encode(SECRET);
 
 function sign(opts: { ttlSeconds?: number; now?: Date } = {}) {
@@ -30,7 +32,7 @@ interface ForgeOverrides {
 
 // A token with valid defaults that a single test can override.
 function forge(overrides: ForgeOverrides = {}) {
-  return new SignJWT({ role: 'EDITOR', typ: 'access', ...overrides.claims })
+  return new SignJWT({ role: 'EDITOR', typ: 'access', sid: SESSION_ID, ...overrides.claims })
     .setProtectedHeader({ alg: overrides.alg ?? 'HS256' })
     .setSubject(overrides.sub ?? ADMIN_ID)
     .setIssuer(overrides.iss ?? 'sk-cinema-api')
@@ -46,9 +48,22 @@ const decodePart = (part: string | undefined) =>
   JSON.parse(Buffer.from(part ?? '', 'base64url').toString()) as Record<string, unknown>;
 
 describe('signAccessToken / verifyAccessToken', () => {
-  it('round-trips the admin id and role', async () => {
+  it('round-trips the admin id, role and session id', async () => {
     const token = await sign();
     await expect(verifyAccessToken(token, { secret: SECRET })).resolves.toEqual(subject);
+  });
+
+  it('carries the session id as the sid claim and round-trips any session id', async () => {
+    const sessionId = randomUUID();
+    const token = await signAccessToken(
+      { ...subject, sessionId },
+      { secret: SECRET, ttlSeconds: 900 },
+    );
+    expect(decodePart(token.split('.')[1])['sid']).toBe(sessionId);
+    await expect(verifyAccessToken(token, { secret: SECRET })).resolves.toEqual({
+      ...subject,
+      sessionId,
+    });
   });
 
   it('sets the expected header and claims', async () => {
@@ -60,6 +75,7 @@ describe('signAccessToken / verifyAccessToken', () => {
       sub: ADMIN_ID,
       role: 'EDITOR',
       typ: 'access',
+      sid: SESSION_ID,
       iss: 'sk-cinema-api',
       aud: 'sk-cinema-admin',
       iat: now.getTime() / 1000,
@@ -90,7 +106,7 @@ describe('signAccessToken / verifyAccessToken', () => {
   });
 
   it('rejects alg none', async () => {
-    const token = new UnsecuredJWT({ role: 'EDITOR', typ: 'access' })
+    const token = new UnsecuredJWT({ role: 'EDITOR', typ: 'access', sid: SESSION_ID })
       .setSubject(ADMIN_ID)
       .setIssuer('sk-cinema-api')
       .setAudience('sk-cinema-admin')
@@ -124,6 +140,11 @@ describe('signAccessToken / verifyAccessToken', () => {
     ['invalid role', { claims: { role: 'ADMIN' } }],
     ['lowercase role', { claims: { role: 'editor' } }],
     ['non-uuid sub', { sub: 'not-a-uuid' }],
+    // Pre-T10a tokens had no sid: they must not authenticate.
+    ['missing sid', { claims: { sid: undefined } }],
+    ['non-uuid sid', { claims: { sid: 'not-a-uuid' } }],
+    ['empty sid', { claims: { sid: '' } }],
+    ['numeric sid', { claims: { sid: 42 } }],
   ])('rejects a token with %s', async (_name, overrides) => {
     const token = await forge(overrides);
     await expect(verifyAccessToken(token, { secret: SECRET })).resolves.toBeNull();

@@ -4,25 +4,29 @@ import type { Config } from '../config/env.js';
 import { readAccessToken } from '../lib/authCookies.js';
 import { AppError } from '../lib/errors.js';
 import { verifyAccessToken } from '../lib/tokens.js';
-import { type AuthDb, findAdminAuthState, sessionExpired } from '../services/auth.service.js';
+import { type AuthDb, findSessionAuthState, sessionExpired } from '../services/auth.service.js';
 
 export const FORBIDDEN_MESSAGE = 'You do not have permission to do this';
 
-type AuthFailure = 'no_cookie' | 'invalid_token' | 'unknown_admin' | 'inactive' | 'no_admin';
+type AuthFailure =
+  'no_cookie' | 'invalid_token' | 'unknown_admin' | 'inactive' | 'session_ended' | 'no_admin';
 
 export interface RequireAuthDeps {
   db: Pick<AuthDb, 'admin'>;
   config: Pick<Config, 'auth'>;
+  /** Injectable clock for tests. Defaults to the current time. */
+  now?: () => Date;
 }
 
 /**
- * Authenticates the access-token cookie and sets `req.admin`. The admin is loaded on every
- * request, so deactivation and role changes apply at once; `req.admin.role` is the DB role,
- * never the token claim. Every failure is the same 401 (SESSION_EXPIRED_MESSAGE), so clients
- * can always "try refresh, else log in" and can't tell which check failed.
+ * Authenticates the access-token cookie and sets `req.admin`. The admin and the token's session
+ * (its `sid` refresh family) are loaded on every request in one query, so deactivation, role
+ * changes, logout and reuse detection apply at once; `req.admin.role` is the DB role, never the
+ * token claim. Every failure is the same 401 (SESSION_EXPIRED_MESSAGE), so clients can always
+ * "try refresh, else log in" and can't tell which check failed.
  * DB errors are not auth failures: they reject and reach the error handler as a 500.
  */
-export function requireAuth({ db, config }: RequireAuthDeps): RequestHandler {
+export function requireAuth({ db, config, now: clock }: RequireAuthDeps): RequestHandler {
   const { jwtAccessSecret } = config.auth;
 
   return async (req, _res, next) => {
@@ -38,19 +42,28 @@ export function requireAuth({ db, config }: RequireAuthDeps): RequestHandler {
       return;
     }
 
-    const subject = await verifyAccessToken(token, { secret: jwtAccessSecret });
+    // One instant for both the JWT exp check and the session's expiresAt check.
+    const now = clock?.() ?? new Date();
+    const subject = await verifyAccessToken(token, { secret: jwtAccessSecret, now });
     if (!subject) {
       refuse('invalid_token');
       return;
     }
 
-    const admin = await findAdminAuthState(subject.adminId, { db });
+    const admin = await findSessionAuthState(subject.adminId, subject.sessionId, {
+      db,
+      now: () => now,
+    });
     if (!admin) {
       refuse('unknown_admin');
       return;
     }
     if (!admin.isActive) {
       refuse('inactive');
+      return;
+    }
+    if (!admin.sessionLive) {
+      refuse('session_ended');
       return;
     }
 

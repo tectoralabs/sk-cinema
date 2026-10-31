@@ -612,10 +612,52 @@ describe('Done when 3: deactivated admins cannot log in or refresh', () => {
     await logIn(c);
   });
 
-  it('DOCUMENTS CURRENT BEHAVIOUR: re-activating revives an unexpired access cookie issued before deactivation', async () => {
-    // requireAuth checks isActive on every request but has no session state, so a
-    // pre-deactivation access JWT (at most accessTokenTtlSeconds old) works again once
-    // the admin is re-activated. Reported to the coordinator as a finding.
+  it('re-activation does not revive the pre-deactivation access cookie once its session was ended', async () => {
+    // The access token carries its refresh family as `sid`; the refused refresh after
+    // deactivation revoked that family, so requireAuth keeps refusing the token.
+    const { app, db, admin } = setup();
+    const c = await authClient(app);
+    const session = await logIn(c);
+    stored(db, admin.id).isActive = false;
+    expect((await meWith(c, session)).status).toBe(401);
+    expect((await refreshWith(c, session)).status).toBe(401);
+
+    stored(db, admin.id).isActive = true;
+    const res = await meWith(c, session);
+
+    expect(res.status).toBe(401);
+    expect(comparable(res)).toEqual(comparable(await c.get('/me')));
+  });
+
+  it('deactivate -> refresh ends the session -> re-activate: every old access cookie of that session is refused, a new login works', async () => {
+    const { app, db, admin } = setup();
+    const c = await authClient(app);
+    const first = await logIn(c);
+    advance(MINUTE_MS);
+    const second = sessionFrom(await refreshWith(c, first));
+    expect((await meWith(c, first)).status).toBe(200);
+    expect((await meWith(c, second)).status).toBe(200);
+
+    stored(db, admin.id).isActive = false;
+    const ended = await refreshWith(c, second);
+    expect(ended.status).toBe(401);
+    expectAuthCookiesCleared(ended);
+    expect(db.refreshTokens.every((t) => t.revokedAt !== null)).toBe(true);
+
+    stored(db, admin.id).isActive = true;
+    for (const old of [first, second]) {
+      const res = await meWith(c, old);
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    }
+    expect((await meWith(c, await logIn(c))).status).toBe(200);
+  });
+
+  it('DOCUMENTS CURRENT BEHAVIOUR (Phase 7): re-activation before the session was ended revives the access cookie', async () => {
+    // Deactivation itself does not revoke refresh families yet; only a refused refresh does.
+    // So if nothing touched the session while the admin was inactive, the family is still
+    // live and the access cookie works again on re-activation (until its exp). Phase 7
+    // (deactivating admins) must revoke all of the admin's families; then flip this test.
     const { app, db, admin } = setup();
     const c = await authClient(app);
     const session = await logIn(c);
@@ -787,31 +829,59 @@ describe('CSRF over HTTP', () => {
 // ---------------------------------------------------------------------------
 
 describe('logout and access tokens', () => {
-  it('DOCUMENTS CURRENT BEHAVIOUR: after logout the old access cookie keeps working until it expires', async () => {
-    // Access tokens are stateless JWTs and requireAuth loads the admin, not the session, so
-    // logout (which revokes the refresh family) cannot end them early. The browser loses the
-    // cookie, but a copied token stays valid for up to accessTokenTtlSeconds. Reported to the
-    // coordinator as a finding to decide on; this test pins today's behaviour.
+  it('after logout, a copied old access cookie gets the identical 401 on /me immediately', async () => {
+    // The access token carries its refresh family as `sid`; logout revokes the family, so
+    // requireAuth refuses the token at once instead of at its exp.
     const { app } = setup();
     const c = await authClient(app);
     const session = await logIn(c);
+    const other = await logIn(c);
+    expect((await meWith(c, session)).status).toBe(200);
     expect((await c.post('/auth/logout', { cookies: [session.refresh] })).status).toBe(204);
 
-    expect((await refreshWith(c, session)).status).toBe(401);
-    expect((await meWith(c, session)).status).toBe(200);
+    const res = await meWith(c, session);
 
-    setNow(new Date(T0.getTime() + ACCESS_TTL_MS));
-    expect((await meWith(c, session)).status).toBe(401);
+    expect(res.status).toBe(401);
+    expect(comparable(res)).toEqual(comparable(await c.get('/me')));
+    expect((await refreshWith(c, session)).status).toBe(401);
+    // Another session of the same admin is untouched.
+    expect((await meWith(c, other)).status).toBe(200);
   });
 
-  it('DOCUMENTS CURRENT BEHAVIOUR: after reuse detection the already-issued access cookie keeps working until it expires', async () => {
+  it('after reuse detection, the already-issued access cookies get the identical 401 immediately', async () => {
     const { app } = setup();
     const c = await authClient(app);
     const tokenA = await logIn(c);
     const tokenB = sessionFrom(await refreshWith(c, tokenA));
+    expect((await meWith(c, tokenB)).status).toBe(200);
     expect((await refreshWith(c, tokenA)).status).toBe(401);
 
-    expect((await meWith(c, tokenB)).status).toBe(200);
+    const anonymous = comparable(await c.get('/me'));
+    for (const session of [tokenB, tokenA]) {
+      const res = await meWith(c, session);
+      expect(res.status).toBe(401);
+      expect(comparable(res)).toEqual(anonymous);
+    }
+  });
+
+  it('after a normal rotation the pre-rotation access cookie keeps working until its own exp', async () => {
+    // Rotation revokes the parent but leaves a live child in the family, so the session is alive.
+    const { app } = setup();
+    const c = await authClient(app);
+    const first = await logIn(c);
+    advance(MINUTE_MS);
+    const second = sessionFrom(await refreshWith(c, first));
+
+    expect((await meWith(c, first)).status).toBe(200);
+    setNow(new Date(T0.getTime() + ACCESS_TTL_MS - 1000));
+    expect((await meWith(c, first)).status).toBe(200);
+
+    setNow(new Date(T0.getTime() + ACCESS_TTL_MS));
+    const res = await meWith(c, first);
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    // Issued a minute later, the rotated cookie is still inside its own lifetime.
+    expect((await meWith(c, second)).status).toBe(200);
   });
 });
 
