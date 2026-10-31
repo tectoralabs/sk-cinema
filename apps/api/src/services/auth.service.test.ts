@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ERROR_CODES } from '@sk-cinema/shared';
-import { adminProfileSchema } from '@sk-cinema/shared';
+import { ERROR_CODES, adminProfileSchema } from '@sk-cinema/shared';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Admin, RefreshToken } from '../generated/prisma/client.js';
 import { AppError } from '../lib/errors.js';
@@ -854,6 +853,204 @@ describe('logout', () => {
     await expect(signOut(session.refreshToken)).resolves.toBeUndefined();
 
     expect(actions()).toEqual(['LOGIN', 'LOGOUT']);
+  });
+});
+
+/**
+ * Each failure below is injected into a statement that runs AFTER an earlier write in the
+ * same transaction already succeeded, and the mock records that earlier write as it saw it,
+ * so the assertions prove a real rollback rather than a transaction that never wrote.
+ */
+describe('transactions roll back after a real write', () => {
+  /** A Prisma-like unique-constraint error (not an AppError). */
+  const uniqueViolation = () =>
+    Object.assign(new Error('Unique constraint failed on the fields: (`tokenHash`)'), {
+      code: 'P2002',
+    });
+
+  describe('refresh', () => {
+    it('child create fails after the claim: parent unclaimed, no child, no audit; a retry rotates', async () => {
+      const session = await attempt();
+      const { familyId } = rowFor(session.refreshToken);
+      clock = new Date(clock.getTime() + MINUTE_MS);
+      const failure = uniqueViolation();
+      let claimedAt: unknown = 'not reached';
+      db.spies.refreshToken.create.mockImplementationOnce(() => {
+        claimedAt = rowFor(session.refreshToken).revokedAt;
+        return Promise.reject(failure);
+      });
+
+      await expect(rotate(session.refreshToken)).rejects.toBe(failure);
+
+      expect(claimedAt).toEqual(clock); // the claim had been written inside the transaction
+      expect(rowFor(session.refreshToken)).toMatchObject({ revokedAt: null, replacedById: null });
+      expect(familyRows(familyId)).toHaveLength(1);
+      expect(db.refreshTokens).toHaveLength(1);
+      expect(actions()).toEqual(['LOGIN']);
+      // Not mistaken for a lost race: the claim ran once and no family revocation followed.
+      expect(db.spies.refreshToken.updateMany).toHaveBeenCalledTimes(1);
+
+      const retried = await rotate(session.refreshToken);
+
+      const child = rowFor(retried.refreshToken);
+      expect(rowFor(session.refreshToken)).toMatchObject({
+        revokedAt: clock,
+        replacedById: child.id,
+      });
+      expect(child).toMatchObject({ familyId, revokedAt: null, replacedById: null });
+      expect(familyRows(familyId)).toHaveLength(2);
+      expect(actions()).toEqual(['LOGIN']);
+    });
+
+    it('linking the parent fails after the child was created: claim and child both roll back; a retry rotates', async () => {
+      const session = await attempt();
+      const { familyId } = rowFor(session.refreshToken);
+      clock = new Date(clock.getTime() + MINUTE_MS);
+      const failure = new Error('connection terminated unexpectedly');
+      let seen: unknown = 'not reached';
+      db.spies.refreshToken.update.mockImplementationOnce(() => {
+        seen = {
+          claimedAt: rowFor(session.refreshToken).revokedAt,
+          familySize: familyRows(familyId).length,
+        };
+        return Promise.reject(failure);
+      });
+
+      await expect(rotate(session.refreshToken)).rejects.toBe(failure);
+
+      expect(seen).toEqual({ claimedAt: clock, familySize: 2 });
+      expect(rowFor(session.refreshToken)).toMatchObject({ revokedAt: null, replacedById: null });
+      expect(familyRows(familyId)).toHaveLength(1);
+      expect(actions()).toEqual(['LOGIN']);
+
+      const retried = await rotate(session.refreshToken);
+
+      expect(rowFor(session.refreshToken)).toMatchObject({
+        revokedAt: clock,
+        replacedById: rowFor(retried.refreshToken).id,
+      });
+      expect(familyRows(familyId)).toHaveLength(2);
+      expect(actions()).toEqual(['LOGIN']);
+    });
+  });
+
+  describe('login', () => {
+    const LAST_LOGIN = new Date('2026-10-29T04:30:00.000Z');
+
+    it('the refresh-token create fails after the reset: no session, no LOGIN audit, only the reserved attempt stays', async () => {
+      db = seedDb({ failedLoginCount: 2, lastLoginAt: LAST_LOGIN });
+      const failure = uniqueViolation();
+      let seen: unknown = 'not reached';
+      db.spies.refreshToken.create.mockImplementationOnce(() => {
+        const { failedLoginCount, lastLoginAt } = storedAdmin();
+        seen = { failedLoginCount, lastLoginAt };
+        return Promise.reject(failure);
+      });
+
+      await expect(attempt()).rejects.toBe(failure);
+
+      expect(seen).toEqual({ failedLoginCount: 0, lastLoginAt: clock }); // the reset was written
+      // The reservation (2 -> 3) ran before the transaction, so its rollback does not undo it.
+      expect(storedAdmin()).toMatchObject({
+        failedLoginCount: 3,
+        lockedUntil: null,
+        lastLoginAt: LAST_LOGIN,
+      });
+      expect(db.refreshTokens).toHaveLength(0);
+      expect(db.auditLogs).toEqual([]);
+    });
+
+    it('the LOGIN audit write fails after the reset and the session row: both roll back', async () => {
+      db = seedDb({ failedLoginCount: 2, lastLoginAt: LAST_LOGIN });
+      const failure = new Error('audit insert failed');
+      let seen: unknown = 'not reached';
+      db.spies.auditLog.create.mockImplementationOnce(() => {
+        seen = {
+          failedLoginCount: storedAdmin().failedLoginCount,
+          sessions: db.refreshTokens.length,
+        };
+        return Promise.reject(failure);
+      });
+
+      await expect(attempt()).rejects.toBe(failure);
+
+      expect(seen).toEqual({ failedLoginCount: 0, sessions: 1 });
+      expect(storedAdmin()).toMatchObject({
+        failedLoginCount: 3,
+        lockedUntil: null,
+        lastLoginAt: LAST_LOGIN,
+      });
+      expect(db.refreshTokens).toHaveLength(0);
+      expect(db.auditLogs).toEqual([]);
+    });
+
+    it('after an expired lock, a failed success transaction leaves the lock cleared and one attempt used', async () => {
+      db = seedDb({ failedLoginCount: MAX, lockedUntil: new Date(clock.getTime() - MINUTE_MS) });
+      db.spies.refreshToken.create.mockRejectedValueOnce(uniqueViolation());
+
+      await expect(attempt()).rejects.toMatchObject({ code: 'P2002' });
+
+      // Both statements before the transaction stay: the expired-lock clear and the reservation.
+      expect(storedAdmin()).toMatchObject({
+        failedLoginCount: 1,
+        lockedUntil: null,
+        lastLoginAt: null,
+      });
+      expect(db.refreshTokens).toHaveLength(0);
+      expect(db.auditLogs).toEqual([]);
+    });
+
+    it('a retry with the correct password then logs in and resets the counter', async () => {
+      db = seedDb({ failedLoginCount: 2, lastLoginAt: LAST_LOGIN });
+      db.spies.refreshToken.create.mockRejectedValueOnce(uniqueViolation());
+      await expect(attempt()).rejects.toMatchObject({ code: 'P2002' });
+
+      const result = await attempt();
+
+      expect(storedAdmin()).toMatchObject({
+        failedLoginCount: 0,
+        lockedUntil: null,
+        lastLoginAt: clock,
+      });
+      expect(db.refreshTokens).toEqual([
+        expect.objectContaining({ tokenHash: hashRefreshToken(result.refreshToken) }),
+      ]);
+      expect(actions()).toEqual(['LOGIN']);
+    });
+  });
+
+  describe('logout', () => {
+    it('the LOGOUT audit write fails after the revocation: the family stays live; a retry logs out', async () => {
+      const session = await attempt();
+      const rotatedAt = clock;
+      const latest = await rotate(session.refreshToken);
+      const { adminId, familyId } = rowFor(session.refreshToken);
+      clock = new Date(clock.getTime() + MINUTE_MS);
+      const failure = new Error('audit insert failed');
+      let revokedAt: unknown = 'not reached';
+      db.spies.auditLog.create.mockImplementationOnce(() => {
+        revokedAt = rowFor(latest.refreshToken).revokedAt;
+        return Promise.reject(failure);
+      });
+
+      await expect(signOut(latest.refreshToken)).rejects.toBe(failure);
+
+      expect(revokedAt).toEqual(clock); // the revocation had been written
+      expect(rowFor(latest.refreshToken).revokedAt).toBeNull();
+      expect(rowFor(session.refreshToken).revokedAt).toEqual(rotatedAt);
+      expect(actions()).toEqual(['LOGIN']);
+      await expect(findSessionAuthState(adminId, familyId, deps())).resolves.toMatchObject({
+        sessionLive: true,
+      });
+
+      await signOut(latest.refreshToken);
+
+      expect(rowFor(latest.refreshToken).revokedAt).toEqual(clock);
+      expect(actions()).toEqual(['LOGIN', 'LOGOUT']);
+      await expect(findSessionAuthState(adminId, familyId, deps())).resolves.toMatchObject({
+        sessionLive: false,
+      });
+    });
   });
 });
 

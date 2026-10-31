@@ -113,7 +113,7 @@ function setup(options: SetupOptions = {}) {
   return { app, db, admin };
 }
 
-/** The stored row (rollbacks replace row objects, so always look it up again). */
+/** The stored row, looked up by id (the store keeps row objects across rollbacks). */
 function stored(db: InMemoryAuthDb, id: string): Admin {
   const row = db.admins.find((a) => a.id === id);
   if (!row) throw new Error('admin not found');

@@ -74,7 +74,7 @@ function setup(options: { admin?: Partial<Admin>; config?: Partial<Config> } = {
   return { app, db, admin };
 }
 
-/** The stored row (rollbacks replace row objects, so always look it up again). */
+/** The stored row, looked up by id (the store keeps row objects across rollbacks). */
 function storedAdmin(db: InMemoryAuthDb, id: string): Admin {
   const row = db.admins.find((a) => a.id === id);
   if (!row) throw new Error('admin not found');
@@ -623,6 +623,98 @@ describe('POST /api/admin/auth/logout', () => {
     expect(setCookieNames(res)).toEqual([]);
     expect(db.spies.refreshToken.findUnique).not.toHaveBeenCalled();
     expect((await c.post('/auth/refresh', { cookies: [session.refresh] })).status).toBe(200);
+  });
+});
+
+describe('database failures inside auth transactions', () => {
+  const INTERNAL_ERROR_BODY = {
+    error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' },
+  };
+  const SECRET_DETAIL = 'pg://admin:hunter2@db.internal';
+
+  /** A Prisma-like failure whose message must never reach the client. */
+  const dbFailure = (code?: string) =>
+    Object.assign(new Error(`statement failed on ${SECRET_DETAIL}`), code ? { code } : {});
+
+  function expectGenericInternalError(res: request.Response) {
+    expect(res.status).toBe(500);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.body).toEqual(INTERNAL_ERROR_BODY);
+    expect(res.text).not.toContain(SECRET_DETAIL);
+    expect(res.text).not.toContain('P2002');
+    expect(res.text).not.toMatch(/stack|\bat .+:\d+:\d+/);
+  }
+
+  it('refresh: a failing child create answers the generic 500, keeps the cookies, and a retry rotates', async () => {
+    const { app, db } = setup();
+    const c = await authClient(app);
+    const first = await logIn(c);
+    db.spies.refreshToken.create.mockRejectedValueOnce(dbFailure('P2002'));
+
+    const res = await c.post('/auth/refresh', { cookies: [first.refresh] });
+
+    expectGenericInternalError(res);
+    // Not a refused session (401), so the controller neither sets nor clears auth cookies.
+    expectNoAuthCookiesSet(res);
+    expect(db.refreshTokens).toHaveLength(1);
+    expect(db.refreshTokens[0]).toMatchObject({ revokedAt: null, replacedById: null });
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+
+    const retry = await c.post('/auth/refresh', { cookies: [first.refresh] });
+
+    expect(retry.status).toBe(200);
+    const second = sessionFrom(retry);
+    expect(second.refreshValue).not.toBe(first.refreshValue);
+    expect(db.refreshTokens).toHaveLength(2);
+    expect(db.refreshTokens[0]?.replacedById).toBe(db.refreshTokens[1]?.id);
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+    expect((await c.get('/me', [second.access])).status).toBe(200);
+  });
+
+  it('login: a failing session create answers the generic 500 with no auth cookies and no LOGIN audit', async () => {
+    const { app, db, admin } = setup();
+    const c = await authClient(app);
+    db.spies.refreshToken.create.mockRejectedValueOnce(dbFailure());
+
+    const res = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+
+    expectGenericInternalError(res);
+    expectNoAuthCookiesSet(res);
+    expect(db.refreshTokens).toHaveLength(0);
+    expect(db.auditLogs).toEqual([]);
+    // Only the attempt reserved before the transaction remains.
+    expect(storedAdmin(db, admin.id)).toMatchObject({
+      failedLoginCount: 1,
+      lockedUntil: null,
+      lastLoginAt: null,
+    });
+
+    await logIn(c);
+    expect(storedAdmin(db, admin.id).failedLoginCount).toBe(0);
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+  });
+
+  it('logout: a failing LOGOUT audit answers the generic 500, still clears the cookies, and revokes nothing', async () => {
+    const { app, db } = setup();
+    const c = await authClient(app);
+    const session = await logIn(c);
+    db.spies.auditLog.create.mockRejectedValueOnce(dbFailure());
+
+    const res = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
+
+    expectGenericInternalError(res);
+    expectAuthCookiesCleared(res);
+    expect(db.refreshTokens[0]?.revokedAt).toBeNull();
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+    // The browser dropped its cookies, but the server-side session is still live.
+    expect((await c.get('/me', [session.access])).status).toBe(200);
+
+    const retry = await c.post('/auth/logout', { cookies: [session.access, session.refresh] });
+
+    expect(retry.status).toBe(204);
+    expect(db.refreshTokens[0]?.revokedAt).not.toBeNull();
+    expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN', 'LOGOUT']);
+    expect((await c.get('/me', [session.access])).status).toBe(401);
   });
 });
 
