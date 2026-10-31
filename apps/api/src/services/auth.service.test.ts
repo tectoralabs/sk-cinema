@@ -188,10 +188,16 @@ describe('login: wrong password', () => {
     expect(error.code).toBe(ERROR_CODES.INVALID_CREDENTIALS);
     expect(storedAdmin().failedLoginCount).toBe(1);
     expect(storedAdmin().lockedUntil).toBeNull();
-    // Incremented in SQL, not read-modify-written in JS.
-    expect(db.spies.admin.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { failedLoginCount: { increment: 1 } } }),
+    // Reserved in SQL before the verify, only while unlocked and under the limit.
+    expect(db.spies.admin.updateManyAndReturn).toHaveBeenCalledWith({
+      where: { id: storedAdmin().id, lockedUntil: null, failedLoginCount: { lt: MAX } },
+      data: { failedLoginCount: { increment: 1 } },
+      select: { failedLoginCount: true },
+    });
+    expect(db.spies.admin.updateManyAndReturn.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(verifyPassword).mock.invocationCallOrder[0] ?? 0,
     );
+    expect(db.spies.admin.update).not.toHaveBeenCalled();
     expect(db.auditLogs).toEqual([
       expect.objectContaining({
         action: 'LOGIN_FAILED',
@@ -294,6 +300,162 @@ describe('login: locked account', () => {
 
     expect(storedAdmin()).toMatchObject({ failedLoginCount: 1, lockedUntil: null });
     expect(actions()).toEqual(['LOGIN_FAILED']);
+  });
+});
+
+/** A promise the test settles by hand, to pin down an interleaving. */
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Holds the next verifyPassword calls (in call order) until the test releases each with
+ * its result, so a race between logins can be replayed step by step.
+ */
+function gateVerifies(count: number) {
+  const gates = Array.from({ length: count }, () => deferred<boolean>());
+  for (const gate of gates) vi.mocked(verifyPassword).mockImplementationOnce(() => gate.promise);
+  return gates;
+}
+
+const waitForVerifies = (times: number) =>
+  vi.waitFor(() => {
+    expect(verifyPassword).toHaveBeenCalledTimes(times);
+  });
+
+const reasons = () =>
+  db.auditLogs
+    .filter((row) => row.action === 'LOGIN_FAILED')
+    .map((row) => (row.details as { reason: string }).reason);
+
+describe('login: concurrent attempts', () => {
+  it(`lets only ${MAX} of 20 concurrent wrong passwords reach the real hash, then locks once`, async () => {
+    const N = 20;
+    const errors = await Promise.all(
+      Array.from({ length: N }, (_, i) => refused({ password: `${WRONG_PASSWORD}-${i}` })),
+    );
+
+    expect(verifyPassword).toHaveBeenCalledTimes(MAX);
+    expect(verifyDummyPassword).toHaveBeenCalledTimes(N - MAX);
+    expect(storedAdmin()).toMatchObject({
+      failedLoginCount: MAX,
+      lockedUntil: new Date(clock.getTime() + authConfig.loginLockoutMinutes * MINUTE_MS),
+    });
+
+    // lockedUntil was written by exactly one statement, and audited exactly once.
+    const calls = db.spies.admin.updateManyAndReturn.mock.calls;
+    const results = await Promise.all(
+      db.spies.admin.updateManyAndReturn.mock.results.map((r) => r.value as Promise<unknown[]>),
+    );
+    const lockWrites = results.filter((_, i) => 'lockedUntil' in (calls[i]?.[0].data ?? {}));
+    expect(lockWrites.filter((rows) => rows.length > 0)).toHaveLength(1);
+    expect(db.spies.admin.update).not.toHaveBeenCalled();
+    expect(db.spies.admin.updateMany).not.toHaveBeenCalled();
+    expect(actions().filter((a) => a === 'ACCOUNT_LOCKED')).toHaveLength(1);
+    expect(db.auditLogs.find((row) => row.action === 'ACCOUNT_LOCKED')?.details).toMatchObject({
+      failedLoginCount: MAX,
+    });
+
+    // The rest were refused as locked, with the same 401 as every other refusal.
+    expect(reasons().filter((r) => r === 'bad_password')).toHaveLength(MAX);
+    expect(reasons().filter((r) => r === 'locked')).toHaveLength(N - MAX);
+    const expected = JSON.stringify({
+      status: 401,
+      code: ERROR_CODES.INVALID_CREDENTIALS,
+      message: INVALID_CREDENTIALS_MESSAGE,
+    });
+    for (const error of errors) expect(errorShape(error)).toBe(expected);
+    expect(db.refreshTokens).toHaveLength(0);
+  });
+
+  // The failure took the last attempt (count reaches MAX), the correct login commits its reset
+  // between that failure's increment and its lock write. The lock must then not be applied.
+  it('does not lock when a correct login commits between the last failure and its lock write', async () => {
+    db = seedDb({ failedLoginCount: MAX - 2 });
+    const [correctGate, wrongGate] = gateVerifies(2);
+
+    const correct = attempt();
+    await waitForVerifies(1);
+    const wrong = refused({ password: WRONG_PASSWORD });
+    await waitForVerifies(2);
+    expect(storedAdmin().failedLoginCount).toBe(MAX); // both reserved; the failure took the last
+
+    correctGate?.resolve(true);
+    await correct;
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: 0, lockedUntil: null });
+    wrongGate?.resolve(false);
+    await wrong;
+
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: 0, lockedUntil: null });
+    expect(actions()).toEqual(['LOGIN', 'LOGIN_FAILED']);
+    expect(reasons()).toEqual(['bad_password']);
+  });
+
+  it('a lock set while a correct login is in flight is cleared by that login, never left at count 0', async () => {
+    db = seedDb({ failedLoginCount: MAX - 2 });
+    const [correctGate, wrongGate] = gateVerifies(2);
+
+    const correct = attempt();
+    await waitForVerifies(1);
+    const wrong = refused({ password: WRONG_PASSWORD });
+    await waitForVerifies(2);
+
+    wrongGate?.resolve(false);
+    await wrong;
+    expect(storedAdmin()).toMatchObject({
+      failedLoginCount: MAX,
+      lockedUntil: new Date(clock.getTime() + authConfig.loginLockoutMinutes * MINUTE_MS),
+    });
+    // While locked, a third attempt is refused without the real hash.
+    await refused();
+    expect(verifyPassword).toHaveBeenCalledTimes(2);
+
+    correctGate?.resolve(true);
+    await correct;
+
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: 0, lockedUntil: null });
+    expect(actions()).toEqual(['ACCOUNT_LOCKED', 'LOGIN_FAILED', 'LOGIN_FAILED', 'LOGIN']);
+    expect(reasons()).toEqual(['bad_password', 'locked']);
+  });
+
+  it('refuses as locked, without the real hash, while a correct login holds the last attempt', async () => {
+    db = seedDb({ failedLoginCount: MAX - 1 });
+    const [correctGate] = gateVerifies(1);
+
+    const correct = attempt();
+    await waitForVerifies(1);
+    await refused({ password: WRONG_PASSWORD });
+
+    expect(verifyPassword).toHaveBeenCalledTimes(1);
+    expect(verifyDummyPassword).toHaveBeenCalledWith(WRONG_PASSWORD);
+    expect(reasons()).toEqual(['locked']);
+
+    correctGate?.resolve(true);
+    await correct;
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: 0, lockedUntil: null });
+    expect(actions().at(-1)).toBe('LOGIN');
+  });
+
+  it('locks an account whose attempts are used up but whose lock write was lost, so it expires', async () => {
+    db = seedDb({ failedLoginCount: MAX, lockedUntil: null });
+    const lockedUntil = new Date(clock.getTime() + authConfig.loginLockoutMinutes * MINUTE_MS);
+
+    await refused();
+    expect(verifyPassword).not.toHaveBeenCalled();
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: MAX, lockedUntil });
+    expect(actions()).toEqual(['ACCOUNT_LOCKED', 'LOGIN_FAILED']);
+    expect(reasons()).toEqual(['locked']);
+
+    await refused();
+    expect(actions().filter((a) => a === 'ACCOUNT_LOCKED')).toHaveLength(1);
+
+    clock = lockedUntil;
+    await attempt();
+    expect(storedAdmin()).toMatchObject({ failedLoginCount: 0, lockedUntil: null });
   });
 });
 

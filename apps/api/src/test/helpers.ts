@@ -90,7 +90,43 @@ export function testRefreshToken(
 type Row = Record<string, unknown>;
 type Where = Record<string, unknown>;
 
-/** Supports equality and `{ lte }` / `{ gt }` on Dates, which is all the services use. */
+type Comparable = Date | number;
+
+interface RangeFilter {
+  lt?: Comparable;
+  lte?: Comparable;
+  gt?: Comparable;
+  gte?: Comparable;
+}
+
+/** A Date or number as a number, or null for anything else (including SQL NULL). */
+const numeric = (value: unknown): number | null =>
+  value instanceof Date ? value.getTime() : typeof value === 'number' ? value : null;
+
+/**
+ * `lt` / `lte` / `gt` / `gte` the way SQL compares: a NULL (or non-comparable) column never
+ * matches, and a bound must be the same kind (Date or number) as the column value.
+ */
+function inRange(value: unknown, filter: RangeFilter): boolean {
+  const actual = numeric(value);
+  if (actual === null) return false;
+  const bound = (b: Comparable): number => {
+    if (b instanceof Date !== value instanceof Date) {
+      throw new Error('inMemoryAuthDb: range bound and column are different types');
+    }
+    return b instanceof Date ? b.getTime() : b;
+  };
+  if (filter.lt !== undefined && !(actual < bound(filter.lt))) return false;
+  if (filter.lte !== undefined && !(actual <= bound(filter.lte))) return false;
+  if (filter.gt !== undefined && !(actual > bound(filter.gt))) return false;
+  if (filter.gte !== undefined && !(actual >= bound(filter.gte))) return false;
+  return true;
+}
+
+/**
+ * Supports equality (Dates by time) and `{ lt, lte, gt, gte }` on Date and number columns,
+ * which is all the services use.
+ */
 function matches(row: Row, where: Where): boolean {
   return Object.entries(where).every(([key, condition]) => {
     const value = row[key];
@@ -99,11 +135,7 @@ function matches(row: Row, where: Where): boolean {
         ? value.getTime() === condition.getTime()
         : value === condition;
     }
-    const { lte, gt } = condition as { lte?: Date; gt?: Date };
-    if (!(value instanceof Date)) return false;
-    if (lte && value.getTime() > lte.getTime()) return false;
-    if (gt && value.getTime() <= gt.getTime()) return false;
-    return true;
+    return inRange(value, condition);
   });
 }
 
@@ -159,8 +191,10 @@ function notFoundError(): Error {
  * interactive $transaction (rolled back if the callback throws). Transactions run one at a
  * time, the way Postgres row locks serialise conflicting writers, so a whole-store rollback
  * never undoes another transaction's writes. Every method is a vi.fn, so tests can assert
- * on the exact Prisma calls. Rows are returned as copies; findUnique honours select/include,
- * and admin.findUnique also a `_count: { select: { refreshTokens: { where } } }` selection.
+ * on the exact Prisma calls. Each single call (update, updateMany, admin.updateManyAndReturn)
+ * matches and writes without yielding, like one SQL statement. Rows are returned as copies;
+ * findUnique and updateManyAndReturn honour select/include, and admin.findUnique also a
+ * `_count: { select: { refreshTokens: { where } } }` selection.
  */
 export function inMemoryAuthDb(seed: { admins?: Admin[]; refreshTokens?: RefreshToken[] } = {}) {
   const store = {
@@ -207,6 +241,16 @@ export function inMemoryAuthDb(seed: { admins?: Admin[]; refreshTokens?: Refresh
       });
       return Promise.resolve({ count: hits.length });
     }),
+    /** One `UPDATE ... WHERE ... RETURNING`: filters and writes in the same synchronous step. */
+    updateManyAndReturn: vi.fn(
+      ({ where, data, ...args }: { where: Where; data: Row } & Pick<Projection, 'select'>) => {
+        const hits = store.admins.filter((a) => matches(a, where));
+        hits.forEach((a) => {
+          applyData(a, { ...data, updatedAt: new Date() });
+        });
+        return Promise.resolve(hits.map((a) => project(a, args, () => undefined)));
+      },
+    ),
   };
 
   const refreshToken = {

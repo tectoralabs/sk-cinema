@@ -187,10 +187,21 @@ export async function login(input: LoginInput, deps: AuthServiceDeps): Promise<L
     return refuse('inactive', admin.id);
   }
 
+  const reservedCount = await reserveAttempt(admin, now, deps);
+
+  if (reservedCount === null) {
+    // No attempt left: the account is locked, or is about to be by an in-flight failure.
+    await lockIfExhausted(admin.id, now, deps, client);
+    await verifyDummyPassword(input.password);
+    return refuse('locked', admin.id);
+  }
+
   const passwordOk = await verifyPassword(admin.passwordHash, input.password);
 
   if (!passwordOk) {
-    await recordFailedAttempt(admin, now, deps, client);
+    if (reservedCount >= config.loginMaxFailedAttempts) {
+      await lockIfExhausted(admin.id, now, deps, client);
+    }
     return refuse('bad_password', admin.id);
   }
 
@@ -232,20 +243,39 @@ export async function login(input: LoginInput, deps: AuthServiceDeps): Promise<L
   return { admin: toAdminProfile(admin), accessToken, refreshToken, refreshExpiresAt };
 }
 
-/**
- * Counts a wrong password without a JS read-modify-write:
- * 1. If an earlier lock has expired, a conditional update (matching only while
- *    lockedUntil <= now) zeroes the counter and clears the lock. Concurrent requests
- *    cannot double-reset: once one commits, lockedUntil is null and the filter no longer matches.
- * 2. The counter is incremented in SQL and the new value read back.
- * 3. Reaching the limit sets lockedUntil and audits ACCOUNT_LOCKED.
+/*
+ * Account lockout. The admin row read at the start of login is only a hint: many requests
+ * for one email can be in flight at once (each slowed by argon2), so every decision that
+ * matters is a single conditional UPDATE that Postgres re-checks against the committed row
+ * under its row lock. There is no JS read-modify-write anywhere.
+ *
+ * 1. Expired lock: `lockedUntil <= now` -> count 0, lockedUntil null. Only one concurrent
+ *    request can match; after it, lockedUntil is null (or a new, future lock) and it no longer does.
+ * 2. Reserve: `lockedUntil IS NULL AND failedLoginCount < max` -> count + 1, RETURNING the new
+ *    count. This happens BEFORE the real hash is verified, so at most `max` verifications can
+ *    ever run per lock window, however many requests race. No row returned means no attempt
+ *    is left: the request is refused as locked without touching the real hash.
+ * 3. Lock: `lockedUntil IS NULL AND failedLoginCount >= max` -> lockedUntil = now + lockout.
+ *    Run by the failure that used the last attempt, and also by any request refused in step 2,
+ *    so a lock write lost to a crash or DB error can never leave the account refused forever
+ *    with no expiry. Only one request can match, so ACCOUNT_LOCKED is audited exactly once
+ *    per lock and the lock is never extended. A successful login sets count 0 and lockedUntil
+ *    null in one UPDATE, so a lock attempted after it no longer matches: the account is never
+ *    left locked with a zero count.
+ *
+ * Reserving before verifying means a correct password in flight briefly holds an attempt; its
+ * success then resets the counter (and clears a lock that raced it) as it always has.
  */
-async function recordFailedAttempt(
+
+/**
+ * Atomically takes one login attempt for an active admin, first clearing an expired lock.
+ * Returns the new failedLoginCount, or null if no attempt is left.
+ */
+async function reserveAttempt(
   admin: LoginAdmin,
   now: Date,
   { db, config }: AuthServiceDeps,
-  client: ClientInfo,
-): Promise<void> {
+): Promise<number | null> {
   if (admin.lockedUntil) {
     await db.admin.updateMany({
       where: { id: admin.id, lockedUntil: { lte: now } },
@@ -253,27 +283,46 @@ async function recordFailedAttempt(
     });
   }
 
-  const { failedLoginCount } = await db.admin.update({
-    where: { id: admin.id },
+  // updateManyAndReturn is one UPDATE ... WHERE ... RETURNING: no row means no match, without
+  // using P2025 from update() as control flow, and the count returned is exactly ours.
+  const [reserved] = await db.admin.updateManyAndReturn({
+    where: {
+      id: admin.id,
+      lockedUntil: null,
+      failedLoginCount: { lt: config.loginMaxFailedAttempts },
+    },
     data: { failedLoginCount: { increment: 1 } },
     select: { failedLoginCount: true },
   });
+  return reserved?.failedLoginCount ?? null;
+}
 
-  if (failedLoginCount < config.loginMaxFailedAttempts) return;
-
+/** Locks an admin whose attempts are used up and not yet locked; audits ACCOUNT_LOCKED if so. */
+async function lockIfExhausted(
+  adminId: string,
+  now: Date,
+  { db, config }: AuthServiceDeps,
+  client: ClientInfo,
+): Promise<void> {
   const lockedUntil = new Date(now.getTime() + config.loginLockoutMinutes * MINUTE_MS);
-  await db.admin.update({
-    where: { id: admin.id },
+  const [locked] = await db.admin.updateManyAndReturn({
+    where: {
+      id: adminId,
+      lockedUntil: null,
+      failedLoginCount: { gte: config.loginMaxFailedAttempts },
+    },
     data: { lockedUntil },
-    select: { id: true },
+    select: { failedLoginCount: true },
   });
+  if (!locked) return;
+
   await writeAudit(db, {
     action: 'ACCOUNT_LOCKED',
-    adminId: admin.id,
+    adminId,
     entity: AUDIT_ENTITY,
-    entityId: admin.id,
+    entityId: adminId,
     details: {
-      failedLoginCount,
+      failedLoginCount: locked.failedLoginCount,
       lockedUntil: lockedUntil.toISOString(),
       lockoutMinutes: config.loginLockoutMinutes,
     },
