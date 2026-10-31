@@ -3,6 +3,7 @@ import express, { type Express } from 'express';
 import type { Logger } from 'pino';
 import type { Config } from './config/env.js';
 import type { PrismaClient } from './generated/prisma/client.js';
+import { API_PREFIX } from './lib/apiPaths.js';
 import type { MemoryCache } from './lib/cache.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import { globalRateLimiter } from './middleware/rateLimiter.js';
@@ -29,12 +30,13 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(requestLogger(logger));
   app.use(securityHeaders());
-  app.use(corsPolicy(config.corsOrigins));
+  // Before the rate limiter, so 429s are readable by allowed origins.
+  app.use(corsPolicy(config));
   app.use(globalRateLimiter(config.rateLimit));
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
   app.use(cookieParser());
 
-  app.use('/api', apiRouter(deps));
+  app.use(API_PREFIX, apiRouter(deps));
 
   app.use(notFoundHandler);
   app.use(errorHandler);
