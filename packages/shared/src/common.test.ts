@@ -1,17 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { emptyBodySchema } from './common.js';
+import { emptyBodySchema, emptyQuerySchema } from './common.js';
 
-describe('emptyBodySchema', () => {
+describe.each([
+  ['emptyBodySchema', emptyBodySchema],
+  ['emptyQuerySchema', emptyQuerySchema],
+])('%s', (_name, schema) => {
   it('accepts an empty object', () => {
-    expect(emptyBodySchema.parse({})).toEqual({});
+    expect(schema.parse({})).toEqual({});
   });
 
   it('rejects any key', () => {
-    expect(emptyBodySchema.safeParse({ refreshToken: 'x' }).success).toBe(false);
+    expect(schema.safeParse({ refreshToken: 'x' }).success).toBe(false);
   });
 
   it('rejects non-objects', () => {
-    expect(emptyBodySchema.safeParse([]).success).toBe(false);
-    expect(emptyBodySchema.safeParse(null).success).toBe(false);
+    expect(schema.safeParse([]).success).toBe(false);
+    expect(schema.safeParse(null).success).toBe(false);
   });
 });
