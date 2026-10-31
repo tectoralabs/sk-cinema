@@ -432,8 +432,11 @@ describe('POST /api/admin/movies', () => {
 
     it(`a generated slug that clashes on all ${String(AUTO_SLUG_MAX_ATTEMPTS)} attempts is a 409`, async () => {
       const s = await setup();
-      for (let i = 0; i < AUTO_SLUG_MAX_ATTEMPTS; i += 1) {
-        s.db.spies.movie.create.mockRejectedValueOnce(uniqueConstraintError('movie', 'slug'));
+      for (let call = 1; call <= AUTO_SLUG_MAX_ATTEMPTS; call += 1) {
+        s.db.injectFault('movie', 'create', {
+          onCall: call,
+          error: uniqueConstraintError('movie', 'slug'),
+        });
       }
 
       const error = expectError(

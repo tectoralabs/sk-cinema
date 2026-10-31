@@ -984,13 +984,21 @@ export function inMemoryAuthDb(
   };
 
   const faults: (FaultOptions & { model: ModelName; operation: string; callsLeft: number })[] = [];
-  /** Counts this call against the faults injected for it, and fires the one that is due. */
+  /**
+   * Counts this call against every fault injected for it, then fires the ones that are due:
+   * each due `before` runs, and the earliest-injected due `error` is thrown. Counting finishes
+   * before anything fires, so a throwing fault never stops a later fault from counting the call.
+   */
   const trip = (model: ModelName, name: string) => {
+    const due: typeof faults = [];
     for (const fault of [...faults]) {
       if (fault.model !== model || fault.operation !== name) continue;
       fault.callsLeft -= 1;
       if (fault.callsLeft > 0) continue;
       faults.splice(faults.indexOf(fault), 1);
+      due.push(fault);
+    }
+    for (const fault of due) {
       if (fault.before) {
         const outer = activeLog;
         activeLog = null;
@@ -1000,8 +1008,9 @@ export function inMemoryAuthDb(
           activeLog = outer;
         }
       }
-      if (fault.error) throw fault.error;
     }
+    const failing = due.find((fault) => fault.error);
+    if (failing?.error) throw failing.error;
   };
 
   const insert = (model: ModelName, row: Row) => {
@@ -1337,7 +1346,8 @@ export function inMemoryAuthDb(
    * Makes call number `onCall` (default 1: the next call) of `model.operation`, counted from
    * now, through the root client or any transaction client, fail with `error` and/or run
    * `before` first. The call's arguments are validated before it counts; a failing call reads
-   * and writes nothing. Several faults on one operation each count every call.
+   * and writes nothing. Several faults on one operation each count every call, including a
+   * call another fault fails, so `onCall: 1` and `onCall: 2` fail the next two calls.
    */
   const injectFault = <M extends keyof typeof delegates>(
     model: M,

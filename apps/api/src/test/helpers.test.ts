@@ -1369,6 +1369,36 @@ describe('inMemoryAuthDb: movie fault injection', () => {
     expect(db.movies.map((m) => m.slug)).toEqual(['dune', 'dune-3']);
   });
 
+  it('fires two queued faults on calls 1 and 2, even though the first one throws', async () => {
+    const db = inMemoryAuthDb();
+    db.injectFault('movie', 'create', { onCall: 1, error: uniqueConstraintError('movie', 'slug') });
+    db.injectFault('movie', 'create', { onCall: 2, error: uniqueConstraintError('movie', 'slug') });
+
+    await expect(db.spies.movie.create({ data: { ...data, slug: 'dune' } })).rejects.toMatchObject({
+      code: 'P2002',
+    });
+    await expect(
+      db.spies.movie.create({ data: { ...data, slug: 'dune-2' } }),
+    ).rejects.toMatchObject({ code: 'P2002' });
+    await db.spies.movie.create({ data: { ...data, slug: 'dune-3' } });
+
+    expect(db.movies.map((m) => m.slug)).toEqual(['dune-3']);
+  });
+
+  it('runs every due before hook and throws the earliest-injected error when faults share a call', async () => {
+    const db = inMemoryAuthDb();
+    const first = uniqueConstraintError('movie', 'slug');
+    const hook = vi.fn();
+    db.injectFault('movie', 'create', { error: first });
+    db.injectFault('movie', 'create', { before: hook, error: new Error('second') });
+
+    await expect(db.spies.movie.create({ data })).rejects.toBe(first);
+
+    expect(hook).toHaveBeenCalledTimes(1);
+    await db.spies.movie.create({ data });
+    expect(db.movies.map((m) => m.slug)).toEqual(['dune']);
+  });
+
   it('simulates a concurrent insert: the slug is free on read, taken on insert', async () => {
     const db = inMemoryAuthDb();
     db.injectFault('movie', 'create', {

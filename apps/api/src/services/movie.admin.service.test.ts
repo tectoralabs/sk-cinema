@@ -255,7 +255,10 @@ describe('createMovieAdminService.create', () => {
     const { db, service, actor } = setup();
     // Clashes that leave no row behind: only the remembered slugs move the suffix on.
     for (let call = 1; call < AUTO_SLUG_MAX_ATTEMPTS; call += 1) {
-      db.spies.movie.create.mockRejectedValueOnce(uniqueConstraintError('movie', 'slug'));
+      db.injectFault('movie', 'create', {
+        onCall: call,
+        error: uniqueConstraintError('movie', 'slug'),
+      });
     }
 
     const movie = await service.create(body({ title: 'Avatar', durationMinutes: 162 }), actor);
