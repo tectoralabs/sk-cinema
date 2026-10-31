@@ -1,4 +1,9 @@
-import { emptyQuerySchema, movieCreateBodySchema, movieIdParamsSchema } from '@sk-cinema/shared';
+import {
+  adminMovieListQuerySchema,
+  emptyQuerySchema,
+  movieCreateBodySchema,
+  movieIdParamsSchema,
+} from '@sk-cinema/shared';
 import { Router } from 'express';
 import type { MovieAdminController } from '../controllers/movie.admin.controller.js';
 import { validate } from '../middleware/validate.js';
@@ -15,6 +20,7 @@ export function movieAdminRoutes(controller: MovieAdminController): Router {
     validate({ body: movieCreateBodySchema, query: emptyQuerySchema }),
     controller.create,
   );
+  router.get('/', validate({ query: adminMovieListQuerySchema }), controller.list);
   router.get(
     '/:id',
     validate({ params: movieIdParamsSchema, query: emptyQuerySchema }),

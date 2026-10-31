@@ -1,6 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { adminMovieSchema, movieCreateBodySchema } from '@sk-cinema/shared';
+import {
+  ADMIN_MOVIE_SORT_FIELDS,
+  adminMovieListQuerySchema,
+  adminMovieSchema,
+  movieCreateBodySchema,
+} from '@sk-cinema/shared';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { Prisma, type Movie } from '../generated/prisma/client.js';
 import { MemoryCache } from '../lib/cache.js';
@@ -14,6 +19,8 @@ import {
 } from '../test/helpers.js';
 import {
   AUTO_SLUG_MAX_ATTEMPTS,
+  adminMovieListOrderBy,
+  adminMovieListWhere,
   createMovieAdminService,
   isMovieSlugClash,
   parseDateOnly,
@@ -301,5 +308,64 @@ describe('createMovieAdminService.create', () => {
     expect(error).toMatchObject({ status: 400, code: 'VALIDATION_ERROR' });
     expect(db.spies.movie.findMany).not.toHaveBeenCalled();
     expect(db.spies.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('adminMovieListWhere', () => {
+  const where = (input: Record<string, string>) =>
+    adminMovieListWhere(adminMovieListQuerySchema.parse(input));
+
+  it('excludes soft-deleted movies by default and adds nothing else', () => {
+    expect(where({})).toEqual({ deletedAt: null });
+  });
+
+  it.each([
+    ['exclude', { deletedAt: null }],
+    ['include', {}],
+    ['only', { deletedAt: { not: null } }],
+  ])('deleted=%s', (deleted, expected) => {
+    expect(where({ deleted })).toEqual(expected);
+  });
+
+  it('ANDs every filter and searches title OR slug with the escaped term', () => {
+    expect(
+      // The search is trimmed by the schema: the term is `50%_off\`.
+      where({ search: ' 50%_off\\ ', status: 'ENDED', isActive: 'false', deleted: 'only' }),
+    ).toEqual({
+      status: 'ENDED',
+      isActive: false,
+      deletedAt: { not: null },
+      OR: [
+        { title: { contains: '50\\%\\_off\\\\', mode: 'insensitive' } },
+        { slug: { contains: '50\\%\\_off\\\\', mode: 'insensitive' } },
+      ],
+    });
+  });
+
+  it('keeps isActive=false (a falsy value) as a filter', () => {
+    expect(where({ isActive: 'false' })).toEqual({ isActive: false, deletedAt: null });
+  });
+});
+
+describe('adminMovieListOrderBy', () => {
+  it.each(ADMIN_MOVIE_SORT_FIELDS.filter((field) => field !== 'releaseDate'))(
+    'sorts by %s, then id in the same direction',
+    (sort) => {
+      expect(adminMovieListOrderBy({ sort, order: 'asc' })).toEqual([
+        { [sort]: 'asc' },
+        { id: 'asc' },
+      ]);
+      expect(adminMovieListOrderBy({ sort, order: 'desc' })).toEqual([
+        { [sort]: 'desc' },
+        { id: 'desc' },
+      ]);
+    },
+  );
+
+  it.each(['asc', 'desc'] as const)('puts undated movies last for releaseDate %s', (order) => {
+    expect(adminMovieListOrderBy({ sort: 'releaseDate', order })).toEqual([
+      { releaseDate: { sort: order, nulls: 'last' } },
+      { id: order },
+    ]);
   });
 });

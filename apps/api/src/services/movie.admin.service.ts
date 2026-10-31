@@ -1,7 +1,14 @@
-import { ERROR_CODES, type AdminMovie, type MovieCreateBody } from '@sk-cinema/shared';
+import {
+  ERROR_CODES,
+  type AdminMovie,
+  type AdminMovieListQuery,
+  type AdminMovieListResponse,
+  type MovieCreateBody,
+} from '@sk-cinema/shared';
 import { Prisma, type Movie, type PrismaClient } from '../generated/prisma/client.js';
 import type { MemoryCache } from '../lib/cache.js';
 import { AppError, notFound } from '../lib/errors.js';
+import { escapeLikePattern } from '../lib/likePattern.js';
 import { firstFreeSlug, slugify } from '../lib/slug.js';
 import { writeAudit } from './audit.service.js';
 import { formatDateOnly, invalidatePublicMovies } from './movie.public.service.js';
@@ -90,6 +97,53 @@ export function toAdminMovie(row: AdminMovieRow): AdminMovie {
 /** A `YYYY-MM-DD` (already validated) as the UTC-midnight Date Prisma writes to a `@db.Date`. */
 export function parseDateOnly(date: string): Date {
   return new Date(`${date}T00:00:00.000Z`);
+}
+
+/**
+ * The `where` of the admin list: every given filter, combined with AND. `deleted` defaults to
+ * 'exclude' in the query schema. The search matches title OR slug, case-insensitively, as a
+ * literal substring (see escapeLikePattern: Prisma does not escape LIKE wildcards).
+ */
+export function adminMovieListWhere(query: AdminMovieListQuery): Prisma.MovieWhereInput {
+  const where: Prisma.MovieWhereInput = {};
+  if (query.status !== undefined) where.status = query.status;
+  if (query.isActive !== undefined) where.isActive = query.isActive;
+  if (query.deleted === 'exclude') where.deletedAt = null;
+  else if (query.deleted === 'only') where.deletedAt = { not: null };
+  if (query.search !== undefined) {
+    const term = escapeLikePattern(query.search);
+    where.OR = [
+      { title: { contains: term, mode: 'insensitive' } },
+      { slug: { contains: term, mode: 'insensitive' } },
+    ];
+  }
+  return where;
+}
+
+type SortOrder = AdminMovieListQuery['order'];
+
+/** One entry per ADMIN_MOVIE_SORT_FIELDS value (the Record type makes a missing one a type error). */
+const ADMIN_LIST_SORT: Record<
+  AdminMovieListQuery['sort'],
+  (order: SortOrder) => Prisma.MovieOrderByWithRelationInput
+> = {
+  updatedAt: (order) => ({ updatedAt: order }),
+  createdAt: (order) => ({ createdAt: order }),
+  title: (order) => ({ title: order }),
+  releaseDate: (order) => ({ releaseDate: { sort: order, nulls: 'last' } }),
+};
+
+/**
+ * The `orderBy` of the admin list: the chosen column, then `id` in the same direction as a
+ * unique tie-breaker, so pages never overlap or skip rows (and asc is exactly desc reversed).
+ * `releaseDate` is the only nullable sort column: undated movies go last in both directions,
+ * like the public list (Postgres would otherwise put NULLs first for desc).
+ */
+export function adminMovieListOrderBy({
+  sort,
+  order,
+}: Pick<AdminMovieListQuery, 'sort' | 'order'>): Prisma.MovieOrderByWithRelationInput[] {
+  return [ADMIN_LIST_SORT[sort](order), { id: order }];
 }
 
 /** A 409 on `body.slug`, so the admin form can show it next to the field. */
@@ -242,6 +296,32 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
       // Only after the commit, so no request can re-cache the pre-insert list.
       invalidatePublicMovies(cache);
       return toAdminMovie(row);
+    },
+
+    /**
+     * One page of movies for the admin table, filtered, searched and sorted (see
+     * adminMovieListWhere / adminMovieListOrderBy). Never cached: admins must see their own
+     * writes at once. A page past the end has no items but still the full `total`.
+     *
+     * The page and the count are two independent queries run in parallel, not a transaction:
+     * at Postgres's default READ COMMITTED level each statement takes its own snapshot anyway,
+     * so a transaction would add BEGIN/COMMIT round trips and hold a pooled connection without
+     * making the two consistent. A write landing between them can make `total` differ from the
+     * rows by one, which the next fetch corrects; that is fine for an admin table.
+     */
+    async list(query: AdminMovieListQuery): Promise<AdminMovieListResponse> {
+      const where = adminMovieListWhere(query);
+      const [rows, total] = await Promise.all([
+        db.movie.findMany({
+          where,
+          orderBy: adminMovieListOrderBy(query),
+          skip: (query.page - 1) * query.pageSize,
+          take: query.pageSize,
+          select: adminMovieSelect,
+        }),
+        db.movie.count({ where }),
+      ]);
+      return { items: rows.map(toAdminMovie), page: query.page, pageSize: query.pageSize, total };
     },
 
     /** Any movie by id, soft-deleted or hidden ones included. 404 when there is none. */

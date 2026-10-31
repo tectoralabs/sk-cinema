@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import {
+  adminMovieListResponseSchema,
   adminMovieResponseSchema,
   apiErrorSchema,
   publicMovieListResponseSchema,
   type AdminMovie,
+  type AdminMovieListResponse,
   type MovieCreateBodyInput,
 } from '@sk-cinema/shared';
 import type { Express } from 'express';
@@ -13,6 +15,7 @@ import type { AdminRole, Movie } from '../generated/prisma/client.js';
 import { hashPassword } from '../lib/password.js';
 import {
   AUTO_SLUG_MAX_ATTEMPTS,
+  adminMovieSelect,
   SLUG_GENERATION_FAILED_MESSAGE,
   SLUG_IN_USE_MESSAGE,
   SLUG_REQUIRED_MESSAGE,
@@ -616,5 +619,503 @@ describe('GET /api/admin/movies/:id', () => {
     const s = await setup({ role: 'SUPER_ADMIN', movies: [seeded] });
 
     expect((await getMovie(s, seeded.id)).status).toBe(200);
+  });
+});
+
+describe('GET /api/admin/movies', () => {
+  const day = (n: number) => new Date(Date.UTC(2026, 0, n));
+  const date = (iso: string) => new Date(`${iso}T00:00:00.000Z`);
+
+  const listMovies = (s: Setup, query: Record<string, string> | string = {}) => {
+    const qs = typeof query === 'string' ? query : new URLSearchParams(query).toString();
+    return s.client.get(qs === '' ? '/movies' : `/movies?${qs}`, [s.session.access]);
+  };
+
+  /** 200, no-store, and a body the strict shared response schema accepts. */
+  function expectPage(res: request.Response): AdminMovieListResponse {
+    expect(res.status).toBe(200);
+    expect(res.headers['cache-control']).toBe('no-store');
+    return adminMovieListResponseSchema.parse(res.body);
+  }
+
+  const slugsOf = (page: AdminMovieListResponse) => page.items.map((m) => m.slug);
+  const listSlugs = async (s: Setup, query: Record<string, string> | string = {}) =>
+    slugsOf(expectPage(await listMovies(s, query)));
+
+  describe('defaults', () => {
+    it('excludes deleted movies, sorts by updatedAt desc, page 1 of 20', async () => {
+      const movies = Array.from({ length: 25 }, (_, i) =>
+        testMovie({
+          slug: `movie-${String(i + 1)}`,
+          title: `Movie ${String(i + 1)}`,
+          updatedAt: day(i + 1),
+        }),
+      );
+      const s = await setup({
+        movies: [...movies, deleted({ slug: 'gone', title: 'Gone', updatedAt: day(31) })],
+      });
+
+      const page = expectPage(await listMovies(s));
+
+      expect(page).toMatchObject({ page: 1, pageSize: 20, total: 25 });
+      expect(slugsOf(page)).toEqual(
+        Array.from({ length: 20 }, (_, i) => `movie-${String(25 - i)}`),
+      );
+    });
+
+    it('returns each movie in the same admin shape as GET /:id', async () => {
+      const seeded = testMovie({
+        slug: 'avatar',
+        title: 'Avatar',
+        genres: ['Sci-Fi'],
+        releaseDate: date('2026-11-01'),
+        posterUrl: 'https://res.cloudinary.com/sk/image/upload/poster.jpg',
+        posterPublicId: 'sk/posters/avatar',
+        isActive: false,
+      });
+      const s = await setup({ movies: [seeded] });
+
+      const page = expectPage(await listMovies(s));
+      const single = adminMovieResponseSchema.parse((await getMovie(s, seeded.id)).body).movie;
+
+      expect(page).toEqual({ items: [single], page: 1, pageSize: 20, total: 1 });
+    });
+
+    it('an empty table is an empty first page', async () => {
+      const s = await setup();
+
+      expect(expectPage(await listMovies(s))).toEqual({
+        items: [],
+        page: 1,
+        pageSize: 20,
+        total: 0,
+      });
+    });
+
+    it('is never cached: a movie added between two reads is in the second', async () => {
+      const s = await setup({ movies: [testMovie({ slug: 'first', title: 'First' })] });
+
+      expect(await listSlugs(s)).toEqual(['first']);
+      s.db.addMovie({ slug: 'second', title: 'Second', durationMinutes: 90, updatedAt: day(2) });
+
+      expect(await listSlugs(s)).toEqual(['second', 'first']);
+      expect(s.db.spies.movie.findMany).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('filters', () => {
+    const catalogue = () => [
+      testMovie({ slug: 'now', title: 'Now', status: 'NOW_SHOWING' }),
+      testMovie({ slug: 'soon', title: 'Soon', status: 'UPCOMING' }),
+      testMovie({ slug: 'old', title: 'Old', status: 'ENDED' }),
+      testMovie({ slug: 'hidden', title: 'Hidden', status: 'NOW_SHOWING', isActive: false }),
+      deleted({ slug: 'gone', title: 'Gone', status: 'NOW_SHOWING' }),
+      deleted({ slug: 'gone-hidden', title: 'Gone Hidden', status: 'UPCOMING', isActive: false }),
+    ];
+
+    // Expected slugs in alphabetical order (the response order is checked in "sorting").
+    it.each<[string, Record<string, string>, string[]]>([
+      ['none', {}, ['hidden', 'now', 'old', 'soon']],
+      ['status=NOW_SHOWING', { status: 'NOW_SHOWING' }, ['hidden', 'now']],
+      ['status=UPCOMING', { status: 'UPCOMING' }, ['soon']],
+      ['status=ENDED', { status: 'ENDED' }, ['old']],
+      ['isActive=true', { isActive: 'true' }, ['now', 'old', 'soon']],
+      ['isActive=false', { isActive: 'false' }, ['hidden']],
+      ['deleted=exclude', { deleted: 'exclude' }, ['hidden', 'now', 'old', 'soon']],
+      [
+        'deleted=include',
+        { deleted: 'include' },
+        ['gone', 'gone-hidden', 'hidden', 'now', 'old', 'soon'],
+      ],
+      ['deleted=only', { deleted: 'only' }, ['gone', 'gone-hidden']],
+      ['status + isActive', { status: 'NOW_SHOWING', isActive: 'true' }, ['now']],
+      [
+        'status + isActive + deleted=include',
+        { status: 'NOW_SHOWING', isActive: 'true', deleted: 'include' },
+        ['gone', 'now'],
+      ],
+      ['isActive=false + deleted=only', { isActive: 'false', deleted: 'only' }, ['gone-hidden']],
+      [
+        'isActive=false + deleted=include',
+        { isActive: 'false', deleted: 'include' },
+        ['gone-hidden', 'hidden'],
+      ],
+      ['status + deleted=only', { status: 'UPCOMING', deleted: 'only' }, ['gone-hidden']],
+      ['a combination nothing matches', { status: 'ENDED', isActive: 'false' }, []],
+    ])('%s', async (_name, query, expected) => {
+      const s = await setup({ movies: catalogue() });
+
+      const page = expectPage(await listMovies(s, query));
+
+      expect(slugsOf(page).sort()).toEqual(expected);
+      expect(page.total).toBe(expected.length);
+    });
+
+    it('isActive=false returns only hidden movies, deleted=only only deleted ones', async () => {
+      const s = await setup({ movies: catalogue() });
+
+      const hidden = expectPage(await listMovies(s, { isActive: 'false', deleted: 'include' }));
+      const gone = expectPage(await listMovies(s, { deleted: 'only' }));
+      const kept = expectPage(await listMovies(s));
+
+      expect(hidden.items).toHaveLength(2);
+      expect(hidden.items.every((m) => !m.isActive)).toBe(true);
+      expect(gone.items).toHaveLength(2);
+      expect(gone.items.every((m) => m.deletedAt !== null)).toBe(true);
+      expect(kept.items.every((m) => m.deletedAt === null)).toBe(true);
+    });
+  });
+
+  describe('search', () => {
+    const searchable = () => [
+      testMovie({ slug: 'avatar-fire-and-ash', title: 'Avatar: Fire and Ash' }),
+      testMovie({ slug: 'mission-x', title: 'Rogue Agent' }),
+      testMovie({ slug: 'gajaman', title: 'Gajaman' }),
+      deleted({ slug: 'avatar-old', title: 'Avatar (old cut)' }),
+    ];
+
+    it.each<[string, string, string[]]>([
+      ['the title, in any case', 'aVaTaR', ['avatar-fire-and-ash']],
+      ['the middle of the title', 'FIRE AND', ['avatar-fire-and-ash']],
+      ['the slug only', 'MISSION-X', ['mission-x']],
+      ['the title only', 'rogue', ['mission-x']],
+      ['a term with surrounding whitespace (trimmed)', '  gajaman  ', ['gajaman']],
+    ])('matches %s', async (_name, search, expected) => {
+      const s = await setup({ movies: searchable() });
+
+      const page = expectPage(await listMovies(s, { search }));
+
+      expect(slugsOf(page)).toEqual(expected);
+      expect(page.total).toBe(expected.length);
+    });
+
+    it('combines with the deleted filter', async () => {
+      const s = await setup({ movies: searchable() });
+
+      expect(await listSlugs(s, { search: 'avatar' })).toEqual(['avatar-fire-and-ash']);
+      expect((await listSlugs(s, { search: 'avatar', deleted: 'include' })).sort()).toEqual([
+        'avatar-fire-and-ash',
+        'avatar-old',
+      ]);
+      expect(await listSlugs(s, { search: 'avatar', deleted: 'only' })).toEqual(['avatar-old']);
+    });
+
+    it('no match is an empty page with total 0', async () => {
+      const s = await setup({ movies: searchable() });
+
+      expect(expectPage(await listMovies(s, { search: 'zzz' }))).toEqual({
+        items: [],
+        page: 1,
+        pageSize: 20,
+        total: 0,
+      });
+    });
+
+    it('a whitespace-only search is no search', async () => {
+      const s = await setup({ movies: searchable() });
+
+      expect(expectPage(await listMovies(s, { search: '   ' })).total).toBe(3);
+    });
+
+    const wildcards = () => [
+      testMovie({ slug: 'fifty-percent-off', title: '50% Off' }),
+      testMovie({ slug: 'five-hundred-days', title: '500 Days' }),
+      testMovie({ slug: 'a-b', title: 'a_b' }),
+      testMovie({ slug: 'axb', title: 'axb' }),
+      testMovie({ slug: 'back-slash', title: 'back\\slash' }),
+      testMovie({ slug: 'backslash', title: 'backslash' }),
+    ];
+
+    it('control: unescaped, these terms over-match (the fake reads LIKE like Postgres)', async () => {
+      const db = inMemoryAuthDb({ movies: wildcards() });
+      const titles = async (term: string) =>
+        (
+          await db.prisma.movie.findMany({
+            where: { title: { contains: term, mode: 'insensitive' } },
+            orderBy: [{ title: 'asc' }],
+            select: { title: true },
+          })
+        ).map((m) => m.title);
+
+      expect(await titles('50%')).toEqual(['50% Off', '500 Days']);
+      expect(await titles('a_b')).toEqual(['a_b', 'axb']);
+      // `\s` is a literal "s", so the title with a real backslash is missed...
+      expect(await titles('back\\slash')).toEqual(['backslash']);
+      // ...and a lone `\` escapes the closing `%`: the pattern `%\%` means "ends with a
+      // percent sign", so it misses the backslash title too.
+      expect(await titles('\\')).toEqual([]);
+    });
+
+    it.each<[string, string[]]>([
+      ['50%', ['fifty-percent-off']],
+      ['%', ['fifty-percent-off']],
+      ['a_b', ['a-b']],
+      ['_', ['a-b']],
+      ['\\', ['back-slash']],
+      ['back\\slash', ['back-slash']],
+      ['50%_', []],
+    ])('search %j matches only the literal text', async (search, expected) => {
+      const s = await setup({ movies: wildcards() });
+
+      const page = expectPage(await listMovies(s, { search }));
+
+      expect(slugsOf(page)).toEqual(expected);
+      expect(page.total).toBe(expected.length);
+    });
+  });
+
+  describe('sorting', () => {
+    /**
+     * Created in this order, so ids ascend m1..m5. Each sort column has ties (and releaseDate
+     * NULLs), so the order within a tie shows the id tie-breaker.
+     */
+    const sortable = (): [Movie, Movie, Movie, Movie, Movie] => [
+      testMovie({
+        slug: 'm1',
+        title: 'Echo',
+        createdAt: day(1),
+        updatedAt: day(5),
+        releaseDate: date('2026-03-01'),
+      }),
+      testMovie({ slug: 'm2', title: 'Alpha', createdAt: day(2), updatedAt: day(5) }),
+      testMovie({
+        slug: 'm3',
+        title: 'Echo',
+        createdAt: day(2),
+        updatedAt: day(3),
+        releaseDate: date('2026-03-01'),
+      }),
+      testMovie({
+        slug: 'm4',
+        title: 'Charlie',
+        createdAt: day(4),
+        updatedAt: day(1),
+        releaseDate: date('2026-01-15'),
+      }),
+      testMovie({ slug: 'm5', title: 'Bravo', createdAt: day(3), updatedAt: day(3) }),
+    ];
+
+    it.each<[string, string, string[]]>([
+      ['updatedAt', 'asc', ['m4', 'm3', 'm5', 'm1', 'm2']],
+      ['updatedAt', 'desc', ['m2', 'm1', 'm5', 'm3', 'm4']],
+      ['createdAt', 'asc', ['m1', 'm2', 'm3', 'm5', 'm4']],
+      ['createdAt', 'desc', ['m4', 'm5', 'm3', 'm2', 'm1']],
+      ['title', 'asc', ['m2', 'm5', 'm4', 'm1', 'm3']],
+      ['title', 'desc', ['m3', 'm1', 'm4', 'm5', 'm2']],
+      // Undated movies last in both directions.
+      ['releaseDate', 'asc', ['m4', 'm1', 'm3', 'm2', 'm5']],
+      ['releaseDate', 'desc', ['m3', 'm1', 'm4', 'm5', 'm2']],
+    ])('sort=%s order=%s, ties by id in the same direction', async (sort, order, expected) => {
+      const [m1, m2, m3, m4, m5] = sortable();
+      // Table order must not matter: once in id order, once shuffled.
+      for (const movies of [
+        [m1, m2, m3, m4, m5],
+        [m5, m3, m1, m4, m2],
+      ]) {
+        const s = await setup({ movies });
+
+        expect(await listSlugs(s, { sort, order })).toEqual(expected);
+      }
+    });
+
+    it('defaults to updatedAt desc; order and sort each work alone', async () => {
+      const s = await setup({ movies: sortable() });
+
+      expect(await listSlugs(s)).toEqual(['m2', 'm1', 'm5', 'm3', 'm4']);
+      expect(await listSlugs(s, { order: 'asc' })).toEqual(['m4', 'm3', 'm5', 'm1', 'm2']);
+      expect(await listSlugs(s, { sort: 'title' })).toEqual(['m3', 'm1', 'm4', 'm5', 'm2']);
+    });
+
+    it('queries with the escaped term, the id tie-breaker and the page window', async () => {
+      const s = await setup();
+
+      expectPage(
+        await listMovies(s, {
+          search: '50%_\\',
+          status: 'ENDED',
+          sort: 'title',
+          order: 'asc',
+          page: '3',
+          pageSize: '7',
+        }),
+      );
+
+      const where = {
+        status: 'ENDED',
+        deletedAt: null,
+        OR: [
+          { title: { contains: '50\\%\\_\\\\', mode: 'insensitive' } },
+          { slug: { contains: '50\\%\\_\\\\', mode: 'insensitive' } },
+        ],
+      };
+      expect(s.db.spies.movie.findMany).toHaveBeenCalledExactlyOnceWith({
+        where,
+        orderBy: [{ title: 'asc' }, { id: 'asc' }],
+        skip: 14,
+        take: 7,
+        select: adminMovieSelect,
+      });
+      expect(s.db.spies.movie.count).toHaveBeenCalledExactlyOnceWith({ where });
+    });
+
+    it('releaseDate asks for NULLs last explicitly (Postgres puts them first for desc)', async () => {
+      const s = await setup();
+
+      expectPage(await listMovies(s, { sort: 'releaseDate', order: 'desc' }));
+
+      expect(s.db.spies.movie.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [{ releaseDate: { sort: 'desc', nulls: 'last' } }, { id: 'desc' }],
+        }),
+      );
+    });
+  });
+
+  describe('paging', () => {
+    const titleOrder = { sort: 'title', order: 'asc' };
+    const fiveMovies = () => [
+      testMovie({ slug: 'm1', title: 'Echo' }),
+      testMovie({ slug: 'm2', title: 'Alpha' }),
+      testMovie({ slug: 'm3', title: 'Echo' }),
+      testMovie({ slug: 'm4', title: 'Charlie' }),
+      testMovie({ slug: 'm5', title: 'Bravo' }),
+    ];
+
+    it('walks pages of 2 with no gap or overlap; past the end is empty with the total', async () => {
+      const s = await setup({ movies: fiveMovies() });
+      const pageOf = async (page: number) =>
+        expectPage(await listMovies(s, { ...titleOrder, page: String(page), pageSize: '2' }));
+
+      expect(await pageOf(1)).toMatchObject({ page: 1, pageSize: 2, total: 5 });
+      expect(slugsOf(await pageOf(1))).toEqual(['m2', 'm5']);
+      expect(slugsOf(await pageOf(2))).toEqual(['m4', 'm1']);
+      expect(slugsOf(await pageOf(3))).toEqual(['m3']);
+      expect(await pageOf(4)).toEqual({ items: [], page: 4, pageSize: 2, total: 5 });
+      expect(await pageOf(999_999)).toEqual({ items: [], page: 999_999, pageSize: 2, total: 5 });
+    });
+
+    it('pageSize=1 returns one movie per page', async () => {
+      const s = await setup({ movies: fiveMovies() });
+
+      const page = expectPage(await listMovies(s, { ...titleOrder, page: '3', pageSize: '1' }));
+
+      expect(page).toMatchObject({ page: 3, pageSize: 1, total: 5 });
+      expect(slugsOf(page)).toEqual(['m4']);
+    });
+
+    it('pageSize=100 returns 100 movies, then the rest', async () => {
+      const movies = Array.from({ length: 105 }, (_, i) =>
+        testMovie({ slug: `movie-${String(i + 1).padStart(3, '0')}`, title: 'Same Title' }),
+      );
+      const s = await setup({ movies });
+
+      const first = expectPage(await listMovies(s, { pageSize: '100', order: 'asc' }));
+      const second = expectPage(await listMovies(s, { pageSize: '100', order: 'asc', page: '2' }));
+
+      expect(first).toMatchObject({ page: 1, pageSize: 100, total: 105 });
+      expect(first.items).toHaveLength(100);
+      expect(second).toMatchObject({ page: 2, pageSize: 100, total: 105 });
+      // Equal updatedAt everywhere: only the id tie-breaker orders them, without gaps.
+      expect([...slugsOf(first), ...slugsOf(second)]).toEqual(movies.map((m) => m.slug));
+    });
+
+    it('a page past the end of a filtered list keeps the filtered total', async () => {
+      const s = await setup({
+        movies: [...fiveMovies(), deleted({ slug: 'gone', title: 'Gone' })],
+      });
+
+      expect(expectPage(await listMovies(s, { deleted: 'only', page: '2' }))).toEqual({
+        items: [],
+        page: 2,
+        pageSize: 20,
+        total: 1,
+      });
+    });
+  });
+
+  describe('validation (400)', () => {
+    it.each<[string, string, (string | number)[]]>([
+      ['pageSize=101', 'pageSize=101', ['query', 'pageSize']],
+      ['pageSize=0', 'pageSize=0', ['query', 'pageSize']],
+      ['page=0', 'page=0', ['query', 'page']],
+      ['page=-1', 'page=-1', ['query', 'page']],
+      ['page=1.5', 'page=1.5', ['query', 'page']],
+      ['page=1e3', 'page=1e3', ['query', 'page']],
+      ['page=1000000', 'page=1000000', ['query', 'page']],
+      ['an empty page', 'page=', ['query', 'page']],
+      ['a repeated page', 'page=1&page=2', ['query', 'page']],
+      ['isActive=maybe', 'isActive=maybe', ['query', 'isActive']],
+      ['isActive=TRUE', 'isActive=TRUE', ['query', 'isActive']],
+      ['isActive=1', 'isActive=1', ['query', 'isActive']],
+      ['status=DRAFT', 'status=DRAFT', ['query', 'status']],
+      ['deleted=yes', 'deleted=yes', ['query', 'deleted']],
+      ['sort=id', 'sort=id', ['query', 'sort']],
+      ['sort=slug', 'sort=slug', ['query', 'sort']],
+      ['order=up', 'order=up', ['query', 'order']],
+      ['a search over 100 characters', `search=${'a'.repeat(101)}`, ['query', 'search']],
+      ['an unknown key', 'include=deleted', ['query']],
+      ['bracket syntax', 'search[]=avatar', ['query']],
+    ])('rejects %s', async (_name, query, path) => {
+      const s = await setup({ movies: [testMovie()] });
+
+      const error = expectError(await listMovies(s, query), 400, 'VALIDATION_ERROR');
+
+      expect(error.message).toBe('Invalid request');
+      expect(error.details).toEqual([expect.objectContaining({ path })]);
+      expect(s.db.spies.movie.findMany).not.toHaveBeenCalled();
+      expect(s.db.spies.movie.count).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('auth', () => {
+    it('answers 401 without a session', async () => {
+      const s = await setup({ movies: [testMovie()] });
+
+      const res = await request(s.app).get(`${ADMIN_BASE}/movies`);
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(UNAUTHORIZED_BODY);
+      expect(s.db.spies.movie.findMany).not.toHaveBeenCalled();
+      expect(s.db.spies.movie.count).not.toHaveBeenCalled();
+    });
+
+    it('answers 401 for an invalid session cookie, even with a bad query', async () => {
+      const s = await setup({ movies: [testMovie()] });
+
+      const res = await s.client.get('/movies?page=0', [`${s.session.access}x`]);
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    });
+
+    it.each<AdminRole>(['EDITOR', 'SUPER_ADMIN'])(
+      'serves a %s without a CSRF token, and writes no audit row',
+      async (role) => {
+        const s = await setup({ role, movies: [testMovie()] });
+
+        // client.get sends neither the CSRF header nor an Origin.
+        expect(expectPage(await listMovies(s)).total).toBe(1);
+        expect(movieAudits(s.db)).toEqual([]);
+        expect(s.db.spies.auditLog.create).not.toHaveBeenCalled();
+        expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  describe('failures', () => {
+    it.each(['findMany', 'count'] as const)(
+      'answers a generic 500 when movie.%s fails',
+      async (operation) => {
+        const s = await setup({ movies: [testMovie()] });
+        s.db.injectFault('movie', operation, {
+          error: new Error('connect ECONNREFUSED 10.0.0.1'),
+        });
+
+        const res = await listMovies(s);
+
+        expect(res.status).toBe(500);
+        expect(res.body).toEqual(INTERNAL_BODY);
+      },
+    );
   });
 });
