@@ -11,10 +11,14 @@ import {
   showtimeConflictDetailsSchema,
   showtimeConflictErrorSchema,
   showtimeCreateBodySchema,
+  showtimeBulkDeleteBodySchema,
+  showtimeBulkDeleteResponseSchema,
   showtimePastSlotErrorSchema,
+  showtimeUpdateBodySchema,
   type AdminShowtimeListQueryInput,
   type ShowtimeBulkCreateBodyInput,
   type ShowtimeCreateBodyInput,
+  type ShowtimeUpdateBodyInput,
 } from '@sk-cinema/shared';
 import { describe, expect, it, vi } from 'vitest';
 import type { Movie, Screen, Setting, Showtime } from '../generated/prisma/client.js';
@@ -23,6 +27,7 @@ import { AppError } from '../lib/errors.js';
 import {
   foreignKeyError,
   inMemoryAuthDb,
+  recordNotFoundError,
   testAdmin,
   testMovie,
   testScreen,
@@ -37,18 +42,31 @@ import {
   adminShowtimeListWhere,
   createShowtimeAdminService,
   expandBulkSlots,
+  showtimeBulkDeleteAlreadyDeletedMessage,
+  showtimeBulkDeleteNotFoundMessage,
   showtimeBulkOverlapMessage,
   showtimeBulkPastMessage,
+  SHOWTIME_ALREADY_DELETED_MESSAGE,
+  SHOWTIME_BULK_DELETE_CHANGED_MESSAGE,
+  SHOWTIME_BULK_DELETE_DELETED_ID_MESSAGE,
+  SHOWTIME_BULK_DELETE_UNKNOWN_ID_MESSAGE,
+  SHOWTIME_CHANGED_MESSAGE,
+  SHOWTIME_DELETED_MESSAGE,
   SHOWTIME_IN_PAST_MESSAGE,
   SHOWTIME_MOVIE_DELETED_MESSAGE,
   SHOWTIME_MOVIE_ENDED_MESSAGE,
   SHOWTIME_MOVIE_NOT_FOUND_MESSAGE,
+  SHOWTIME_MOVE_MOVIE_DELETED_MESSAGE,
+  SHOWTIME_MOVE_MOVIE_ENDED_MESSAGE,
+  SHOWTIME_MOVE_SCREEN_DELETED_MESSAGE,
+  SHOWTIME_MOVE_SCREEN_INACTIVE_MESSAGE,
   SHOWTIME_NOT_FOUND_MESSAGE,
   SHOWTIME_OVERLAP_MESSAGE,
   SHOWTIME_SCREEN_DELETED_MESSAGE,
   SHOWTIME_SCREEN_INACTIVE_MESSAGE,
   SHOWTIME_SCREEN_NOT_FOUND_MESSAGE,
   SHOWTIME_SLOT_IN_PAST_MESSAGE,
+  SHOWTIME_STARTED_MESSAGE,
   SHOWTIME_TARGET_CHANGED_MESSAGE,
   toAdminShowtime,
   UNNORMALISABLE_FORMAT,
@@ -1558,5 +1576,934 @@ describe('showtime admin service: bulkCreate at the maximum size', () => {
     expect(s.db.spies.showtime.createMany).toHaveBeenCalledTimes(1);
     expect(s.db.spies.auditLog.createMany).toHaveBeenCalledTimes(1);
     expect(ms).toBeLessThan(10_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// update (T12)
+// ---------------------------------------------------------------------------
+
+/** The show being edited: 2026-11-02 19:00-21:00 Colombo on Screen 1 (main movie, 120 min). */
+const EDITED_START = colombo('2026-11-02', '19:00');
+
+function setupEdit(options: SetupOptions = {}) {
+  const s = setup(options);
+  const show = s.db.addShowtime({
+    movieId: s.movie.id,
+    screenId: s.screen.id,
+    startsAt: EDITED_START,
+  });
+  return { ...s, show };
+}
+
+type EditSetup = ReturnType<typeof setupEdit>;
+
+const updateBody = (input: ShowtimeUpdateBodyInput) => showtimeUpdateBodySchema.parse(input);
+
+const update = (s: EditSetup, input: ShowtimeUpdateBodyInput, id = s.show.id) =>
+  s.service.update(id, updateBody(input), s.actor);
+
+const storedShow = (s: Setup, id: string) =>
+  structuredClone(s.db.showtimes.find((row) => row.id === id));
+
+/** Nothing changed: the row as it was, no audit row, no invalidation. */
+function expectUnchanged(s: EditSetup, before: ReturnType<typeof storedShow>) {
+  expect(storedShow(s, s.show.id)).toEqual(before);
+  expect(showtimeAudits(s)).toEqual([]);
+  expect(s.invalidate).not.toHaveBeenCalled();
+}
+
+/** The public cache was dropped exactly once, after the last audit write. */
+function expectInvalidatedAfterAudit(s: Setup, method: 'create' | 'createMany' = 'create') {
+  expect(s.invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+  const auditOrder = s.db.spies.auditLog[method].mock.invocationCallOrder.at(-1) ?? Infinity;
+  expect(s.invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+}
+
+describe('showtime admin service: update', () => {
+  it('moves the start: 200 in the strict shape, UPDATE audit with changes.startsAt, then the cache', async () => {
+    const s = setupEdit();
+
+    const showtime = await update(s, { date: '2026-11-02', time: '21:30' });
+
+    expect(adminShowtimeSchema.parse(showtime)).toEqual(showtime);
+    expect(showtime).toMatchObject({
+      id: s.show.id,
+      startsAt: '2026-11-02T16:00:00.000Z',
+      endsAt: '2026-11-02T18:00:00.000Z',
+      colomboDate: '2026-11-02',
+      time: '21:30',
+      screen: { id: s.screen.id, name: 'Screen 1' },
+      bookingUrl: `${DEFAULT_BMS_BASE_URL}/20261102`,
+    });
+    expect(storedShow(s, s.show.id)?.startsAt.toISOString()).toBe('2026-11-02T16:00:00.000Z');
+    expect(showtimeAudits(s)).toEqual([
+      expect.objectContaining({
+        action: 'UPDATE',
+        adminId: s.admin.id,
+        entity: 'Showtime',
+        entityId: s.show.id,
+        ipAddress: IP,
+        userAgent: UA,
+        details: {
+          changes: {
+            startsAt: { from: '2026-11-02T13:30:00.000Z', to: '2026-11-02T16:00:00.000Z' },
+          },
+        },
+      }),
+    ]);
+    expectInvalidatedAfterAudit(s);
+  });
+
+  it('reads first, then locks [Movie, Screen] and re-reads under the lock before the settings and the overlap query', async () => {
+    const s = setupEdit();
+
+    await update(s, { date: '2026-11-02', time: '21:30' });
+
+    expect(s.db.locks).toEqual([
+      { table: 'Movie', id: s.movie.id },
+      { table: 'Screen', id: s.screen.id },
+    ]);
+    const findUnique = s.db.spies.showtime.findUnique.mock.invocationCallOrder;
+    const locks = s.db.spies.$queryRaw.mock.invocationCallOrder;
+    expect(findUnique).toHaveLength(2);
+    expect(findUnique[0]).toBeLessThan(locks[0] ?? -Infinity);
+    expect(findUnique[1]).toBeGreaterThan(locks.at(-1) ?? Infinity);
+    expect(s.db.spies.setting.findMany.mock.invocationCallOrder[0]).toBeGreaterThan(
+      findUnique[1] ?? Infinity,
+    );
+    expect(s.db.spies.showtime.findMany).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('moves across Colombo midnight: 00:30 is the evening before in UTC, the link has the new Colombo date', async () => {
+    const s = setupEdit();
+
+    const showtime = await update(s, { date: '2026-11-03', time: '00:30' });
+
+    expect(showtime).toMatchObject({
+      startsAt: '2026-11-02T19:00:00.000Z',
+      colomboDate: '2026-11-03',
+      time: '00:30',
+      bookingUrl: `${DEFAULT_BMS_BASE_URL}/20261103`,
+    });
+  });
+
+  it('moves to another screen: locks the movie, then both screens sorted; audit changes.screenId', async () => {
+    const screen2 = testScreen({ name: 'Screen 2' });
+    const s = setupEdit({ screens: [screen2] });
+
+    const showtime = await update(s, { screenId: screen2.id });
+
+    expect(showtime.screen).toEqual({ id: screen2.id, name: 'Screen 2' });
+    expect(showtime.startsAt).toBe('2026-11-02T13:30:00.000Z');
+    expect(storedShow(s, s.show.id)?.screenId).toBe(screen2.id);
+    expect(s.db.locks).toEqual([
+      { table: 'Movie', id: s.movie.id },
+      ...[s.screen.id, screen2.id].sort().map((id) => ({ table: 'Screen', id })),
+    ]);
+    expect(showtimeAudits(s)[0]?.details).toEqual({
+      changes: { screenId: { from: s.screen.id, to: screen2.id } },
+    });
+    expectInvalidatedAfterAudit(s);
+  });
+
+  it('moves the start and the screen at once, auditing both', async () => {
+    const screen2 = testScreen({ name: 'Screen 2' });
+    const s = setupEdit({ screens: [screen2] });
+
+    await update(s, { screenId: screen2.id, date: '2026-11-04', time: '10:00' });
+
+    expect(showtimeAudits(s)[0]?.details).toEqual({
+      changes: {
+        startsAt: { from: '2026-11-02T13:30:00.000Z', to: '2026-11-04T04:30:00.000Z' },
+        screenId: { from: s.screen.id, to: screen2.id },
+      },
+    });
+  });
+
+  it('409 when the new start runs into a neighbour: details on body.time, row unchanged', async () => {
+    const s = setupEdit();
+    const neighbour = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '23:00'),
+    });
+    const before = storedShow(s, s.show.id);
+
+    const error = await rejection(update(s, { date: '2026-11-02', time: '21:00' }));
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: SHOWTIME_OVERLAP_MESSAGE,
+    });
+    expect(showtimeConflictDetailsSchema.parse(error.details)).toEqual([
+      {
+        path: ['body', 'time'],
+        message: 'Overlaps "Main Feature" (23:00–01:00), counting the 15-minute gap between shows',
+        requested: { date: '2026-11-02', time: '21:00' },
+        conflict: {
+          showtimeId: neighbour.id,
+          movieTitle: 'Main Feature',
+          startsAt: '2026-11-02T17:30:00.000Z',
+          endsAt: '2026-11-02T19:30:00.000Z',
+        },
+      },
+    ]);
+    expectUnchanged(s, before);
+  });
+
+  it('409 on body.screenId when only the screen changes and the target screen is taken', async () => {
+    const screen2 = testScreen({ name: 'Screen 2' });
+    const s = setupEdit({ screens: [screen2] });
+    const other = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: screen2.id,
+      startsAt: colombo('2026-11-02', '20:00'),
+    });
+    const before = storedShow(s, s.show.id);
+
+    const error = await rejection(update(s, { screenId: screen2.id }));
+
+    expect(error.status).toBe(409);
+    const [detail] = showtimeConflictDetailsSchema.parse(error.details);
+    expect(detail).toMatchObject({
+      path: ['body', 'screenId'],
+      requested: { date: '2026-11-02', time: '19:00' },
+      conflict: { showtimeId: other.id },
+    });
+    expectUnchanged(s, before);
+  });
+
+  it('a move of a few minutes inside its own old slot is allowed (its saved slot is replaced)', async () => {
+    const s = setupEdit();
+    // Touching the edited show's current end (21:00 + 15 gap).
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '21:15'),
+    });
+
+    const showtime = await update(s, { date: '2026-11-02', time: '18:50' });
+
+    expect(showtime.time).toBe('18:50');
+    const [args] = s.db.spies.showtime.findMany.mock.calls[0] ?? [];
+    // The query returns the show's own saved row too; the candidate replaces it.
+    expect(args).toMatchObject({ where: { screenId: { in: [s.screen.id] }, deletedAt: null } });
+  });
+
+  it('two OTHER saved shows that clash with each other under the current gap do not fail the move', async () => {
+    const s = setupEdit({ settings: [testSetting('showGapMinutes', '15')] });
+    // Saved under a 0-minute gap: 10:00-12:00 and 12:05-14:05 clash under today's 15 minutes.
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '10:00'),
+    });
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '12:05'),
+    });
+
+    // 14:05 + 15 = 14:20: touching the second show is fine.
+    await expect(update(s, { date: '2026-11-02', time: '14:20' })).resolves.toMatchObject({
+      time: '14:20',
+    });
+    expect(showtimeAudits(s)).toHaveLength(1);
+  });
+
+  // The edited show (120 min) moves before a neighbour at 2026-11-03 19:00 (120 min).
+  it.each([
+    [0, '17:00', false],
+    [0, '17:01', true],
+    [15, '16:45', false],
+    [15, '16:46', true],
+    [120, '15:00', false],
+    [120, '15:01', true],
+  ] as const)('gap %i from the Setting: moving to %s conflicts: %s', async (gap, time, clashes) => {
+    const s = setupEdit({ settings: [testSetting('showGapMinutes', String(gap))] });
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-03', '19:00'),
+    });
+
+    const result = update(s, { date: '2026-11-03', time });
+
+    if (clashes) {
+      expect(await rejection(result)).toMatchObject({ status: 409 });
+    } else {
+      await expect(result).resolves.toMatchObject({ colomboDate: '2026-11-03', time });
+    }
+    // Read through the transaction, once.
+    expect(s.db.spies.setting.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('stores "imax 3d" as "IMAX 3D"; audit changes.format from the stored value', async () => {
+    const s = setupEdit();
+
+    const showtime = await update(s, { format: 'imax 3d' });
+
+    expect(showtime.format).toBe('IMAX 3D');
+    expect(storedShow(s, s.show.id)?.format).toBe('IMAX 3D');
+    expect(showtimeAudits(s)[0]?.details).toEqual({
+      changes: { format: { from: '2D', to: 'IMAX 3D' } },
+    });
+  });
+
+  it('format-only edit on a hidden screen, of an ENDED movie, beside a clashing show: allowed, no rule or overlap query', async () => {
+    const ended = testMovie({ slug: 'ended', title: 'Ended', status: 'ENDED', isActive: false });
+    const hidden = testScreen({ name: 'Hidden', isActive: false });
+    const s = setup({ movies: [ended], screens: [hidden] });
+    const show = s.db.addShowtime({
+      movieId: ended.id,
+      screenId: hidden.id,
+      startsAt: EDITED_START,
+    });
+    // Saved before a gap change; it clashes with the edited show today.
+    s.db.addShowtime({
+      movieId: ended.id,
+      screenId: hidden.id,
+      startsAt: colombo('2026-11-02', '21:05'),
+    });
+
+    const showtime = await s.service.update(show.id, updateBody({ format: '3D' }), s.actor);
+
+    expect(showtime).toMatchObject({ format: '3D', movie: { status: 'ENDED' } });
+    expect(s.db.spies.showtime.findMany).not.toHaveBeenCalled();
+    expect(s.db.spies.movie.findUnique).not.toHaveBeenCalled();
+    expect(s.db.spies.screen.findUnique).not.toHaveBeenCalled();
+    expect(showtimeAudits(s)).toHaveLength(1);
+  });
+
+  it('sets an override (the booking link becomes it) and clears it with null (the generated link again)', async () => {
+    const s = setupEdit();
+
+    const set = await update(s, { bookingUrlOverride: OVERRIDE });
+    expect(set).toMatchObject({ bookingUrlOverride: OVERRIDE, bookingUrl: OVERRIDE });
+    expect(s.db.spies.showtime.findMany).not.toHaveBeenCalled();
+
+    const cleared = await update(s, { bookingUrlOverride: null });
+    expect(cleared).toMatchObject({
+      bookingUrlOverride: null,
+      bookingUrl: `${DEFAULT_BMS_BASE_URL}/20261102`,
+    });
+
+    expect(showtimeAudits(s).map((row) => row.details)).toEqual([
+      { changes: { bookingUrlOverride: { from: null, to: OVERRIDE } } },
+      { changes: { bookingUrlOverride: { from: OVERRIDE, to: null } } },
+    ]);
+    expect(s.invalidate).toHaveBeenCalledTimes(2);
+  });
+
+  it('the body schema refuses a non-BookMyShow override, a date without a time and a movieId', () => {
+    expect(
+      showtimeUpdateBodySchema.safeParse({
+        bookingUrlOverride: 'https://evil.example/buytickets/x',
+      }).success,
+    ).toBe(false);
+    expect(showtimeUpdateBodySchema.safeParse({ date: '2026-11-03' }).success).toBe(false);
+    expect(showtimeUpdateBodySchema.safeParse({ movieId: randomUUID() }).success).toBe(false);
+  });
+
+  it.each([
+    ['the same date + time', () => ({ date: '2026-11-02', time: '19:00' })],
+    ['the same screen in upper case', (s: EditSetup) => ({ screenId: s.screen.id.toUpperCase() })],
+    ['"2d" for a stored "2D"', () => ({ format: '2d' })],
+    ['a null override for none', () => ({ bookingUrlOverride: null })],
+    [
+      'every field as it is',
+      (s: EditSetup) => ({
+        screenId: s.screen.id,
+        date: '2026-11-02',
+        time: '19:00',
+        format: '2D',
+        bookingUrlOverride: null,
+      }),
+    ],
+  ] as const)('no-op (%s): 200 as it is, no write, audit or invalidation', async (_name, input) => {
+    const s = setupEdit();
+    const before = storedShow(s, s.show.id);
+
+    const showtime = await update(s, input(s));
+
+    expect(showtime).toMatchObject({ id: s.show.id, time: '19:00', format: '2D' });
+    expect(s.db.spies.showtime.update).not.toHaveBeenCalled();
+    expect(s.db.spies.showtime.findMany).not.toHaveBeenCalled();
+    expectUnchanged(s, before);
+  });
+
+  it('a no-op with an unchanged stored override returns the override link', async () => {
+    const s = setup();
+    const show = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: EDITED_START,
+      bookingUrlOverride: OVERRIDE,
+    });
+
+    const showtime = await s.service.update(
+      show.id,
+      updateBody({ bookingUrlOverride: OVERRIDE }),
+      s.actor,
+    );
+
+    expect(showtime.bookingUrl).toBe(OVERRIDE);
+    expect(showtimeAudits(s)).toEqual([]);
+  });
+});
+
+describe('showtime admin service: update refusals', () => {
+  it('404 for an unknown id, before any transaction', async () => {
+    const s = setupEdit();
+
+    const error = await rejection(update(s, { format: '3D' }, randomUUID()));
+
+    expect(error).toMatchObject({
+      status: 404,
+      code: 'NOT_FOUND',
+      message: SHOWTIME_NOT_FOUND_MESSAGE,
+    });
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('409 for a soft-deleted showtime (no restore), even for a format-only edit', async () => {
+    const s = setup();
+    const show = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: EDITED_START,
+      deletedAt: DELETED_AT,
+    });
+
+    const error = await rejection(s.service.update(show.id, updateBody({ format: '3D' }), s.actor));
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: SHOWTIME_DELETED_MESSAGE,
+    });
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['started an hour ago', colombo('2026-11-01', '14:30')],
+    ['starting exactly now', NOW],
+    ['long past', colombo('2026-10-01', '19:00')],
+  ])('409 for a show %s, whatever the edit', async (_name, startsAt) => {
+    const s = setup();
+    const show = s.db.addShowtime({ movieId: s.movie.id, screenId: s.screen.id, startsAt });
+
+    for (const input of [
+      { format: '3D' },
+      { date: '2026-11-05', time: '10:00' },
+    ] satisfies ShowtimeUpdateBodyInput[]) {
+      const error = await rejection(s.service.update(show.id, updateBody(input), s.actor));
+      expect(error).toMatchObject({ status: 409, message: SHOWTIME_STARTED_MESSAGE });
+    }
+    expect(showtimeAudits(s)).toEqual([]);
+  });
+
+  it('400 on body.time for a new start at or before now', async () => {
+    const s = setupEdit();
+    const before = storedShow(s, s.show.id);
+
+    for (const time of ['15:00', '15:30']) {
+      const error = await rejection(update(s, { date: '2026-11-01', time }));
+      expect(error).toMatchObject({
+        status: 400,
+        code: 'VALIDATION_ERROR',
+        message: SHOWTIME_IN_PAST_MESSAGE,
+        details: [{ path: ['body', 'time'], message: SHOWTIME_IN_PAST_MESSAGE }],
+      });
+    }
+    expectUnchanged(s, before);
+    await expect(update(s, { date: '2026-11-01', time: '15:31' })).resolves.toBeTruthy();
+  });
+
+  it('404 / 409 on body.screenId for an unknown, deleted or hidden target screen', async () => {
+    const deleted = testScreen({ name: 'Deleted', deletedAt: DELETED_AT });
+    const hidden = testScreen({ name: 'Hidden', isActive: false });
+    const s = setupEdit({ screens: [deleted, hidden] });
+    const before = storedShow(s, s.show.id);
+
+    const cases = [
+      [randomUUID(), 404, 'NOT_FOUND', SHOWTIME_SCREEN_NOT_FOUND_MESSAGE],
+      [deleted.id, 409, 'CONFLICT', SHOWTIME_MOVE_SCREEN_DELETED_MESSAGE],
+      [hidden.id, 409, 'CONFLICT', SHOWTIME_MOVE_SCREEN_INACTIVE_MESSAGE],
+    ] as const;
+    for (const [screenId, status, code, message] of cases) {
+      const error = await rejection(update(s, { screenId }));
+      expect(error).toMatchObject({
+        status,
+        code,
+        message,
+        details: [{ path: ['body', 'screenId'], message }],
+      });
+    }
+    expectUnchanged(s, before);
+  });
+
+  it('a time move on a screen that is hidden now is refused on body.screenId', async () => {
+    const hidden = testScreen({ name: 'Hidden', isActive: false });
+    const s = setup({ screens: [hidden] });
+    const show = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: hidden.id,
+      startsAt: EDITED_START,
+    });
+
+    const error = await rejection(
+      s.service.update(show.id, updateBody({ date: '2026-11-02', time: '20:00' }), s.actor),
+    );
+
+    expect(error).toMatchObject({ status: 409, message: SHOWTIME_MOVE_SCREEN_INACTIVE_MESSAGE });
+  });
+
+  it.each([
+    ['ENDED', { status: 'ENDED' }, SHOWTIME_MOVE_MOVIE_ENDED_MESSAGE],
+    ['soft-deleted', { deletedAt: DELETED_AT }, SHOWTIME_MOVE_MOVIE_DELETED_MESSAGE],
+  ] as const)(
+    '409 without details when moving a show of a %s movie',
+    async (_name, overrides, message) => {
+      const other = testMovie({ slug: 'other', title: 'Other', ...overrides });
+      const screen2 = testScreen({ name: 'Screen 2' });
+      const s = setup({ movies: [other], screens: [screen2] });
+      const show = s.db.addShowtime({
+        movieId: other.id,
+        screenId: s.screen.id,
+        startsAt: EDITED_START,
+      });
+
+      for (const input of [
+        { date: '2026-11-02', time: '20:00' },
+        { screenId: screen2.id },
+      ] satisfies ShowtimeUpdateBodyInput[]) {
+        const error = await rejection(s.service.update(show.id, updateBody(input), s.actor));
+        expect(error).toMatchObject({ status: 409, code: 'CONFLICT', message });
+        expect(error.details).toBeUndefined();
+      }
+      expect(showtimeAudits(s)).toEqual([]);
+    },
+  );
+
+  it('an UPCOMING hidden movie can be moved (admins schedule ahead)', async () => {
+    const upcoming = testMovie({
+      slug: 'soon',
+      title: 'Soon',
+      status: 'UPCOMING',
+      isActive: false,
+    });
+    const s = setup({ movies: [upcoming] });
+    const show = s.db.addShowtime({
+      movieId: upcoming.id,
+      screenId: s.screen.id,
+      startsAt: EDITED_START,
+    });
+
+    await expect(
+      s.service.update(show.id, updateBody({ date: '2026-11-09', time: '10:00' }), s.actor),
+    ).resolves.toMatchObject({ colomboDate: '2026-11-09' });
+  });
+});
+
+describe('showtime admin service: update races and failures', () => {
+  it('409 "changed" when the show moved to another screen between the first read and the lock', async () => {
+    const screen2 = testScreen({ name: 'Screen 2' });
+    const s = setupEdit({ screens: [screen2] });
+    s.db.injectFault('$queryRaw', 'lock', {
+      before: () => {
+        const row = s.db.showtimes.find((r) => r.id === s.show.id);
+        if (row) row.screenId = screen2.id;
+      },
+    });
+
+    const error = await rejection(update(s, { date: '2026-11-02', time: '20:00' }));
+
+    expect(error).toMatchObject({ status: 409, message: SHOWTIME_CHANGED_MESSAGE });
+    expect(s.db.spies.showtime.update).not.toHaveBeenCalled();
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('409 deleted / 404 when the show was deleted or removed between the first read and the lock', async () => {
+    const s = setupEdit();
+    s.db.injectFault('$queryRaw', 'lock', {
+      before: () => {
+        const row = s.db.showtimes.find((r) => r.id === s.show.id);
+        if (row) row.deletedAt = DELETED_AT;
+      },
+    });
+    expect(await rejection(update(s, { format: '3D' }))).toMatchObject({
+      status: 409,
+      message: SHOWTIME_DELETED_MESSAGE,
+    });
+
+    const t = setupEdit();
+    t.db.injectFault('$queryRaw', 'lock', {
+      before: () => {
+        t.db.showtimes.splice(0, t.db.showtimes.length);
+      },
+    });
+    expect(await rejection(update(t, { format: '3D' }))).toMatchObject({
+      status: 404,
+      message: SHOWTIME_NOT_FOUND_MESSAGE,
+    });
+  });
+
+  it.each([
+    ['soft-deleted', 409, SHOWTIME_DELETED_MESSAGE],
+    ['removed', 404, SHOWTIME_NOT_FOUND_MESSAGE],
+    ['still live', 409, SHOWTIME_CHANGED_MESSAGE],
+  ] as const)(
+    'a P2025 on the update (the show %s meanwhile) is a %i, never a 500',
+    async (state, status, message) => {
+      const s = setupEdit();
+      s.db.injectFault('showtime', 'update', {
+        before: () => {
+          const index = s.db.showtimes.findIndex((r) => r.id === s.show.id);
+          const row = s.db.showtimes[index];
+          if (state === 'soft-deleted' && row) row.deletedAt = DELETED_AT;
+          if (state === 'removed') s.db.showtimes.splice(index, 1);
+        },
+        error: recordNotFoundError('showtime', 'an update'),
+      });
+
+      const error = await rejection(update(s, { date: '2026-11-02', time: '21:30' }));
+
+      expect(error).toMatchObject({ status, message });
+      expect(showtimeAudits(s)).toEqual([]);
+      expect(s.invalidate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('a foreign-key failure on the update is a 409 "changed", never a 500', async () => {
+    const screen2 = testScreen({ name: 'Screen 2' });
+    const s = setupEdit({ screens: [screen2] });
+    s.db.injectFault('showtime', 'update', { error: foreignKeyError('showtime', 'screenId') });
+
+    expect(await rejection(update(s, { screenId: screen2.id }))).toMatchObject({
+      status: 409,
+      message: SHOWTIME_TARGET_CHANGED_MESSAGE,
+    });
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('rolls the update back when the audit write fails, and keeps the cache', async () => {
+    const s = setupEdit();
+    const before = storedShow(s, s.show.id);
+    const failure = new Error('audit insert failed');
+    s.db.injectFault('auditLog', 'create', { error: failure });
+
+    await expect(update(s, { date: '2026-11-02', time: '21:30', format: '3D' })).rejects.toBe(
+      failure,
+    );
+
+    expectUnchanged(s, before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// softDelete (T12)
+// ---------------------------------------------------------------------------
+
+describe('showtime admin service: softDelete', () => {
+  it('sets deletedAt, returns the showtime, writes DELETE { mode: soft }, then drops the cache', async () => {
+    const s = setupEdit();
+
+    const showtime = await s.service.softDelete(s.show.id, s.actor);
+
+    expect(adminShowtimeSchema.parse(showtime)).toEqual(showtime);
+    expect(showtime).toMatchObject({
+      id: s.show.id,
+      deletedAt: NOW.toISOString(),
+      time: '19:00',
+    });
+    expect(storedShow(s, s.show.id)?.deletedAt).toEqual(NOW);
+    expect(showtimeAudits(s)).toEqual([
+      expect.objectContaining({
+        action: 'DELETE',
+        adminId: s.admin.id,
+        entity: 'Showtime',
+        entityId: s.show.id,
+        details: { mode: 'soft' },
+        ipAddress: IP,
+        userAgent: UA,
+      }),
+    ]);
+    expectInvalidatedAfterAudit(s);
+    // No row lock: a delete never creates an overlap.
+    expect(s.db.locks).toEqual([]);
+  });
+
+  it('a started or past show can be deleted (D8), on a hidden screen of an ENDED movie too', async () => {
+    const ended = testMovie({ slug: 'ended', title: 'Ended', status: 'ENDED' });
+    const hidden = testScreen({ name: 'Hidden', isActive: false });
+    const s = setup({ movies: [ended], screens: [hidden] });
+    const past = s.db.addShowtime({
+      movieId: ended.id,
+      screenId: hidden.id,
+      startsAt: colombo('2026-10-01', '19:00'),
+    });
+
+    await expect(s.service.softDelete(past.id, s.actor)).resolves.toMatchObject({
+      deletedAt: NOW.toISOString(),
+    });
+  });
+
+  it('409 when already deleted, 404 when unknown; nothing written', async () => {
+    const s = setup();
+    const gone = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: EDITED_START,
+      deletedAt: DELETED_AT,
+    });
+
+    expect(await rejection(s.service.softDelete(gone.id, s.actor))).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: SHOWTIME_ALREADY_DELETED_MESSAGE,
+    });
+    expect(await rejection(s.service.softDelete(randomUUID(), s.actor))).toMatchObject({
+      status: 404,
+      code: 'NOT_FOUND',
+      message: SHOWTIME_NOT_FOUND_MESSAGE,
+    });
+    expect(storedShow(s, gone.id)?.deletedAt).toEqual(DELETED_AT);
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('a concurrent delete between the read and the update (P2025) is a 409, never a 500', async () => {
+    const s = setupEdit();
+    s.db.injectFault('showtime', 'update', {
+      before: () => {
+        const row = s.db.showtimes.find((r) => r.id === s.show.id);
+        if (row) row.deletedAt = DELETED_AT;
+      },
+      error: recordNotFoundError('showtime', 'an update'),
+    });
+
+    expect(await rejection(s.service.softDelete(s.show.id, s.actor))).toMatchObject({
+      status: 409,
+      message: SHOWTIME_ALREADY_DELETED_MESSAGE,
+    });
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('rolls back when the audit write fails, and keeps the cache', async () => {
+    const s = setupEdit();
+    const failure = new Error('audit insert failed');
+    s.db.injectFault('auditLog', 'create', { error: failure });
+
+    await expect(s.service.softDelete(s.show.id, s.actor)).rejects.toBe(failure);
+
+    expect(storedShow(s, s.show.id)?.deletedAt).toBeNull();
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulkDelete (T12)
+// ---------------------------------------------------------------------------
+
+describe('showtime admin service: bulkDelete', () => {
+  function setupMany(extra: SetupOptions = {}) {
+    const s = setup(extra);
+    const shows = [
+      colombo('2026-10-20', '19:00'), // past: allowed (D8)
+      colombo('2026-11-02', '19:00'),
+      colombo('2026-11-03', '19:00'),
+    ].map((startsAt) => s.db.addShowtime({ movieId: s.movie.id, screenId: s.screen.id, startsAt }));
+    return { ...s, shows };
+  }
+
+  const bulkDelete = (s: Setup, ids: string[]) =>
+    s.service.bulkDelete(showtimeBulkDeleteBodySchema.parse({ ids }), s.actor);
+
+  const idAt = (rows: readonly Showtime[], index: number) => rows[index]?.id ?? '';
+
+  it('soft-deletes every showtime in one updateMany: 3 DELETE audits sharing a batchId, the cache dropped once', async () => {
+    const s = setupMany();
+    const ids = s.shows.map((row) => row.id).reverse();
+
+    const result = await bulkDelete(s, ids);
+
+    expect(showtimeBulkDeleteResponseSchema.parse(result)).toEqual({ deleted: 3 });
+    expect(s.db.showtimes.every((row) => row.deletedAt?.getTime() === NOW.getTime())).toBe(true);
+    expect(s.db.spies.showtime.updateMany).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.showtime.update).not.toHaveBeenCalled();
+    const audits = showtimeAudits(s);
+    expect(audits.map((row) => row.entityId)).toEqual(ids);
+    const batchId = (audits[0]?.details as { batchId?: unknown } | null)?.batchId;
+    expect(batchId).toEqual(expect.any(String));
+    for (const row of audits) {
+      expect(row).toMatchObject({
+        action: 'DELETE',
+        adminId: s.admin.id,
+        entity: 'Showtime',
+        details: { mode: 'soft', batchId },
+        ipAddress: IP,
+        userAgent: UA,
+      });
+    }
+    expect(s.db.spies.auditLog.createMany).toHaveBeenCalledTimes(1);
+    expectInvalidatedAfterAudit(s, 'createMany');
+    expect(s.db.locks).toEqual([]);
+  });
+
+  it('404 listing every unknown ID (path body.ids[i]); nothing changed', async () => {
+    const s = setupMany();
+    const ids = [idAt(s.shows, 0), randomUUID(), idAt(s.shows, 1), randomUUID()];
+
+    const error = await rejection(bulkDelete(s, ids));
+
+    expect(error).toMatchObject({
+      status: 404,
+      code: 'NOT_FOUND',
+      message: showtimeBulkDeleteNotFoundMessage(2),
+      details: [
+        { path: ['body', 'ids', 1], message: SHOWTIME_BULK_DELETE_UNKNOWN_ID_MESSAGE },
+        { path: ['body', 'ids', 3], message: SHOWTIME_BULK_DELETE_UNKNOWN_ID_MESSAGE },
+      ],
+    });
+    expect(s.db.showtimes.every((row) => row.deletedAt === null)).toBe(true);
+    expect(s.db.spies.showtime.updateMany).not.toHaveBeenCalled();
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('409 listing every already-deleted ID; nothing changed', async () => {
+    const s = setupMany();
+    const gone = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-04', '19:00'),
+      deletedAt: DELETED_AT,
+    });
+
+    const error = await rejection(bulkDelete(s, [idAt(s.shows, 1), gone.id]));
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: showtimeBulkDeleteAlreadyDeletedMessage(1),
+      details: [{ path: ['body', 'ids', 1], message: SHOWTIME_BULK_DELETE_DELETED_ID_MESSAGE }],
+    });
+    expect(storedShow(s, idAt(s.shows, 1))?.deletedAt).toBeNull();
+    expect(s.db.spies.showtime.updateMany).not.toHaveBeenCalled();
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('unknown IDs are reported before already-deleted ones', async () => {
+    const s = setupMany();
+    const gone = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-04', '19:00'),
+      deletedAt: DELETED_AT,
+    });
+
+    const error = await rejection(bulkDelete(s, [gone.id, randomUUID()]));
+
+    expect(error).toMatchObject({
+      status: 404,
+      details: [{ path: ['body', 'ids', 1], message: SHOWTIME_BULK_DELETE_UNKNOWN_ID_MESSAGE }],
+    });
+  });
+
+  it('messages: singular and plural', () => {
+    expect(showtimeBulkDeleteNotFoundMessage(1)).toBe(
+      '1 of the selected showtimes was not found. Reload and try again.',
+    );
+    expect(showtimeBulkDeleteNotFoundMessage(3)).toBe(
+      '3 of the selected showtimes were not found. Reload and try again.',
+    );
+    expect(showtimeBulkDeleteAlreadyDeletedMessage(1)).toBe(
+      '1 of the selected showtimes is already deleted. Reload and try again.',
+    );
+    expect(showtimeBulkDeleteAlreadyDeletedMessage(2)).toBe(
+      '2 of the selected showtimes are already deleted. Reload and try again.',
+    );
+  });
+
+  it('a race (one deleted between the read and the updateMany): 409, rolled back, no audit', async () => {
+    const s = setupMany();
+    const second = idAt(s.shows, 1);
+    s.db.injectFault('showtime', 'updateMany', {
+      before: () => {
+        const row = s.db.showtimes.find((r) => r.id === second);
+        if (row) row.deletedAt = DELETED_AT;
+      },
+    });
+
+    const error = await rejection(
+      bulkDelete(
+        s,
+        s.shows.map((row) => row.id),
+      ),
+    );
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: SHOWTIME_BULK_DELETE_CHANGED_MESSAGE,
+    });
+    // Our two deletes rolled back; only the concurrent writer's stays.
+    expect(storedShow(s, idAt(s.shows, 0))?.deletedAt).toBeNull();
+    expect(storedShow(s, idAt(s.shows, 2))?.deletedAt).toBeNull();
+    expect(storedShow(s, second)?.deletedAt).toEqual(DELETED_AT);
+    expect(showtimeAudits(s)).toEqual([]);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('a failed audit insert rolls the deletes back, keeping the cache', async () => {
+    const s = setupMany();
+    const failure = new Error('audit insert failed');
+    s.db.injectFault('auditLog', 'createMany', { error: failure });
+
+    await expect(
+      bulkDelete(
+        s,
+        s.shows.map((row) => row.id),
+      ),
+    ).rejects.toBe(failure);
+
+    expect(s.db.showtimes.every((row) => row.deletedAt === null)).toBe(true);
+    expect(s.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('the body schema refuses duplicates (also case-only), no IDs and more than 200', () => {
+    const id = randomUUID();
+    expect(showtimeBulkDeleteBodySchema.safeParse({ ids: [id, id] }).success).toBe(false);
+    expect(showtimeBulkDeleteBodySchema.safeParse({ ids: [id, id.toUpperCase()] }).success).toBe(
+      false,
+    );
+    expect(showtimeBulkDeleteBodySchema.safeParse({ ids: [] }).success).toBe(false);
+    const many = Array.from({ length: 201 }, () => randomUUID());
+    expect(showtimeBulkDeleteBodySchema.safeParse({ ids: many }).success).toBe(false);
+    expect(showtimeBulkDeleteBodySchema.safeParse({ ids: many.slice(0, 200) }).success).toBe(true);
+  });
+
+  it('200 IDs in one request', async () => {
+    const s = setup();
+    const ids = Array.from(
+      { length: 200 },
+      (_, i) =>
+        s.db.addShowtime({
+          movieId: s.movie.id,
+          screenId: s.screen.id,
+          startsAt: new Date(colombo('2026-11-02', '00:00').getTime() + i * 3 * 3_600_000),
+        }).id,
+    );
+
+    await expect(bulkDelete(s, ids)).resolves.toEqual({ deleted: 200 });
+    expect(showtimeAudits(s)).toHaveLength(200);
   });
 });

@@ -4,8 +4,11 @@ import type {
   AdminShowtimeResponse,
   ShowtimeBulkCreateBody,
   ShowtimeBulkCreateResponse,
+  ShowtimeBulkDeleteBody,
+  ShowtimeBulkDeleteResponse,
   ShowtimeCreateBody,
   ShowtimeIdParams,
+  ShowtimeUpdateBody,
 } from '@sk-cinema/shared';
 import type { RequestHandler } from 'express';
 import { clientInfo } from '../lib/clientInfo.js';
@@ -45,7 +48,33 @@ export function createShowtimeAdminController(service: ShowtimeAdminService) {
     res.json({ showtime } satisfies AdminShowtimeResponse);
   };
 
-  return { create, bulkCreate, list, getById };
+  const update: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as ShowtimeIdParams;
+    const showtime = await service.update(id, req.body as ShowtimeUpdateBody, {
+      adminId: req.admin.id,
+      ...clientInfo(req),
+    });
+    res.json({ showtime } satisfies AdminShowtimeResponse);
+  };
+
+  const softDelete: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as ShowtimeIdParams;
+    const showtime = await service.softDelete(id, { adminId: req.admin.id, ...clientInfo(req) });
+    res.json({ showtime } satisfies AdminShowtimeResponse);
+  };
+
+  const bulkDelete: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const result = await service.bulkDelete(req.body as ShowtimeBulkDeleteBody, {
+      adminId: req.admin.id,
+      ...clientInfo(req),
+    });
+    res.json(result satisfies ShowtimeBulkDeleteResponse);
+  };
+
+  return { create, bulkCreate, list, getById, update, softDelete, bulkDelete };
 }
 
 export type ShowtimeAdminController = ReturnType<typeof createShowtimeAdminController>;

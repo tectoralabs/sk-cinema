@@ -10,13 +10,20 @@
  *   4. createMany, the `startsAt IN (...)` read-back and auditLog.createMany work on real
  *      Postgres: every row returned once, sorted, one audit row each sharing a batchId;
  *   5. a clash inside the batch writes nothing.
+ * T12 update and bulk delete:
+ *   6. a PATCH move into a neighbour is refused with 409 under the real locks and leaves the
+ *      row as it was; a valid move commits with its UPDATE audit row;
+ *   7. a bulk delete soft-deletes every row with one conditional updateMany and writes one
+ *      DELETE audit row each, sharing a batchId.
  */
 import {
   adminShowtimeListQuerySchema,
   showtimeBulkCreateBodySchema,
   showtimeBulkCreateResponseSchema,
   showtimeConflictDetailsSchema,
+  showtimeBulkDeleteBodySchema,
   showtimeCreateBodySchema,
+  showtimeUpdateBodySchema,
   type ShowtimeBulkCreateBodyInput,
   type ShowtimeCreateBodyInput,
 } from '@sk-cinema/shared';
@@ -201,5 +208,95 @@ describePg('admin showtimes on real Postgres', () => {
     expect(details.every((detail) => detail.conflict.showtimeId === null)).toBe(true);
     expect(await testPrisma().showtime.count()).toBe(0);
     expect(await testPrisma().auditLog.count({ where: { entity: 'Showtime' } })).toBe(0);
+  });
+
+  it('a PATCH move into a neighbour is a 409 and leaves the row unchanged; a valid move commits', async () => {
+    const { movie, screen, by } = await fixtures();
+    const create = (time: string) =>
+      service().create(
+        showtimeCreateBodySchema.parse({
+          movieId: movie.id,
+          screenId: screen.id,
+          date: '2026-11-02',
+          time,
+        }),
+        by,
+      );
+    const moving = await create('10:00');
+    const neighbour = await create('19:00');
+    const before = await testPrisma().showtime.findUniqueOrThrow({ where: { id: moving.id } });
+
+    const error = await service()
+      .update(moving.id, showtimeUpdateBodySchema.parse({ date: '2026-11-02', time: '17:00' }), by)
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error).toMatchObject({ status: 409, message: SHOWTIME_OVERLAP_MESSAGE });
+    expect(showtimeConflictDetailsSchema.parse((error as AppError).details)[0]).toMatchObject({
+      path: ['body', 'time'],
+      requested: { date: '2026-11-02', time: '17:00' },
+      conflict: { showtimeId: neighbour.id },
+    });
+    expect(await testPrisma().showtime.findUniqueOrThrow({ where: { id: moving.id } })).toEqual(
+      before,
+    );
+    expect(await testPrisma().auditLog.count({ where: { action: 'UPDATE' } })).toBe(0);
+
+    // 16:45 + 120 + 15 = 19:00: touching the neighbour is allowed.
+    const moved = await service().update(
+      moving.id,
+      showtimeUpdateBodySchema.parse({ date: '2026-11-02', time: '16:45', format: '3d' }),
+      by,
+    );
+    expect(moved).toMatchObject({ time: '16:45', format: '3D' });
+    const audit = await testPrisma().auditLog.findFirstOrThrow({
+      where: { entity: 'Showtime', action: 'UPDATE' },
+      select: { entityId: true, details: true },
+    });
+    expect(audit).toEqual({
+      entityId: moving.id,
+      details: {
+        changes: {
+          startsAt: { from: '2026-11-02T04:30:00.000Z', to: '2026-11-02T11:15:00.000Z' },
+          format: { from: '2D', to: '3D' },
+        },
+      },
+    });
+  });
+
+  it('a bulk delete soft-deletes every row and writes one DELETE audit row each, in one batch', async () => {
+    const { movie, screen, by } = await fixtures();
+    const { items } = await service().bulkCreate(
+      showtimeBulkCreateBodySchema.parse({
+        movieId: movie.id,
+        screenId: screen.id,
+        dateFrom: '2026-11-02',
+        dateTo: '2026-11-04',
+        times: ['10:00'],
+      }),
+      by,
+    );
+    const ids = items.map((item) => item.id);
+
+    const result = await service().bulkDelete(showtimeBulkDeleteBodySchema.parse({ ids }), by);
+
+    expect(result).toEqual({ deleted: 3 });
+    const rows = await testPrisma().showtime.findMany({ select: { deletedAt: true } });
+    expect(rows.map((row) => row.deletedAt)).toEqual([NOW, NOW, NOW]);
+    const audits = await testPrisma().auditLog.findMany({
+      where: { entity: 'Showtime', action: 'DELETE' },
+      select: { entityId: true, details: true },
+    });
+    expect(new Set(audits.map((row) => row.entityId))).toEqual(new Set(ids));
+    const details = audits.map((row) => row.details as Record<string, unknown> | null);
+    expect(details.every((d) => d?.['mode'] === 'soft')).toBe(true);
+    expect(new Set(details.map((d) => d?.['batchId'])).size).toBe(1);
+
+    // A second bulk delete of the same rows changes nothing: 409 listing every one.
+    const again = await service()
+      .bulkDelete(showtimeBulkDeleteBodySchema.parse({ ids }), by)
+      .catch((e: unknown) => e);
+    expect(again).toMatchObject({ status: 409 });
+    expect(await testPrisma().auditLog.count({ where: { action: 'DELETE' } })).toBe(3);
   });
 });

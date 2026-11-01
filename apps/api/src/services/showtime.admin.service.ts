@@ -9,16 +9,19 @@ import {
   type AdminShowtimeListResponse,
   type ShowtimeBulkCreateBody,
   type ShowtimeBulkCreateResponse,
+  type ShowtimeBulkDeleteBody,
+  type ShowtimeBulkDeleteResponse,
   type ShowtimeConflictDetail,
   type ShowtimeCreateBody,
   type ShowtimePastSlotDetail,
+  type ShowtimeUpdateBody,
 } from '@sk-cinema/shared';
 import type { Logger } from 'pino';
 import { Prisma, type PrismaClient } from '../generated/prisma/client.js';
 import type { MemoryCache } from '../lib/cache.js';
 import { addDays, fromColomboDateTime, toColomboDate, toColomboTime } from '../lib/colomboTime.js';
 import { AppError, notFound } from '../lib/errors.js';
-import { lockMovieAndScreens } from '../lib/locks.js';
+import { lockMovieAndScreens, type MovieAndScreenLocks } from '../lib/locks.js';
 import {
   existingShowtimeWindow,
   findShowtimeConflicts,
@@ -32,10 +35,10 @@ import { invalidatePublicMovies } from './movie.public.service.js';
 import { createSettingsService, type SettingsService } from './settings.service.js';
 
 /*
- * Admin showtimes: create one, bulk create, get one, list. T12 (update, delete, bulk delete)
- * builds on the exports here: adminShowtimeSelect + toAdminShowtime for responses,
- * checkScheduleTargets for the movie/screen rules, findScreenConflicts for the overlap check
- * and showtimeConflictError for the 409.
+ * Admin showtimes: create one, bulk create, get one, list, update, soft delete, bulk soft
+ * delete. Shared pieces: adminShowtimeSelect + toAdminShowtime for responses,
+ * checkScheduleTargets / checkLockedScheduleTargets for the movie/screen rules,
+ * findScreenConflicts for the overlap check and showtimeConflictError for the 409.
  *
  * Times: stored as UTC instants; requests and responses carry the Colombo `date` + `time`
  * (lib/colomboTime.ts). Nothing here uses the server's time zone.
@@ -85,6 +88,49 @@ export function showtimeBulkOverlapMessage(slotCount: number, conflictCount: num
  */
 export const SHOWTIME_TARGET_CHANGED_MESSAGE =
   'The movie or screen was changed by someone else. Reload and try again.';
+
+/** PATCH /:id on a soft-deleted showtime (D9: deleted showtimes are never restored or edited). */
+export const SHOWTIME_DELETED_MESSAGE = "This showtime is deleted and can't be changed";
+/** PATCH /:id on a showtime whose start is at or before now (D8). */
+export const SHOWTIME_STARTED_MESSAGE = "This showtime has already started and can't be changed";
+/** DELETE /:id on a showtime that is already soft-deleted. */
+export const SHOWTIME_ALREADY_DELETED_MESSAGE = 'Showtime is already deleted';
+/**
+ * The showtime moved to another screen (or its write matched no row) between our first read
+ * and our write. Never expected under the movie lock; answered as a 409, not a 500.
+ */
+export const SHOWTIME_CHANGED_MESSAGE =
+  'The showtime was changed by someone else. Reload and try again.';
+/** Update that moves a show: the movie / target screen rules (see MOVE_TARGET_MESSAGES). */
+export const SHOWTIME_MOVE_MOVIE_DELETED_MESSAGE =
+  'This movie is deleted. Restore it before moving its showtimes.';
+export const SHOWTIME_MOVE_MOVIE_ENDED_MESSAGE =
+  'This movie has ended. Change its status before moving its showtimes.';
+export const SHOWTIME_MOVE_SCREEN_DELETED_MESSAGE =
+  'This screen is deleted. Restore it before moving showtimes to it.';
+export const SHOWTIME_MOVE_SCREEN_INACTIVE_MESSAGE =
+  'This screen is hidden. Show it before moving showtimes to it.';
+/** Bulk delete: `details` message of an ID with no showtime. */
+export const SHOWTIME_BULK_DELETE_UNKNOWN_ID_MESSAGE = 'Showtime not found';
+/** Bulk delete: `details` message of an ID whose showtime is already soft-deleted. */
+export const SHOWTIME_BULK_DELETE_DELETED_ID_MESSAGE = 'This showtime is already deleted';
+/** Bulk delete: the conditional update missed rows that were live when read (a race). */
+export const SHOWTIME_BULK_DELETE_CHANGED_MESSAGE =
+  'Some of the selected showtimes were changed by someone else. Reload and try again.';
+
+/** Bulk delete 404 message: how many of the IDs have no showtime (all listed in `details`). */
+export function showtimeBulkDeleteNotFoundMessage(count: number): string {
+  return count === 1
+    ? '1 of the selected showtimes was not found. Reload and try again.'
+    : `${String(count)} of the selected showtimes were not found. Reload and try again.`;
+}
+
+/** Bulk delete 409 message: how many of the IDs are already soft-deleted (all listed). */
+export function showtimeBulkDeleteAlreadyDeletedMessage(count: number): string {
+  return count === 1
+    ? '1 of the selected showtimes is already deleted. Reload and try again.'
+    : `${String(count)} of the selected showtimes are already deleted. Reload and try again.`;
+}
 
 /** `reason` logged when a stored format cannot be normalised (the value is never logged). */
 export const UNNORMALISABLE_FORMAT = 'unnormalisable_format';
@@ -208,7 +254,7 @@ export const ADMIN_SHOWTIME_LIST_ORDER_BY = [
 ] as const satisfies Prisma.ShowtimeOrderByWithRelationInput[];
 
 // ---------------------------------------------------------------------------
-// Scheduling rules (create and bulk create; update in T12)
+// Scheduling rules (create, bulk create and update)
 // ---------------------------------------------------------------------------
 
 /** A 404 / 409 / 400 about one body field, shaped like validation details. */
@@ -235,29 +281,74 @@ export interface ScheduleTargets {
   screen: { id: string; name: string };
 }
 
+/** The 409 messages of the movie / screen rules (see checkLockedScheduleTargets). */
+export interface ScheduleTargetMessages {
+  movieDeleted: string;
+  movieEnded: string;
+  screenDeleted: string;
+  screenInactive: string;
+}
+
+/** Create and bulk create: "before adding showtimes". */
+export const CREATE_TARGET_MESSAGES: ScheduleTargetMessages = {
+  movieDeleted: SHOWTIME_MOVIE_DELETED_MESSAGE,
+  movieEnded: SHOWTIME_MOVIE_ENDED_MESSAGE,
+  screenDeleted: SHOWTIME_SCREEN_DELETED_MESSAGE,
+  screenInactive: SHOWTIME_SCREEN_INACTIVE_MESSAGE,
+};
+
+/** Update that moves a show (new start or screen): "before moving ...". */
+export const MOVE_TARGET_MESSAGES: ScheduleTargetMessages = {
+  movieDeleted: SHOWTIME_MOVE_MOVIE_DELETED_MESSAGE,
+  movieEnded: SHOWTIME_MOVE_MOVIE_ENDED_MESSAGE,
+  screenDeleted: SHOWTIME_MOVE_SCREEN_DELETED_MESSAGE,
+  screenInactive: SHOWTIME_MOVE_SCREEN_INACTIVE_MESSAGE,
+};
+
+export interface ScheduleTargetOptions {
+  messages?: ScheduleTargetMessages;
+  /**
+   * The movie is a request body field (create, bulk create): its errors get
+   * `details: [{ path: ['body', 'movieId'], message }]`. False for an update, whose body has no
+   * movieId: the movie errors then have no `details`. Default true.
+   */
+  movieInBody?: boolean;
+}
+
 /**
- * Locks the movie, then the screen (lib/locks.ts order), then reads and checks both. Must run
- * inside the write's transaction, before any read the overlap check depends on.
+ * Reads and checks the movie and the screen of a showtime write whose rows are ALREADY locked
+ * (`locks` is what lockMovieAndScreens returned; the screen must be among the locked ones).
  * - Movie: 404 unknown; 409 soft-deleted; 409 ENDED. UPCOMING and NOW_SHOWING are allowed,
  *   hidden (isActive=false) ones too: admins schedule ahead.
  * - Screen: 404 unknown; 409 soft-deleted; 409 hidden.
- * Every error has `details: [{ path: ['body', 'movieId' | 'screenId'], message }]`.
+ * Screen errors have `details: [{ path: ['body', 'screenId'], message }]`; movie errors the
+ * same on 'movieId' unless `movieInBody` is false (no details).
  */
-export async function checkScheduleTargets(
+export async function checkLockedScheduleTargets(
   tx: Prisma.TransactionClient,
   movieId: string,
   screenId: string,
+  locks: MovieAndScreenLocks,
+  { messages = CREATE_TARGET_MESSAGES, movieInBody = true }: ScheduleTargetOptions = {},
 ): Promise<ScheduleTargets> {
-  const locks = await lockMovieAndScreens(tx, movieId, [screenId]);
+  const movieError = (status: 404 | 409, message: string) =>
+    movieInBody
+      ? fieldError(status, 'movieId', message)
+      : new AppError(
+          status,
+          status === 404 ? ERROR_CODES.NOT_FOUND : ERROR_CODES.CONFLICT,
+          message,
+        );
+
   const movie = locks.movieFound
     ? await tx.movie.findUnique({
         where: { id: movieId },
         select: { id: true, title: true, durationMinutes: true, status: true, deletedAt: true },
       })
     : null;
-  if (movie === null) throw fieldError(404, 'movieId', SHOWTIME_MOVIE_NOT_FOUND_MESSAGE);
-  if (movie.deletedAt !== null) throw fieldError(409, 'movieId', SHOWTIME_MOVIE_DELETED_MESSAGE);
-  if (movie.status === 'ENDED') throw fieldError(409, 'movieId', SHOWTIME_MOVIE_ENDED_MESSAGE);
+  if (movie === null) throw movieError(404, SHOWTIME_MOVIE_NOT_FOUND_MESSAGE);
+  if (movie.deletedAt !== null) throw movieError(409, messages.movieDeleted);
+  if (movie.status === 'ENDED') throw movieError(409, messages.movieEnded);
 
   const screen = locks.screensFound.has(screenId.toLowerCase())
     ? await tx.screen.findUnique({
@@ -266,15 +357,27 @@ export async function checkScheduleTargets(
       })
     : null;
   if (screen === null) throw fieldError(404, 'screenId', SHOWTIME_SCREEN_NOT_FOUND_MESSAGE);
-  if (screen.deletedAt !== null) {
-    throw fieldError(409, 'screenId', SHOWTIME_SCREEN_DELETED_MESSAGE);
-  }
-  if (!screen.isActive) throw fieldError(409, 'screenId', SHOWTIME_SCREEN_INACTIVE_MESSAGE);
+  if (screen.deletedAt !== null) throw fieldError(409, 'screenId', messages.screenDeleted);
+  if (!screen.isActive) throw fieldError(409, 'screenId', messages.screenInactive);
 
   return {
     movie: { id: movie.id, title: movie.title, durationMinutes: movie.durationMinutes },
     screen: { id: screen.id, name: screen.name },
   };
+}
+
+/**
+ * Locks the movie, then the screen (lib/locks.ts order), then reads and checks both
+ * (checkLockedScheduleTargets, create messages). Must run inside the write's transaction,
+ * before any read the overlap check depends on.
+ */
+export async function checkScheduleTargets(
+  tx: Prisma.TransactionClient,
+  movieId: string,
+  screenId: string,
+): Promise<ScheduleTargets> {
+  const locks = await lockMovieAndScreens(tx, movieId, [screenId]);
+  return checkLockedScheduleTargets(tx, movieId, screenId, locks);
 }
 
 /** A show to check for overlaps, with what the 409 details need to point at it. */
@@ -362,13 +465,113 @@ export function showtimeConflictError(
 const isForeignKeyError = (error: unknown) =>
   error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2003';
 
-/** Thrown inside the create transaction when the insert hit a foreign key (see message). */
+const isRecordNotFound = (error: unknown) =>
+  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025';
+
+/** Thrown inside a create / update transaction when the write hit a foreign key (see message). */
 class TargetGone extends Error {
   constructor() {
-    super('Movie or screen gone before the insert');
+    super('Movie or screen gone before the write');
     this.name = 'TargetGone';
   }
 }
+
+/**
+ * Thrown inside an update / soft delete transaction when the conditional update matched no
+ * row (P2025): the showtime was removed or soft-deleted after it was read. Turned into a 404
+ * or 409 after the rollback, never a 500.
+ */
+class ShowtimeGone extends Error {
+  constructor() {
+    super('Showtime changed before the write');
+    this.name = 'ShowtimeGone';
+  }
+}
+
+const conflict = (message: string) => new AppError(409, ERROR_CODES.CONFLICT, message);
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+/** A showtime column PATCH /:id may change (the body's date + time become `startsAt`). */
+export type ShowtimeEditableField = 'startsAt' | 'screenId' | 'format' | 'bookingUrlOverride';
+
+/** A Record, not an interface, so it is assignable to Prisma's JSON input types. */
+export type ShowtimeFieldChange = Record<'from' | 'to', string | null>;
+
+/** Only the fields that actually change; empty when the update is a no-op. */
+export type ShowtimeChanges = Partial<Record<ShowtimeEditableField, ShowtimeFieldChange>>;
+
+/** What an update body would do to a showtime (see planShowtimeUpdate). */
+export interface ShowtimeUpdatePlan {
+  /** As audited: `startsAt` as ISO UTC strings, `format` from the stored (raw) value. */
+  changes: ShowtimeChanges;
+  /** The start or the screen changes: the scheduling rules and the overlap check apply. */
+  moves: boolean;
+  /** The start after the update (the current one when date + time are not sent). */
+  startsAt: Date;
+  /** The screen after the update (the current one when screenId is not sent or equal). */
+  screenId: string;
+}
+
+/**
+ * Compares a validated update body with the stored showtime:
+ * - `date` + `time`: the Colombo wall clock as a UTC instant, compared by instant;
+ * - `screenId`: compared case-insensitively (UUIDs);
+ * - `format`: the body's normalised value against the NORMALISED stored one, so a stored "2d"
+ *   and a body "2D" are equal; a stored value that cannot be normalised differs from any;
+ * - `bookingUrlOverride`: exactly (`null` equals a stored NULL).
+ * Omitted fields are ignored.
+ */
+export function planShowtimeUpdate(
+  current: AdminShowtimeRow,
+  body: ShowtimeUpdateBody,
+): ShowtimeUpdatePlan {
+  const changes: ShowtimeChanges = {};
+
+  let startsAt = current.startsAt;
+  if (body.date !== undefined && body.time !== undefined) {
+    const requested = fromColomboDateTime(body.date, body.time);
+    if (requested.getTime() !== current.startsAt.getTime()) {
+      startsAt = requested;
+      changes.startsAt = { from: current.startsAt.toISOString(), to: requested.toISOString() };
+    }
+  }
+
+  let screenId = current.screen.id;
+  if (body.screenId !== undefined && body.screenId.toLowerCase() !== screenId.toLowerCase()) {
+    screenId = body.screenId;
+    changes.screenId = { from: current.screen.id, to: body.screenId };
+  }
+
+  if (body.format !== undefined && body.format !== normalizeShowtimeFormat(current.format)) {
+    changes.format = { from: current.format, to: body.format };
+  }
+
+  if (
+    body.bookingUrlOverride !== undefined &&
+    body.bookingUrlOverride !== current.bookingUrlOverride
+  ) {
+    changes.bookingUrlOverride = { from: current.bookingUrlOverride, to: body.bookingUrlOverride };
+  }
+
+  const moves = changes.startsAt !== undefined || changes.screenId !== undefined;
+  return { changes, moves, startsAt, screenId };
+}
+
+// ---------------------------------------------------------------------------
+// Bulk delete
+// ---------------------------------------------------------------------------
+
+/** One `details` entry of a bulk delete refusal: the index of the ID in `ids`. */
+export interface ShowtimeIdDetail {
+  path: ['body', 'ids', number];
+  message: string;
+}
+
+const idDetails = (indexes: readonly number[], message: string): ShowtimeIdDetail[] =>
+  indexes.map((index) => ({ path: ['body', 'ids', index], message }));
 
 // ---------------------------------------------------------------------------
 // Bulk create
@@ -473,6 +676,18 @@ export function createShowtimeAdminService({
 }: ShowtimeAdminServiceDeps) {
   /** Settings read through a transaction client, so the write sees them under its locks. */
   const settingsIn = (tx: Prisma.TransactionClient) => createSettingsService({ db: tx, logger });
+
+  /**
+   * The answer to a conditional update that matched no row (ShowtimeGone), from the showtime
+   * re-read after the rollback: 404 when it is gone, 409 `deletedMessage` when it is
+   * soft-deleted, 409 SHOWTIME_CHANGED_MESSAGE otherwise. Never a 500 (unless the re-read
+   * itself fails).
+   */
+  async function lostWriteError(id: string, deletedMessage: string): Promise<AppError> {
+    const row = await db.showtime.findUnique({ where: { id }, select: { deletedAt: true } });
+    if (row === null) return notFound(SHOWTIME_NOT_FOUND_MESSAGE);
+    return conflict(row.deletedAt === null ? SHOWTIME_CHANGED_MESSAGE : deletedMessage);
+  }
 
   return {
     /**
@@ -704,6 +919,289 @@ export function createShowtimeAdminService({
       ]);
       if (row === null) throw notFound(SHOWTIME_NOT_FOUND_MESSAGE);
       return toAdminShowtime(row, booking.bmsBaseUrl, logger);
+    },
+
+    /**
+     * Changes the start (Colombo date + time), the screen, the format and/or the booking link
+     * override of a live showtime that has not started. The movie never changes.
+     *
+     * Flow:
+     * 1. read the showtime outside any transaction to learn its movie and screen (404 unknown);
+     * 2. in one transaction: lock the movie, then the current and the requested screens
+     *    (lockMovieAndScreens: movie first, screens sorted), then RE-READ the showtime under
+     *    the locks: 404 gone; 409 SHOWTIME_DELETED_MESSAGE soft-deleted (D9: no restore);
+     *    409 SHOWTIME_CHANGED_MESSAGE when it moved to another screen since step 1 (our locks
+     *    no longer cover it); 409 SHOWTIME_STARTED_MESSAGE when `startsAt <= now` (D8);
+     * 3. read the booking settings (gap, bmsBaseUrl) through the transaction;
+     * 4. planShowtimeUpdate: no change at all is a 200 with the showtime as it is, without a
+     *    write, an audit row or a cache invalidation;
+     * 5. only when the start or the screen changes ("moves"): the movie must not be deleted or
+     *    ENDED (409, no details: the body has no movieId) and the target screen must exist, be
+     *    live and active (404 / 409 on body.screenId), then a changed start must be after now
+     *    (400 on body.time), then the overlap check of the moved show against its neighbours
+     *    on the target screen. The show is a candidate WITH its showtimeId, so it replaces its
+     *    own saved slot (moving it a few minutes within its old slot is fine), and saved shows
+     *    clashing with EACH OTHER under today's gap never fail it (a gap change only applies
+     *    to shows created or moved afterwards). 409 with conflict details: path ['body',
+     *    'time'] when the start changes, ['body', 'screenId'] when only the screen does;
+     *    `requested` is the new start's Colombo date and time;
+     * 6. the conditional update `where: { id, deletedAt: null }` (a P2025 means a concurrent
+     *    delete: 404 / 409 after the rollback; a P2003 a vanished screen: 409), then the UPDATE
+     *    audit row `{ changes }` with only the changed fields;
+     * then, only after the commit, the public movie cache is dropped.
+     *
+     * Format-only and override-only edits skip step 5: they are allowed whatever the movie
+     * status or the screen state (admins may fix the data of a show on a screen that has been
+     * hidden since, or of an ENDED movie), and the slot does not move, so there is no overlap
+     * check. Concurrent updates of one showtime are serialised by the movie lock; a concurrent
+     * (unlocked) soft delete is caught by the conditional update.
+     */
+    async update(id: string, body: ShowtimeUpdateBody, actor: AuditActor): Promise<AdminShowtime> {
+      const first = await db.showtime.findUnique({
+        where: { id },
+        select: { movieId: true, screenId: true },
+      });
+      if (first === null) throw notFound(SHOWTIME_NOT_FOUND_MESSAGE);
+
+      let outcome: { row: AdminShowtimeRow; baseUrl: string; changed: boolean };
+      try {
+        outcome = await db.$transaction(async (tx) => {
+          const locks = await lockMovieAndScreens(tx, first.movieId, [
+            first.screenId,
+            body.screenId ?? first.screenId,
+          ]);
+          const current = await tx.showtime.findUnique({
+            where: { id },
+            select: adminShowtimeSelect,
+          });
+          if (current === null) throw notFound(SHOWTIME_NOT_FOUND_MESSAGE);
+          if (current.deletedAt !== null) throw conflict(SHOWTIME_DELETED_MESSAGE);
+          if (current.screen.id.toLowerCase() !== first.screenId.toLowerCase()) {
+            throw conflict(SHOWTIME_CHANGED_MESSAGE);
+          }
+          if (current.startsAt.getTime() <= now().getTime()) {
+            throw conflict(SHOWTIME_STARTED_MESSAGE);
+          }
+
+          const booking = await settingsIn(tx).getBookingSettings();
+          const plan = planShowtimeUpdate(current, body);
+          const { changes } = plan;
+          if (Object.keys(changes).length === 0) {
+            return { row: current, baseUrl: booking.bmsBaseUrl, changed: false };
+          }
+
+          const data: Prisma.ShowtimeUncheckedUpdateInput = {};
+          if (plan.moves) {
+            const { movie, screen } = await checkLockedScheduleTargets(
+              tx,
+              current.movie.id,
+              plan.screenId,
+              locks,
+              { messages: MOVE_TARGET_MESSAGES, movieInBody: false },
+            );
+            if (changes.startsAt !== undefined && plan.startsAt.getTime() <= now().getTime()) {
+              throw fieldError(400, 'time', SHOWTIME_IN_PAST_MESSAGE);
+            }
+
+            const candidate: ShowtimeCandidate = {
+              showtimeId: current.id,
+              screenId: screen.id,
+              movieTitle: movie.title,
+              startsAt: plan.startsAt,
+              durationMinutes: movie.durationMinutes,
+              path: ['body', changes.startsAt === undefined ? 'screenId' : 'time'],
+              requested: { date: toColomboDate(plan.startsAt), time: toColomboTime(plan.startsAt) },
+            };
+            const overlaps = await findScreenConflicts(tx, [candidate], booking.showGapMinutes);
+            if (overlaps.length > 0) {
+              throw showtimeConflictError(overlaps, booking.showGapMinutes);
+            }
+
+            if (changes.startsAt !== undefined) data.startsAt = plan.startsAt;
+            if (changes.screenId !== undefined) {
+              // The id as stored, so the audit `to` matches the row.
+              data.screenId = screen.id;
+              changes.screenId = { from: current.screen.id, to: screen.id };
+            }
+          }
+          if (changes.format !== undefined && body.format !== undefined) {
+            data.format = body.format;
+          }
+          if (changes.bookingUrlOverride !== undefined && body.bookingUrlOverride !== undefined) {
+            data.bookingUrlOverride = body.bookingUrlOverride;
+          }
+
+          let row: AdminShowtimeRow;
+          try {
+            row = await tx.showtime.update({
+              where: { id, deletedAt: null },
+              data,
+              select: adminShowtimeSelect,
+            });
+          } catch (error) {
+            if (isRecordNotFound(error)) throw new ShowtimeGone();
+            if (isForeignKeyError(error)) throw new TargetGone();
+            throw error;
+          }
+
+          await writeAudit(tx, {
+            action: 'UPDATE',
+            adminId: actor.adminId,
+            entity: AUDIT_ENTITY,
+            entityId: row.id,
+            // Admin configuration, stored in the audit table (never logged).
+            details: { changes },
+            ipAddress: actor.ipAddress,
+            userAgent: actor.userAgent,
+          });
+          return { row, baseUrl: booking.bmsBaseUrl, changed: true };
+        });
+      } catch (error) {
+        if (error instanceof TargetGone) throw conflict(SHOWTIME_TARGET_CHANGED_MESSAGE);
+        if (error instanceof ShowtimeGone) throw await lostWriteError(id, SHOWTIME_DELETED_MESSAGE);
+        throw error;
+      }
+
+      // Only after the commit, so no request can re-cache the public pages as they were.
+      if (outcome.changed) invalidatePublicMovies(cache);
+      return toAdminShowtime(outcome.row, outcome.baseUrl, logger);
+    },
+
+    /**
+     * Soft-deletes a live showtime: sets `deletedAt` (DELETE audit, `{ mode: 'soft' }`) and
+     * returns it. 404 unknown; 409 SHOWTIME_ALREADY_DELETED_MESSAGE when already deleted (there
+     * is no restore). Started and past showtimes can be deleted (D8).
+     *
+     * No row lock: removing a show never creates an overlap, and the guards that count
+     * upcoming showtimes under a lock (screen hide / delete, movie delete) can only become
+     * stricter than necessary while a delete is in flight, never too lenient. The conditional
+     * update `where: { id, deletedAt: null }` makes two concurrent deletes safe: the second
+     * gets a P2025, answered as 409 / 404 after the rollback.
+     */
+    async softDelete(id: string, actor: AuditActor): Promise<AdminShowtime> {
+      let outcome: { row: AdminShowtimeRow; baseUrl: string };
+      try {
+        outcome = await db.$transaction(async (tx) => {
+          const current = await tx.showtime.findUnique({
+            where: { id },
+            select: { deletedAt: true },
+          });
+          if (current === null) throw notFound(SHOWTIME_NOT_FOUND_MESSAGE);
+          if (current.deletedAt !== null) throw conflict(SHOWTIME_ALREADY_DELETED_MESSAGE);
+
+          const booking = await settingsIn(tx).getBookingSettings();
+          let row: AdminShowtimeRow;
+          try {
+            row = await tx.showtime.update({
+              where: { id, deletedAt: null },
+              data: { deletedAt: now() },
+              select: adminShowtimeSelect,
+            });
+          } catch (error) {
+            if (isRecordNotFound(error)) throw new ShowtimeGone();
+            throw error;
+          }
+
+          await writeAudit(tx, {
+            action: 'DELETE',
+            adminId: actor.adminId,
+            entity: AUDIT_ENTITY,
+            entityId: row.id,
+            details: { mode: 'soft' },
+            ipAddress: actor.ipAddress,
+            userAgent: actor.userAgent,
+          });
+          return { row, baseUrl: booking.bmsBaseUrl };
+        });
+      } catch (error) {
+        if (error instanceof ShowtimeGone) {
+          throw await lostWriteError(id, SHOWTIME_ALREADY_DELETED_MESSAGE);
+        }
+        throw error;
+      }
+
+      // Only after the commit.
+      invalidatePublicMovies(cache);
+      return toAdminShowtime(outcome.row, outcome.baseUrl, logger);
+    },
+
+    /**
+     * Soft-deletes up to 200 showtimes, all or nothing, in one transaction:
+     * 1. read every requested showtime: any unknown ID is a 404 listing each one
+     *    (`details: [{ path: ['body', 'ids', i], message }]`); otherwise any already deleted
+     *    one is a 409 listing each one. Nothing is changed in either case;
+     * 2. one conditional `updateMany` (`id IN ids AND deletedAt IS NULL`); a count other than
+     *    the number of IDs means a concurrent delete got in between: rolled back with 409
+     *    SHOWTIME_BULK_DELETE_CHANGED_MESSAGE;
+     * 3. one DELETE audit row per showtime (`{ mode: 'soft', batchId }`), in one insert;
+     * then, only after the commit, the public movie cache is dropped (once).
+     *
+     * Started and past showtimes can be deleted (D8). D7: this is how an admin clears a
+     * movie's upcoming showtimes before soft-deleting the movie. No row lock, for the reasons
+     * given on softDelete.
+     */
+    async bulkDelete(
+      input: ShowtimeBulkDeleteBody,
+      actor: AuditActor,
+    ): Promise<ShowtimeBulkDeleteResponse> {
+      const { ids } = input;
+      const deleted = await db.$transaction(async (tx) => {
+        const rows = await tx.showtime.findMany({
+          where: { id: { in: ids } },
+          select: { id: true, deletedAt: true },
+        });
+        // UUIDs compare case-insensitively (the body schema rejects case-only duplicates).
+        const byId = new Map(rows.map((row) => [row.id.toLowerCase(), row]));
+        const unknown: number[] = [];
+        const alreadyDeleted: number[] = [];
+        ids.forEach((id, index) => {
+          const row = byId.get(id.toLowerCase());
+          if (row === undefined) unknown.push(index);
+          else if (row.deletedAt !== null) alreadyDeleted.push(index);
+        });
+        if (unknown.length > 0) {
+          throw new AppError(
+            404,
+            ERROR_CODES.NOT_FOUND,
+            showtimeBulkDeleteNotFoundMessage(unknown.length),
+            idDetails(unknown, SHOWTIME_BULK_DELETE_UNKNOWN_ID_MESSAGE),
+          );
+        }
+        if (alreadyDeleted.length > 0) {
+          throw new AppError(
+            409,
+            ERROR_CODES.CONFLICT,
+            showtimeBulkDeleteAlreadyDeletedMessage(alreadyDeleted.length),
+            idDetails(alreadyDeleted, SHOWTIME_BULK_DELETE_DELETED_ID_MESSAGE),
+          );
+        }
+
+        const { count } = await tx.showtime.updateMany({
+          where: { id: { in: ids }, deletedAt: null },
+          data: { deletedAt: now() },
+        });
+        if (count !== ids.length) throw conflict(SHOWTIME_BULK_DELETE_CHANGED_MESSAGE);
+
+        const batchId = randomUUID();
+        await writeAuditMany(
+          tx,
+          ids.map((id) => ({
+            action: 'DELETE' as const,
+            adminId: actor.adminId,
+            entity: AUDIT_ENTITY,
+            // The id as stored (every one was found above).
+            entityId: byId.get(id.toLowerCase())?.id ?? id,
+            details: { mode: 'soft', batchId },
+            ipAddress: actor.ipAddress,
+            userAgent: actor.userAgent,
+          })),
+        );
+        return count;
+      });
+
+      // Only after the commit.
+      invalidatePublicMovies(cache);
+      return { deleted };
     },
   };
 }
