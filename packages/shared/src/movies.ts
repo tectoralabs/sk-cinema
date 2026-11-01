@@ -97,6 +97,16 @@ export const trailerUrlSchema = z
     message: 'Must be an https YouTube link (youtube.com/watch?v=... or youtu.be/...)',
   });
 
+/** Shortest accepted movie running time, in minutes. */
+export const MOVIE_DURATION_MIN_MINUTES = 1;
+
+/**
+ * Longest accepted movie running time, in minutes. The API also relies on it to bound the
+ * showtime overlap query (a show can start at most this long, plus the show gap, before a
+ * clashing one), so raising it widens that query window.
+ */
+export const MOVIE_DURATION_MAX_MINUTES = 600;
+
 /** Removes case-insensitive duplicates, keeping the first spelling. */
 function dedupeCaseInsensitive(values: string[]): string[] {
   const seen = new Set<string>();
@@ -123,7 +133,7 @@ const movieFields = {
   title: z.string().trim().min(1).max(150),
   slug: slugSchema,
   synopsis: z.string().trim().min(1).max(5000).nullable(),
-  durationMinutes: z.number().int().min(1).max(600),
+  durationMinutes: z.number().int().min(MOVIE_DURATION_MIN_MINUTES).max(MOVIE_DURATION_MAX_MINUTES),
   language: z.string().trim().min(1).max(50).nullable(),
   genres: genresSchema,
   rating: z.string().trim().min(1).max(20).nullable(),

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import {
+  MOVIE_DURATION_MAX_MINUTES,
+  MOVIE_DURATION_MIN_MINUTES,
   adminMovieListQuerySchema,
   adminMovieListResponseSchema,
   adminMovieResponseSchema,
@@ -286,6 +288,11 @@ describe('movieCreateBodySchema', () => {
         true,
       );
     }
+  });
+
+  it('exports the durationMinutes bounds the API uses for its overlap query window', () => {
+    expect(MOVIE_DURATION_MIN_MINUTES).toBe(1);
+    expect(MOVIE_DURATION_MAX_MINUTES).toBe(600);
   });
 
   it('enforces text length limits', () => {
