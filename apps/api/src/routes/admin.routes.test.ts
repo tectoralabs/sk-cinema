@@ -411,6 +411,18 @@ describe('admin router: authentication by default', () => {
     );
   });
 
+  it('sees every /showtimes route (Phase 5 T10), so the 401 walk below probes each one', () => {
+    const { app, mounts } = setup();
+    const showtimes = `${ADMIN_API_PATH}/showtimes`;
+    const showtimeEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
+      isUnder(e.split(' ')[1] ?? '', showtimes),
+    );
+
+    expect(showtimeEndpoints.sort()).toEqual(
+      [`GET ${showtimes}`, `POST ${showtimes}`, `GET ${showtimes}/:id`].sort(),
+    );
+  });
+
   it('exposes only csrf, login, refresh and logout under /auth', () => {
     const { app, mounts } = setup();
     const authEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
