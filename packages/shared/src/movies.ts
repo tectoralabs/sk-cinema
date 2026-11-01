@@ -12,9 +12,11 @@ export type MovieStatus = z.infer<typeof movieStatusSchema>;
 /*
  * Regex safety: Zod 4 keeps running a string's later checks after one fails, so without
  * `abort: true` a `.regex()` or `.refine()` placed after `.max(n)` still sees the whole input
- * (up to the 100 KB JSON body limit). Every pattern below therefore runs only on input whose
- * length has already been checked, and is linear in that input (no nested or overlapping
- * quantifiers). Keep it that way when adding patterns.
+ * (up to the 100 KB JSON body limit). Every pattern below that can see request input is
+ * therefore either length-checked first (`.max(n, { abort: true })` or a length test inside the
+ * refine) or anchored with a bounded match that fails within a few characters (e.g.
+ * `^\d{1,6}$`, `z.iso.date()`, `z.uuid()`), and none has nested or overlapping quantifiers.
+ * Keep it that way when adding patterns.
  */
 
 const SLUG_MAX_LENGTH = 160;

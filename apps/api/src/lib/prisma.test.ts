@@ -23,9 +23,11 @@ describe('createPrismaClient', () => {
     client = undefined;
   });
 
-  it('waits as long as the pool connect timeout to start a transaction (Neon cold start)', () => {
-    expect(TRANSACTION_OPTIONS).toEqual({ maxWait: CONNECT_TIMEOUT_MS, timeout: 10_000 });
+  it('waits longer than the pool connect timeout to start a transaction (Neon cold start)', () => {
+    expect(TRANSACTION_OPTIONS).toEqual({ maxWait: 20_000, timeout: 10_000 });
     expect(CONNECT_TIMEOUT_MS).toBe(15_000);
+    // maxWait covers the pool connect and the BEGIN round trip, so it must exceed the connect timeout.
+    expect(TRANSACTION_OPTIONS.maxWait).toBe(CONNECT_TIMEOUT_MS + 5_000);
     // Longer than Prisma's defaults (maxWait 2 s, timeout 5 s), never shorter.
     expect(TRANSACTION_OPTIONS.maxWait).toBeGreaterThan(2_000);
     expect(TRANSACTION_OPTIONS.timeout).toBeGreaterThan(5_000);
@@ -35,7 +37,7 @@ describe('createPrismaClient', () => {
     client = createPrismaClient(UNUSED_URL);
 
     expect(resolvedTransactionOptions(client)).toMatchObject({
-      maxWait: CONNECT_TIMEOUT_MS,
+      maxWait: CONNECT_TIMEOUT_MS + 5_000,
       timeout: 10_000,
     });
   });
