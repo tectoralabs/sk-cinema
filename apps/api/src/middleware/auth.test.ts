@@ -8,7 +8,6 @@ import request from 'supertest';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Admin, RefreshToken } from '../generated/prisma/client.js';
 import { ACCESS_COOKIE_NAME } from '../lib/authCookies.js';
-import { hashPassword } from '../lib/password.js';
 import { signAccessToken } from '../lib/tokens.js';
 import {
   SESSION_EXPIRED_MESSAGE,
@@ -22,6 +21,7 @@ import {
   silentLogger,
   testAdmin,
   testConfig,
+  testPasswordHash,
   testRefreshToken,
 } from '../test/helpers.js';
 import { FORBIDDEN_MESSAGE, requireAuth, requireRole } from './auth.js';
@@ -434,7 +434,7 @@ describe('requireAuth with sessions from the auth service', () => {
   let passwordHash: string;
 
   beforeAll(async () => {
-    passwordHash = await hashPassword(PASSWORD);
+    passwordHash = await testPasswordHash(PASSWORD);
   });
 
   /** A store with one admin and no seeded sessions: only the service creates them. */

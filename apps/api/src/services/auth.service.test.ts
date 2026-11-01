@@ -4,9 +4,15 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Admin, RefreshToken } from '../generated/prisma/client.js';
 import { AppError } from '../lib/errors.js';
 import type * as PasswordModule from '../lib/password.js';
-import { hashPassword, verifyDummyPassword, verifyPassword } from '../lib/password.js';
+import { verifyDummyPassword, verifyPassword } from '../lib/password.js';
 import { hashRefreshToken, verifyAccessToken } from '../lib/tokens.js';
-import { inMemoryAuthDb, testAdmin, testConfig, type InMemoryAuthDb } from '../test/helpers.js';
+import {
+  inMemoryAuthDb,
+  testAdmin,
+  testConfig,
+  testPasswordHash,
+  type InMemoryAuthDb,
+} from '../test/helpers.js';
 import {
   INVALID_CREDENTIALS_MESSAGE,
   SESSION_EXPIRED_MESSAGE,
@@ -46,7 +52,7 @@ let clock: Date;
 const logger = { error: vi.fn() };
 
 beforeAll(async () => {
-  passwordHash = await hashPassword(PASSWORD);
+  passwordHash = await testPasswordHash(PASSWORD);
 });
 
 beforeEach(() => {

@@ -7,12 +7,14 @@ import { randomUUID } from 'node:crypto';
 import { movieIdParamsSchema } from '@sk-cinema/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Prisma } from '../generated/prisma/client.js';
+import { verifyPassword } from '../lib/password.js';
 import {
   UnsupportedByFakeError,
   inMemoryAuthDb,
   recordNotFoundError,
   testAdmin,
   testMovie,
+  testPasswordHash,
   testRefreshToken,
   testUuidV7,
   uniqueConstraintError,
@@ -1689,5 +1691,20 @@ describe('inMemoryAuthDb: auth models keep their behaviour, with real Prisma err
       db.spies.auditLog.create({ data: { action: 'LOGGED_IN', entity: 'Admin' } }),
     ).rejects.toThrow(/not a valid auditLog\.action/);
     expect(db.auditLogs).toHaveLength(0);
+  });
+});
+
+describe('testPasswordHash', () => {
+  it('is a cheap argon2id hash that the app verifies like a production one', async () => {
+    const hash = await testPasswordHash('correct horse battery staple');
+
+    expect(hash.startsWith('$argon2id$v=19$m=8,t=1,p=1$')).toBe(true);
+    await expect(verifyPassword(hash, 'correct horse battery staple')).resolves.toBe(true);
+    await expect(verifyPassword(hash, 'Correct horse battery staple')).resolves.toBe(false);
+  });
+
+  it('salts every hash', async () => {
+    const [a, b] = await Promise.all([testPasswordHash('same'), testPasswordHash('same')]);
+    expect(a).not.toBe(b);
   });
 });

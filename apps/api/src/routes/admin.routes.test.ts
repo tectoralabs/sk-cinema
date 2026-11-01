@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { createServer, type Server } from 'node:http';
 import { inspect, isDeepStrictEqual } from 'node:util';
 import { apiErrorSchema } from '@sk-cinema/shared';
 import express, { Router, type Express, type RequestHandler } from 'express';
 import request from 'supertest';
-import { beforeAll, describe, expect, it, vi, type Mock } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi, type Mock } from 'vitest';
 import { ADMIN_API_PATH, ADMIN_AUTH_PREFIX } from '../lib/apiPaths.js';
-import { hashPassword } from '../lib/password.js';
 import type * as AuthModule from '../middleware/auth.js';
 import { requireAuth } from '../middleware/auth.js';
 import type * as CsrfModule from '../middleware/csrf.js';
@@ -19,6 +19,8 @@ import {
   inMemoryAuthDb,
   sessionFrom,
   testAdmin,
+  testPasswordHash,
+  type Csrf,
   type Session,
 } from '../test/helpers.js';
 
@@ -53,7 +55,7 @@ const PROBE_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 let passwordHash: string;
 
 beforeAll(async () => {
-  passwordHash = await hashPassword(PASSWORD);
+  passwordHash = await testPasswordHash(PASSWORD);
 });
 
 // ---------------------------------------------------------------------------
@@ -197,26 +199,42 @@ const isUnder = (path: string, base: string) => path === base || path.startsWith
 type Send = (method: string, path: string) => Promise<request.Response>;
 
 /**
+ * How many probe requests a walk keeps in flight at once. Every probe is independent (no
+ * session, nothing written), so sending them in small batches checks exactly what sending them
+ * one by one does, in a fraction of the time on a machine with slow loopback HTTP.
+ */
+const PROBE_BATCH_SIZE = 10;
+
+/** Runs `probe` over `items` in batches of PROBE_BATCH_SIZE; results keep the items' order. */
+async function inBatches<T, R>(items: readonly T[], probe: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += PROBE_BATCH_SIZE) {
+    results.push(...(await Promise.all(items.slice(i, i + PROBE_BATCH_SIZE).map(probe))));
+  }
+  return results;
+}
+
+/**
  * Sends every PROBE_METHOD, with no session, to each middleware's mount path and to a path
  * below it (a use() middleware also runs for sub-paths). Returns "METHOD /path -> status" for
- * every response `refused` does not accept, so a failure names each leak.
+ * every response `refused` does not accept, so a failure names each leak (in walk order).
  */
 async function probeWithoutSession(
   layers: MiddlewareLayer[],
   sendFn: Send,
   refused: (res: request.Response) => boolean,
 ): Promise<string[]> {
-  const leaks: string[] = [];
-  for (const { path } of layers) {
+  const probes = layers.flatMap(({ path }) => {
     const base = concretePath(path);
-    for (const probePath of [base, `${base}/walk-probe`]) {
-      for (const method of PROBE_METHODS) {
-        const res = await sendFn(method, probePath);
-        if (!refused(res)) leaks.push(`${method} ${probePath} -> ${res.status}`);
-      }
-    }
-  }
-  return leaks;
+    return [base, `${base}/walk-probe`].flatMap((probePath) =>
+      PROBE_METHODS.map((method) => ({ method, probePath })),
+    );
+  });
+  const results = await inBatches(probes, async ({ method, probePath }) => {
+    const res = await sendFn(method, probePath);
+    return refused(res) ? null : `${method} ${probePath} -> ${String(res.status)}`;
+  });
+  return results.filter((leak) => leak !== null);
 }
 
 /** True when `handle` is one of the handlers `factory` (a vi.fn spy) has returned. */
@@ -260,7 +278,36 @@ const KNOWN_GUARDS: KnownGuard[] = [
 const isKnownGuard = ({ path, handle }: MiddlewareLayer) =>
   KNOWN_GUARDS.some((guard) => guard.path === path && guard.matches(handle));
 
-function requestFor(app: Express, method: string, path: string): request.Test {
+/** An Express app (supertest starts a server per request) or a server already listening. */
+type Target = Express | Server;
+
+/** Servers opened by listen() in the current test; closed after it. */
+const servers: Server[] = [];
+
+/**
+ * One loopback server for many requests. request(app) makes supertest start and stop a new
+ * server for every request; a walk sends hundreds, so it shares one instead.
+ */
+async function listen(app: Express): Promise<Server> {
+  const server = createServer(app);
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return server;
+}
+
+afterEach(async () => {
+  for (const server of servers.splice(0)) {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+});
+
+function requestFor(app: Target, method: string, path: string): request.Test {
   const agent = request(app) as unknown as Record<
     string,
     ((url: string) => request.Test) | undefined
@@ -288,12 +335,33 @@ async function logIn(app: Express): Promise<Session> {
  * A request with a valid CSRF cookie + token and the admin Origin, so CSRF passes and only the
  * session decides. `cookies` are extra "name=value" pairs (e.g. a session).
  */
-async function send(app: Express, method: string, path: string, cookies: string[] = []) {
-  const csrf = await fetchCsrf(app);
-  return requestFor(app, method, path)
+function sendWithCsrf(
+  target: Target,
+  csrf: Csrf,
+  method: string,
+  path: string,
+  cookies: string[] = [],
+) {
+  return requestFor(target, method, path)
     .set('Origin', ADMIN_ORIGIN)
     .set(CSRF_HEADER, csrf.token)
     .set('Cookie', [csrf.cookie, ...cookies].join('; '));
+}
+
+/** sendWithCsrf with a CSRF cookie + token fetched for this one request. */
+async function send(app: Express, method: string, path: string, cookies: string[] = []) {
+  return sendWithCsrf(app, await fetchCsrf(app), method, path, cookies);
+}
+
+/**
+ * For walks: one listening server and one CSRF cookie + token for every probe. The token is an
+ * HMAC of the cookie, tied to no session or request, so sharing it changes nothing the probes
+ * check: CSRF still passes on every probe and only the (missing) session decides.
+ */
+async function walkSender(app: Express): Promise<Send> {
+  const server = await listen(app);
+  const csrf = await fetchCsrf(server);
+  return (method, path) => sendWithCsrf(server, csrf, method, path);
 }
 
 const isUnauthorized = (res: request.Response) =>
@@ -340,9 +408,14 @@ describe('admin router: authentication by default', () => {
     });
     expect(protectedEndpoints.length).toBeGreaterThan(0);
 
-    for (const endpoint of protectedEndpoints) {
+    const sendProbe = await walkSender(app);
+    const responses = await inBatches(protectedEndpoints, async (endpoint) => {
       const [method = '', path = ''] = endpoint.split(' ');
-      const res = await send(app, method, concretePath(path));
+      return { endpoint, res: await sendProbe(method, concretePath(path)) };
+    });
+
+    expect(responses.map((r) => r.endpoint)).toEqual(protectedEndpoints);
+    for (const { endpoint, res } of responses) {
       expect(res.status, endpoint).toBe(401);
       expectUnauthorized(res);
     }
@@ -370,11 +443,7 @@ describe('admin router: authentication by default', () => {
       (m) => isUnder(m.path, ADMIN_API_PATH) && !isKnownGuard(m),
     );
 
-    const leaks = await probeWithoutSession(
-      unguarded,
-      (method, path) => send(app, method, path),
-      isUnauthorized,
-    );
+    const leaks = await probeWithoutSession(unguarded, await walkSender(app), isUnauthorized);
 
     expect(leaks).toEqual([]);
   });
@@ -470,10 +539,10 @@ describe('admin route walk: self-test', () => {
   const fakeGuard: RequestHandler = (_req, res) => {
     res.status(401).end();
   };
-  const plainSend =
-    (app: Express): Send =>
-    (method, path) =>
-      requestFor(app, method, path);
+  const plainSend = async (app: Express): Promise<Send> => {
+    const server = await listen(app);
+    return (method, path) => requestFor(server, method, path);
+  };
 
   /** /api -> /admin, with `configure` filling in the admin router. */
   function throwawayApp(configure: (admin: Router, app: Express) => void) {
@@ -505,7 +574,7 @@ describe('admin route walk: self-test', () => {
 
     const leaks = await probeWithoutSession(
       adminMiddleware,
-      plainSend(app),
+      await plainSend(app),
       (res) => res.status === 401,
     );
 

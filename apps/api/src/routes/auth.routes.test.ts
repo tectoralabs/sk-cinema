@@ -32,6 +32,7 @@ import {
   sessionFrom,
   testAdmin,
   testConfig,
+  testPasswordHash,
   type AuthClient,
   type InMemoryAuthDb,
   type SendOptions,
@@ -53,7 +54,7 @@ const CSRF_BODY = { error: { code: 'CSRF_INVALID', message: 'CSRF validation fai
 let passwordHash: string;
 
 beforeAll(async () => {
-  passwordHash = await hashPassword(PASSWORD);
+  passwordHash = await testPasswordHash(PASSWORD);
 });
 
 afterEach(() => {
@@ -192,6 +193,22 @@ describe('POST /api/admin/auth/login', () => {
     expectProfileOnly(res, admin, db);
     expect(db.refreshTokens).toHaveLength(1);
     expect(db.auditLogs.map((l) => l.action)).toEqual(['LOGIN']);
+  });
+
+  it('accepts a password stored at the production argon2id cost (hashPassword)', async () => {
+    // Every other test stores a cheap testPasswordHash() for speed; this one keeps the real
+    // login path covered against a hash made exactly as the seed script and admins make them.
+    const productionHash = await hashPassword(PASSWORD);
+    expect(productionHash.startsWith('$argon2id$v=19$m=19456,t=2,p=1$')).toBe(true);
+    const { app } = setup({ admin: { passwordHash: productionHash } });
+    const c = await authClient(app);
+
+    const ok = await c.post('/auth/login', { body: { email: EMAIL, password: PASSWORD } });
+    const wrong = await c.post('/auth/login', { body: { email: EMAIL, password: WRONG_PASSWORD } });
+
+    expect(ok.status).toBe(200);
+    expect(wrong.status).toBe(401);
+    expect(wrong.body).toEqual(INVALID_CREDENTIALS_BODY);
   });
 
   it('sets the access and refresh cookies with exact flags and paths', async () => {

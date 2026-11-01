@@ -20,7 +20,6 @@ import {
   REFRESH_COOKIE_NAME,
   REFRESH_COOKIE_PATH,
 } from '../lib/authCookies.js';
-import { hashPassword } from '../lib/password.js';
 import { FORBIDDEN_MESSAGE, requireAuth, requireRole } from '../middleware/auth.js';
 import { errorHandler } from '../middleware/errorHandler.js';
 import { requestLogger } from '../middleware/requestLogger.js';
@@ -36,6 +35,7 @@ import {
   silentLogger,
   testAdmin,
   testConfig,
+  testPasswordHash,
   type AuthClient,
   type InMemoryAuthDb,
   type Session,
@@ -75,7 +75,7 @@ const REFRESH_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 let passwordHash: string;
 
 beforeAll(async () => {
-  passwordHash = await hashPassword(PASSWORD);
+  passwordHash = await testPasswordHash(PASSWORD);
 });
 
 beforeEach(() => {

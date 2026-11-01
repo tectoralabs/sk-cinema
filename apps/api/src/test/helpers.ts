@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import type { Server } from 'node:http';
+import { hash as argon2Hash } from '@node-rs/argon2';
 import { csrfTokenResponseSchema } from '@sk-cinema/shared';
 import type { Express } from 'express';
 import { pino, type Logger } from 'pino';
@@ -60,6 +62,20 @@ export function fakePrisma(parts: Partial<Record<keyof PrismaClient, unknown>> =
     $queryRaw: vi.fn().mockResolvedValue([{ ok: 1 }]),
     ...parts,
   } as unknown as PrismaClient;
+}
+
+/**
+ * argon2id at the lowest cost argon2 accepts (8 KiB, 1 pass, 1 lane). TEST FIXTURES ONLY.
+ * argon2 reads the cost from the stored hash, so the app's real verifyPassword checks these
+ * hashes, and a login against one costs ~0.1 ms instead of ~20 ms at the production cost.
+ * Production hashing (lib/password.ts, 19 MiB / 2 passes) is unchanged and is covered by
+ * password.test.ts and by one login against a hashPassword() hash in auth.routes.test.ts.
+ */
+export const TEST_ARGON2_OPTIONS = { memoryCost: 8, timeCost: 1, parallelism: 1 } as const;
+
+/** A cheap argon2id hash of `password` for a test admin's `passwordHash` (see TEST_ARGON2_OPTIONS). */
+export function testPasswordHash(password: string): Promise<string> {
+  return argon2Hash(password, TEST_ARGON2_OPTIONS);
 }
 
 /** An Admin row with safe defaults. `passwordHash` is a placeholder unless overridden. */
@@ -1495,7 +1511,7 @@ export interface Csrf {
 }
 
 /** GET /csrf, keeping the CSRF cookie and token, as the admin app does on load. */
-export async function fetchCsrf(app: Express): Promise<Csrf> {
+export async function fetchCsrf(app: Express | Server): Promise<Csrf> {
   const res = await request(app).get(`${ADMIN_BASE}/auth/csrf`);
   const cookie = parseSetCookies(res)[CSRF_COOKIE_NAME];
   if (!cookie) throw new Error('no CSRF cookie');
