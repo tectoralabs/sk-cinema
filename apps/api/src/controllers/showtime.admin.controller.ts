@@ -2,6 +2,8 @@ import type {
   AdminShowtimeListQuery,
   AdminShowtimeListResponse,
   AdminShowtimeResponse,
+  ShowtimeBulkCreateBody,
+  ShowtimeBulkCreateResponse,
   ShowtimeCreateBody,
   ShowtimeIdParams,
 } from '@sk-cinema/shared';
@@ -22,6 +24,15 @@ export function createShowtimeAdminController(service: ShowtimeAdminService) {
     res.status(201).json({ showtime } satisfies AdminShowtimeResponse);
   };
 
+  const bulkCreate: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const result = await service.bulkCreate(req.body as ShowtimeBulkCreateBody, {
+      adminId: req.admin.id,
+      ...clientInfo(req),
+    });
+    res.status(201).json(result satisfies ShowtimeBulkCreateResponse);
+  };
+
   const list: RequestHandler = async (req, res) => {
     // validate() replaced req.query with the parsed query, which ParsedQs cannot describe.
     const page = await service.list(req.query as unknown as AdminShowtimeListQuery);
@@ -34,7 +45,7 @@ export function createShowtimeAdminController(service: ShowtimeAdminService) {
     res.json({ showtime } satisfies AdminShowtimeResponse);
   };
 
-  return { create, list, getById };
+  return { create, bulkCreate, list, getById };
 }
 
 export type ShowtimeAdminController = ReturnType<typeof createShowtimeAdminController>;

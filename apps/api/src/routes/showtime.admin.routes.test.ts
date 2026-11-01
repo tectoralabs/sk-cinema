@@ -4,7 +4,9 @@ import {
   adminShowtimeResponseSchema,
   apiErrorSchema,
   DEFAULT_BMS_BASE_URL,
+  showtimeBulkCreateResponseSchema,
   showtimeConflictErrorSchema,
+  showtimePastSlotErrorSchema,
   type AdminShowtime,
 } from '@sk-cinema/shared';
 import type { Express } from 'express';
@@ -25,6 +27,7 @@ import { CSRF_HEADER } from '../middleware/csrf.js';
 import { SESSION_EXPIRED_MESSAGE } from '../services/auth.service.js';
 import { PUBLIC_MOVIES_CACHE_PREFIX } from '../services/movie.public.service.js';
 import {
+  showtimeBulkPastMessage,
   SHOWTIME_IN_PAST_MESSAGE,
   SHOWTIME_MOVIE_ENDED_MESSAGE,
   SHOWTIME_MOVIE_NOT_FOUND_MESSAGE,
@@ -32,6 +35,7 @@ import {
   SHOWTIME_OVERLAP_MESSAGE,
   SHOWTIME_SCREEN_INACTIVE_MESSAGE,
   SHOWTIME_SCREEN_NOT_FOUND_MESSAGE,
+  SHOWTIME_SLOT_IN_PAST_MESSAGE,
 } from '../services/showtime.admin.service.js';
 import {
   ADMIN_BASE,
@@ -692,5 +696,314 @@ describe('showtime create -> get -> list', () => {
     expectError(await createShowtime(s, validBody(s, { time: '20:00' })), 409, 'CONFLICT');
     expect(s.db.showtimes).toHaveLength(1);
     expect(showtimeAudits(s.db)).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/showtimes/bulk
+// ---------------------------------------------------------------------------
+
+const validBulkBody = (s: Setup, overrides: object = {}) => ({
+  movieId: s.movie.id,
+  screenId: s.screen.id,
+  dateFrom: '2026-11-02',
+  dateTo: '2026-11-08',
+  times: ['18:00', '10:00', '14:00'],
+  ...overrides,
+});
+
+const bulkCreate = (s: Setup, body: object | string, options: SendOptions = {}) =>
+  post(s, '/bulk', { ...options, body });
+
+function expectBulkOk(res: request.Response) {
+  expect(res.status).toBe(201);
+  expect(res.headers['cache-control']).toBe('no-store');
+  return showtimeBulkCreateResponseSchema.parse(res.body);
+}
+
+describe('POST /api/admin/showtimes/bulk: session, CSRF and roles', () => {
+  it('answers 401 without a session, before touching the database', async () => {
+    const s = await setup();
+
+    const res = await bulkCreate(s, validBulkBody(s), { cookies: [] });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(s.db.showtimes).toEqual([]);
+  });
+
+  it.each([
+    ['a missing CSRF token', { token: null }],
+    ['a wrong CSRF token', { token: 'not-the-token' }],
+    ['a foreign Origin', { origin: 'https://evil.example' }],
+  ] as const)('answers 403 for %s, even with a session', async (_name, overrides) => {
+    const s = await setup();
+
+    const res = await bulkCreate(s, validBulkBody(s), overrides);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(CSRF_BODY);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(s.db.showtimes).toEqual([]);
+    expect(showtimeAudits(s.db)).toEqual([]);
+  });
+
+  it.each<AdminRole>(['EDITOR', 'SUPER_ADMIN'])('serves a %s', async (role) => {
+    const s = await setup({ role });
+
+    expect(
+      expectBulkOk(await bulkCreate(s, validBulkBody(s, { dateTo: '2026-11-02' }))).created,
+    ).toBe(3);
+
+    expect(showtimeAudits(s.db)).toEqual(
+      Array(3).fill(expect.objectContaining({ adminId: s.adminId, userAgent: TEST_USER_AGENT })),
+    );
+  });
+});
+
+describe('POST /api/admin/showtimes/bulk', () => {
+  it('creates 7 days x 3 times (201): sorted items, 21 audits in one batch, then drops the public cache', async () => {
+    const s = await setup();
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+    const result = expectBulkOk(await bulkCreate(s, validBulkBody(s)));
+
+    expect(result.created).toBe(21);
+    const starts = result.items.map((item) => item.startsAt);
+    expect(starts).toEqual([...starts].sort());
+    expect(s.db.showtimes).toHaveLength(21);
+    expect(s.db.locks).toEqual([
+      { table: 'Movie', id: s.movie.id },
+      { table: 'Screen', id: s.screen.id },
+    ]);
+    const audits = showtimeAudits(s.db);
+    expect(audits).toHaveLength(21);
+    expect(new Set(audits.map((row) => row.entityId))).toEqual(
+      new Set(result.items.map((item) => item.id)),
+    );
+    const batchIds = new Set(
+      audits.map((row) => (row.details as Record<string, unknown>)['batchId']),
+    );
+    expect(batchIds.size).toBe(1);
+    expect(audits[0]).toMatchObject({ action: 'CREATE', adminId: s.adminId, entity: 'Showtime' });
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+    const auditOrder = s.db.spies.auditLog.createMany.mock.invocationCallOrder[0] ?? Infinity;
+    expect(invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+  });
+
+  it('00:30 is the UTC instant of the evening before; "imax 3d" is stored as "IMAX 3D"', async () => {
+    const s = await setup();
+
+    const { items } = expectBulkOk(
+      await bulkCreate(
+        s,
+        validBulkBody(s, { dateTo: '2026-11-02', times: ['00:30'], format: 'imax 3d' }),
+      ),
+    );
+
+    expect(items).toEqual([
+      expect.objectContaining({
+        startsAt: '2026-11-01T19:00:00.000Z',
+        colomboDate: '2026-11-02',
+        time: '00:30',
+        format: 'IMAX 3D',
+        bookingUrl: `${DEFAULT_BMS_BASE_URL}/20261102`,
+      }),
+    ]);
+    expect(s.db.showtimes[0]).toMatchObject({ format: 'IMAX 3D', bookingUrlOverride: null });
+  });
+
+  describe('validation (400, nothing written)', () => {
+    it.each([
+      ['more than 31 days', { dateFrom: '2026-11-02', dateTo: '2026-12-03' }, ['body', 'dateTo']],
+      [
+        'dateTo before dateFrom',
+        { dateFrom: '2026-11-05', dateTo: '2026-11-04' },
+        ['body', 'dateTo'],
+      ],
+      [
+        '13 times',
+        { times: Array.from({ length: 13 }, (_, i) => `${String(i + 10)}:00`) },
+        ['body', 'times'],
+      ],
+      ['duplicate times', { times: ['10:00', '14:00', '10:00'] }, ['body', 'times', 2]],
+      ['no times', { times: [] }, ['body', 'times']],
+      ['a bad time', { times: ['10:00', '24:00'] }, ['body', 'times', 1]],
+      ['a booking URL override', { bookingUrlOverride: OVERRIDE }, ['body']],
+      ['an unknown key', { extra: 1 }, ['body']],
+      ['an impossible date', { dateFrom: '2026-02-30' }, ['body', 'dateFrom']],
+      ['a bad screen id', { screenId: 'nope' }, ['body', 'screenId']],
+    ] as const)('rejects %s', async (_name, overrides, path) => {
+      const s = await setup();
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const error = expectError(
+        await bulkCreate(s, validBulkBody(s, overrides)),
+        400,
+        'VALIDATION_ERROR',
+      );
+
+      expect(error.details).toEqual(expect.arrayContaining([expect.objectContaining({ path })]));
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expectNothingWritten(s, invalidate);
+    });
+
+    it('rejects query parameters', async () => {
+      const s = await setup();
+
+      const error = expectError(
+        await post(s, '/bulk?dryRun=true', { body: validBulkBody(s) }),
+        400,
+        'VALIDATION_ERROR',
+      );
+
+      expect(error.details).toEqual([expect.objectContaining({ path: ['query'] })]);
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects slots in the past (by the app clock), listing each one', async () => {
+      const s = await setup();
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const res = await bulkCreate(
+        s,
+        validBulkBody(s, { dateFrom: '2026-11-01', times: ['20:00', '09:00'] }),
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.headers['cache-control']).toBe('no-store');
+      expect(showtimePastSlotErrorSchema.parse(res.body)).toEqual({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: showtimeBulkPastMessage(1),
+          details: [
+            {
+              path: ['body', 'times', 1],
+              message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
+              requested: { date: '2026-11-01', time: '09:00' },
+            },
+          ],
+        },
+      });
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expectNothingWritten(s, invalidate);
+    });
+  });
+
+  it('answers 404 for an unknown movie or screen and 409 for an ENDED movie or a hidden screen', async () => {
+    const ended = testMovie({ slug: 'ended', title: 'Ended', status: 'ENDED' });
+    const hidden = testScreen({ name: 'Screen 2', isActive: false });
+    const s = await setup({ movies: [ended], screens: [hidden] });
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+    expect(
+      expectError(
+        await bulkCreate(s, validBulkBody(s, { movieId: randomUUID() })),
+        404,
+        'NOT_FOUND',
+      ),
+    ).toEqual({
+      code: 'NOT_FOUND',
+      message: SHOWTIME_MOVIE_NOT_FOUND_MESSAGE,
+      details: [{ path: ['body', 'movieId'], message: SHOWTIME_MOVIE_NOT_FOUND_MESSAGE }],
+    });
+    expect(
+      expectError(
+        await bulkCreate(s, validBulkBody(s, { screenId: randomUUID() })),
+        404,
+        'NOT_FOUND',
+      ),
+    ).toMatchObject({ message: SHOWTIME_SCREEN_NOT_FOUND_MESSAGE });
+    expect(
+      expectError(await bulkCreate(s, validBulkBody(s, { movieId: ended.id })), 409, 'CONFLICT'),
+    ).toMatchObject({
+      message: SHOWTIME_MOVIE_ENDED_MESSAGE,
+      details: [{ path: ['body', 'movieId'] }],
+    });
+    expect(
+      expectError(await bulkCreate(s, validBulkBody(s, { screenId: hidden.id })), 409, 'CONFLICT'),
+    ).toMatchObject({
+      message: SHOWTIME_SCREEN_INACTIVE_MESSAGE,
+      details: [{ path: ['body', 'screenId'] }],
+    });
+    expectNothingWritten(s, invalidate);
+  });
+
+  it('answers 409 with conflict details (saved and in-batch); nothing written', async () => {
+    const s = await setup({ showtimes: [{ startsAt: colombo('2026-11-02', '15:00') }] });
+    const existing = s.db.showtimes[0];
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+    const res = await bulkCreate(
+      s,
+      validBulkBody(s, { dateTo: '2026-11-02', times: ['14:00', '21:00', '22:00'] }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(showtimeConflictErrorSchema.parse(res.body)).toEqual({
+      error: {
+        code: 'CONFLICT',
+        message: '2 of the requested showtimes overlap other showtimes on this screen',
+        details: [
+          {
+            path: ['body', 'times', 0],
+            message:
+              'Overlaps "Main Feature" (15:00–17:00), counting the 15-minute gap between shows',
+            requested: { date: '2026-11-02', time: '14:00' },
+            conflict: {
+              showtimeId: existing?.id,
+              movieTitle: 'Main Feature',
+              startsAt: '2026-11-02T09:30:00.000Z',
+              endsAt: '2026-11-02T11:30:00.000Z',
+            },
+          },
+          {
+            path: ['body', 'times', 2],
+            message:
+              'Overlaps another showtime in this request: "Main Feature" (21:00–23:00), counting the 15-minute gap between shows',
+            requested: { date: '2026-11-02', time: '22:00' },
+            conflict: {
+              showtimeId: null,
+              movieTitle: 'Main Feature',
+              startsAt: '2026-11-02T15:30:00.000Z',
+              endsAt: '2026-11-02T17:30:00.000Z',
+            },
+          },
+        ],
+      },
+    });
+    expectNothingWritten(s, invalidate, 1);
+  });
+
+  it.each([
+    ['the showtime insert', 'showtime', 'createMany'],
+    ['the audit insert', 'auditLog', 'createMany'],
+  ] as const)(
+    'answers a generic 500 and writes nothing when %s fails',
+    async (_name, model, operation) => {
+      const s = await setup();
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+      s.db.injectFault(model, operation, { error: new Error('db exploded at 10.0.0.5') });
+
+      const res = await bulkCreate(s, validBulkBody(s));
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual(INTERNAL_BODY);
+      expect(JSON.stringify(res.body)).not.toContain('10.0.0.5');
+      expectNothingWritten(s, invalidate);
+    },
+  );
+
+  it('bulk-created showtimes are listed straight away and block an overlapping single create', async () => {
+    const s = await setup();
+
+    const { items } = expectBulkOk(await bulkCreate(s, validBulkBody(s, { dateTo: '2026-11-03' })));
+
+    const page = adminShowtimeListResponseSchema.parse((await getShowtimes(s, '')).body);
+    expect(page.items).toEqual(items);
+    expectError(await createShowtime(s, validBody(s, { time: '11:00' })), 409, 'CONFLICT');
+    expect(s.db.showtimes).toHaveLength(6);
   });
 });

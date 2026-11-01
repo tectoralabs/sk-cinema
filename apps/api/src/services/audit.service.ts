@@ -49,16 +49,27 @@ export type AuditDb = Pick<Prisma.TransactionClient, 'auditLog'>;
  * secrets, in `details` or anywhere else. Audit rows are read by admins and kept long-term.
  */
 export async function writeAudit(db: AuditDb, entry: AuditEntry): Promise<void> {
-  await db.auditLog.create({
-    data: {
-      action: entry.action,
-      adminId: entry.adminId ?? null,
-      entity: entry.entity,
-      entityId: entry.entityId ?? null,
-      ...(entry.details && { details: entry.details }),
-      ipAddress: fitColumn(entry.ipAddress, IP_ADDRESS_MAX_LENGTH),
-      userAgent: fitColumn(entry.userAgent, USER_AGENT_MAX_LENGTH),
-    },
-    select: { id: true },
-  });
+  await db.auditLog.create({ data: auditRow(entry), select: { id: true } });
+}
+
+/**
+ * Writes one AuditLog row per entry with a single multi-row INSERT (nothing for no entries),
+ * e.g. a bulk create inside its transaction. Same SECURITY rule as writeAudit.
+ */
+export async function writeAuditMany(db: AuditDb, entries: readonly AuditEntry[]): Promise<void> {
+  if (entries.length === 0) return;
+  await db.auditLog.createMany({ data: entries.map(auditRow) });
+}
+
+/** An entry as AuditLog columns: missing values as NULL, client values fitted to the columns. */
+function auditRow(entry: AuditEntry): Prisma.AuditLogCreateManyInput {
+  return {
+    action: entry.action,
+    adminId: entry.adminId ?? null,
+    entity: entry.entity,
+    entityId: entry.entityId ?? null,
+    ...(entry.details && { details: entry.details }),
+    ipAddress: fitColumn(entry.ipAddress, IP_ADDRESS_MAX_LENGTH),
+    userAgent: fitColumn(entry.userAgent, USER_AGENT_MAX_LENGTH),
+  };
 }

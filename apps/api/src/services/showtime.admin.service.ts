@@ -1,11 +1,17 @@
+import { randomUUID } from 'node:crypto';
 import {
   ERROR_CODES,
   normalizeShowtimeFormat,
+  SHOWTIME_BULK_MAX_DAYS,
+  SHOWTIME_BULK_MAX_DETAILS,
   type AdminShowtime,
   type AdminShowtimeListQuery,
   type AdminShowtimeListResponse,
+  type ShowtimeBulkCreateBody,
+  type ShowtimeBulkCreateResponse,
   type ShowtimeConflictDetail,
   type ShowtimeCreateBody,
+  type ShowtimePastSlotDetail,
 } from '@sk-cinema/shared';
 import type { Logger } from 'pino';
 import { Prisma, type PrismaClient } from '../generated/prisma/client.js';
@@ -20,14 +26,14 @@ import {
   type ShowtimeOverlap,
   type ShowtimeSlot,
 } from '../lib/showtimeOverlap.js';
-import { writeAudit, type AuditActor } from './audit.service.js';
+import { writeAudit, writeAuditMany, type AuditActor } from './audit.service.js';
 import { resolveBookingUrl } from './bmsLink.js';
 import { invalidatePublicMovies } from './movie.public.service.js';
 import { createSettingsService, type SettingsService } from './settings.service.js';
 
 /*
- * Admin showtimes: create one, get one, list. T11 (bulk create) and T12 (update, delete, bulk
- * delete) build on the exports here: adminShowtimeSelect + toAdminShowtime for responses,
+ * Admin showtimes: create one, bulk create, get one, list. T12 (update, delete, bulk delete)
+ * builds on the exports here: adminShowtimeSelect + toAdminShowtime for responses,
  * checkScheduleTargets for the movie/screen rules, findScreenConflicts for the overlap check
  * and showtimeConflictError for the 409.
  *
@@ -50,6 +56,29 @@ export const SHOWTIME_SCREEN_INACTIVE_MESSAGE =
   'This screen is hidden. Show it before adding showtimes.';
 export const SHOWTIME_IN_PAST_MESSAGE = 'Choose a date and time in the future';
 export const SHOWTIME_OVERLAP_MESSAGE = 'This showtime overlaps another showtime on this screen';
+/** Bulk create: `details` message of one slot at or before now. */
+export const SHOWTIME_SLOT_IN_PAST_MESSAGE = 'This date and time is in the past';
+
+/** Bulk create 400 message: how many of the requested slots are at or before now (all of them). */
+export function showtimeBulkPastMessage(pastCount: number): string {
+  return pastCount === 1
+    ? '1 of the requested showtimes is in the past. Choose dates and times in the future.'
+    : `${String(pastCount)} of the requested showtimes are in the past. Choose dates and times in the future.`;
+}
+
+/**
+ * Bulk create 409 message: how many requested slots clash (each counted once, whatever the
+ * number of shows it overlaps), plus the number of clashes when `details` had to be cut.
+ */
+export function showtimeBulkOverlapMessage(slotCount: number, conflictCount: number): string {
+  const slots =
+    slotCount === 1
+      ? '1 of the requested showtimes overlaps other showtimes on this screen'
+      : `${String(slotCount)} of the requested showtimes overlap other showtimes on this screen`;
+  return conflictCount > SHOWTIME_BULK_MAX_DETAILS
+    ? `${slots}. Showing the first ${String(SHOWTIME_BULK_MAX_DETAILS)} of ${String(conflictCount)} conflicts.`
+    : slots;
+}
 /**
  * The insert hit a foreign key (P2003): the movie or screen vanished after it was locked and
  * checked. Cannot happen on Postgres while the row locks are held; answered as a 409, not a 500.
@@ -179,7 +208,7 @@ export const ADMIN_SHOWTIME_LIST_ORDER_BY = [
 ] as const satisfies Prisma.ShowtimeOrderByWithRelationInput[];
 
 // ---------------------------------------------------------------------------
-// Scheduling rules (create now; bulk create and update in T11 / T12)
+// Scheduling rules (create and bulk create; update in T12)
 // ---------------------------------------------------------------------------
 
 /** A 404 / 409 / 400 about one body field, shaped like validation details. */
@@ -293,26 +322,41 @@ export async function findScreenConflicts<C extends ShowtimeCandidate>(
   return findShowtimeConflicts({ candidates, existing, gapMinutes });
 }
 
+export interface ShowtimeConflictErrorOptions {
+  /** The error message. Defaults to SHOWTIME_OVERLAP_MESSAGE (one showtime). */
+  message?: string;
+  /** Keep only the first `maxDetails` clashes in `details` (the message should give the total). */
+  maxDetails?: number;
+}
+
 /**
  * The 409 CONFLICT for overlaps (shared showtimeConflictErrorSchema): one detail per clash,
- * each with the candidate's `path` and `requested` date/time and the show it overlaps.
+ * each with the candidate's `path` and `requested` date/time and the show it overlaps. The
+ * span names the Colombo date too when it differs from the requested date (e.g. a show that
+ * started the evening before). A clash with another slot of the same request (`showtimeId:
+ * null`) says so.
  */
 export function showtimeConflictError(
   overlaps: readonly ShowtimeOverlap<ShowtimeCandidate>[],
   gapMinutes: number,
+  { message = SHOWTIME_OVERLAP_MESSAGE, maxDetails }: ShowtimeConflictErrorOptions = {},
 ): AppError {
-  const details: ShowtimeConflictDetail[] = overlaps.map(({ candidate, conflict }) => {
-    const span = `${toColomboTime(conflict.startsAt)}–${toColomboTime(conflict.endsAt)}`;
+  const shown = maxDetails === undefined ? overlaps : overlaps.slice(0, maxDetails);
+  const details: ShowtimeConflictDetail[] = shown.map(({ candidate, conflict }) => {
+    const conflictDate = toColomboDate(conflict.startsAt);
+    const day = conflictDate === candidate.requested.date ? '' : `${conflictDate} `;
+    const span = `${day}${toColomboTime(conflict.startsAt)}–${toColomboTime(conflict.endsAt)}`;
     const gap =
       gapMinutes > 0 ? `, counting the ${String(gapMinutes)}-minute gap between shows` : '';
+    const what = conflict.showtimeId === null ? 'another showtime in this request: ' : '';
     return {
       path: [...candidate.path],
-      message: `Overlaps "${conflict.movieTitle}" (${span})${gap}`,
+      message: `Overlaps ${what}"${conflict.movieTitle}" (${span})${gap}`,
       requested: { ...candidate.requested },
       conflict: toShowtimeConflict(conflict),
     };
   });
-  return new AppError(409, ERROR_CODES.CONFLICT, SHOWTIME_OVERLAP_MESSAGE, details);
+  return new AppError(409, ERROR_CODES.CONFLICT, message, details);
 }
 
 const isForeignKeyError = (error: unknown) =>
@@ -324,6 +368,76 @@ class TargetGone extends Error {
     super('Movie or screen gone before the insert');
     this.name = 'TargetGone';
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk create
+// ---------------------------------------------------------------------------
+
+/** One requested slot of a bulk create: a Colombo date + time and its UTC instant. */
+export interface BulkSlot {
+  date: string;
+  time: string;
+  /** Index of `time` in the request's `times` (the `path` of its errors). */
+  timeIndex: number;
+  startsAt: Date;
+}
+
+/**
+ * Every date from `dateFrom` to `dateTo` (inclusive) at every time in `times`, in Colombo wall
+ * clock, ordered by date then by the order of `times`: at most 31 x 12 = 372 slots. Throws
+ * RangeError on a range the body schema would have refused (a programmer error).
+ */
+export function expandBulkSlots({
+  dateFrom,
+  dateTo,
+  times,
+}: Pick<ShowtimeBulkCreateBody, 'dateFrom' | 'dateTo' | 'times'>): BulkSlot[] {
+  const dates: string[] = [];
+  for (let date = dateFrom; date <= dateTo; date = addDays(date, 1)) {
+    if (dates.length === SHOWTIME_BULK_MAX_DAYS) {
+      throw new RangeError(`More than ${String(SHOWTIME_BULK_MAX_DAYS)} days`);
+    }
+    dates.push(date);
+  }
+  if (dates.length === 0) throw new RangeError('dateTo is before dateFrom');
+  return dates.flatMap((date) =>
+    times.map((time, timeIndex) => ({
+      date,
+      time,
+      timeIndex,
+      startsAt: fromColomboDateTime(date, time),
+    })),
+  );
+}
+
+/** The bulk create 400 for slots at or before now: all counted, the first 50 listed. */
+function bulkPastError(past: readonly BulkSlot[]): AppError {
+  const details: ShowtimePastSlotDetail[] = past
+    .slice(0, SHOWTIME_BULK_MAX_DETAILS)
+    .map((slot) => ({
+      path: ['body', 'times', slot.timeIndex],
+      message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
+      requested: { date: slot.date, time: slot.time },
+    }));
+  return new AppError(
+    400,
+    ERROR_CODES.VALIDATION_ERROR,
+    showtimeBulkPastMessage(past.length),
+    details,
+  );
+}
+
+/** The bulk create 409: every clash counted, the first 50 listed (see showtimeConflictError). */
+function bulkConflictError(
+  overlaps: readonly ShowtimeOverlap<ShowtimeCandidate>[],
+  gapMinutes: number,
+): AppError {
+  const slotCount = new Set(overlaps.map((overlap) => overlap.candidateIndex)).size;
+  return showtimeConflictError(overlaps, gapMinutes, {
+    message: showtimeBulkOverlapMessage(slotCount, overlaps.length),
+    maxDetails: SHOWTIME_BULK_MAX_DETAILS,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +556,118 @@ export function createShowtimeAdminService({
       // Only after the commit, so no request can re-cache the public pages without it.
       invalidatePublicMovies(cache);
       return toAdminShowtime(outcome.row, outcome.baseUrl, logger);
+    },
+
+    /**
+     * Creates one showtime per Colombo date in [dateFrom, dateTo] at each of `times`, all or
+     * nothing:
+     * 1. any slot at or before now: 400 listing the past slots (nothing read or written);
+     * 2. in one transaction: lock and check the movie, then the screen (checkScheduleTargets);
+     *    read the booking settings; check every slot against the live showtimes on the screen
+     *    and against the other slots (409 listing the clashes, nothing written);
+     * 3. one multi-row insert, then the inserted rows read back (below), then one CREATE audit
+     *    row per showtime sharing a `batchId`, in one multi-row insert;
+     * then, only after the commit, the public movie cache is dropped.
+     *
+     * Reading back: by movie, screen and `startsAt IN (...)` among live rows. That is exactly
+     * the inserted rows: the overlap check just proved no live showtime on the screen starts at
+     * any of these instants (a show always clashes with one starting at the same time), the
+     * slots are distinct instants, and the screen lock keeps every other writer out until the
+     * commit. A count mismatch is a bug: it throws, so the transaction rolls back (a 500). IDs
+     * stay database-generated (UUIDv7, like every other row).
+     */
+    async bulkCreate(
+      input: ShowtimeBulkCreateBody,
+      actor: AuditActor,
+    ): Promise<ShowtimeBulkCreateResponse> {
+      const slots = expandBulkSlots(input);
+      const nowMs = now().getTime();
+      const past = slots.filter((slot) => slot.startsAt.getTime() <= nowMs);
+      if (past.length > 0) throw bulkPastError(past);
+
+      let outcome: { rows: AdminShowtimeRow[]; baseUrl: string };
+      try {
+        outcome = await db.$transaction(async (tx) => {
+          const { movie, screen } = await checkScheduleTargets(tx, input.movieId, input.screenId);
+          const booking = await settingsIn(tx).getBookingSettings();
+
+          const candidates: ShowtimeCandidate[] = slots.map((slot) => ({
+            showtimeId: null,
+            screenId: screen.id,
+            movieTitle: movie.title,
+            startsAt: slot.startsAt,
+            durationMinutes: movie.durationMinutes,
+            path: ['body', 'times', slot.timeIndex],
+            requested: { date: slot.date, time: slot.time },
+          }));
+          const overlaps = await findScreenConflicts(tx, candidates, booking.showGapMinutes);
+          if (overlaps.length > 0) throw bulkConflictError(overlaps, booking.showGapMinutes);
+
+          try {
+            await tx.showtime.createMany({
+              data: slots.map((slot) => ({
+                movieId: movie.id,
+                screenId: screen.id,
+                startsAt: slot.startsAt,
+                // Omitted: the database default ("2D").
+                ...(input.format !== undefined && { format: input.format }),
+              })),
+            });
+          } catch (error) {
+            if (isForeignKeyError(error)) throw new TargetGone();
+            throw error;
+          }
+
+          const rows = await tx.showtime.findMany({
+            where: {
+              movieId: movie.id,
+              screenId: screen.id,
+              deletedAt: null,
+              startsAt: { in: slots.map((slot) => slot.startsAt) },
+            },
+            orderBy: [...ADMIN_SHOWTIME_LIST_ORDER_BY],
+            select: adminShowtimeSelect,
+          });
+          if (rows.length !== slots.length) {
+            throw new Error(
+              `Bulk showtime create read back ${String(rows.length)} rows, expected ${String(slots.length)}`,
+            );
+          }
+
+          const batchId = randomUUID();
+          await writeAuditMany(
+            tx,
+            rows.map((row) => ({
+              action: 'CREATE' as const,
+              adminId: actor.adminId,
+              entity: AUDIT_ENTITY,
+              entityId: row.id,
+              // Admin configuration, stored in the audit table (never logged).
+              details: {
+                movieId: movie.id,
+                screenId: screen.id,
+                startsAt: row.startsAt.toISOString(),
+                format: row.format,
+                bookingUrlOverride: row.bookingUrlOverride,
+                batchId,
+              },
+              ipAddress: actor.ipAddress,
+              userAgent: actor.userAgent,
+            })),
+          );
+          return { rows, baseUrl: booking.bmsBaseUrl };
+        });
+      } catch (error) {
+        if (error instanceof TargetGone) {
+          throw new AppError(409, ERROR_CODES.CONFLICT, SHOWTIME_TARGET_CHANGED_MESSAGE);
+        }
+        throw error;
+      }
+
+      // Only after the commit, so no request can re-cache the public pages without them.
+      invalidatePublicMovies(cache);
+      const items = outcome.rows.map((row) => toAdminShowtime(row, outcome.baseUrl, logger));
+      return { created: items.length, items };
     },
 
     /**

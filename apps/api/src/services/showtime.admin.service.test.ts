@@ -5,10 +5,15 @@ import {
   adminShowtimeSchema,
   DEFAULT_BMS_BASE_URL,
   MOVIE_DURATION_MAX_MINUTES,
+  SHOWTIME_BULK_MAX_DETAILS,
+  showtimeBulkCreateBodySchema,
+  showtimeBulkCreateResponseSchema,
   showtimeConflictDetailsSchema,
   showtimeConflictErrorSchema,
   showtimeCreateBodySchema,
+  showtimePastSlotErrorSchema,
   type AdminShowtimeListQueryInput,
+  type ShowtimeBulkCreateBodyInput,
   type ShowtimeCreateBodyInput,
 } from '@sk-cinema/shared';
 import { describe, expect, it, vi } from 'vitest';
@@ -31,6 +36,9 @@ import {
   ADMIN_SHOWTIME_LIST_ORDER_BY,
   adminShowtimeListWhere,
   createShowtimeAdminService,
+  expandBulkSlots,
+  showtimeBulkOverlapMessage,
+  showtimeBulkPastMessage,
   SHOWTIME_IN_PAST_MESSAGE,
   SHOWTIME_MOVIE_DELETED_MESSAGE,
   SHOWTIME_MOVIE_ENDED_MESSAGE,
@@ -40,6 +48,7 @@ import {
   SHOWTIME_SCREEN_DELETED_MESSAGE,
   SHOWTIME_SCREEN_INACTIVE_MESSAGE,
   SHOWTIME_SCREEN_NOT_FOUND_MESSAGE,
+  SHOWTIME_SLOT_IN_PAST_MESSAGE,
   SHOWTIME_TARGET_CHANGED_MESSAGE,
   toAdminShowtime,
   UNNORMALISABLE_FORMAT,
@@ -960,5 +969,594 @@ describe('showtime admin service: getById', () => {
       code: 'NOT_FOUND',
       message: SHOWTIME_NOT_FOUND_MESSAGE,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulk create
+// ---------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const bulkBody = (s: Setup, overrides: Partial<ShowtimeBulkCreateBodyInput> = {}) =>
+  showtimeBulkCreateBodySchema.parse({
+    movieId: s.movie.id,
+    screenId: s.screen.id,
+    dateFrom: '2026-11-02',
+    dateTo: '2026-11-08',
+    times: ['18:00', '10:00', '14:00'],
+    ...overrides,
+  });
+
+const bulkCreate = (s: Setup, overrides: Partial<ShowtimeBulkCreateBodyInput> = {}) =>
+  s.service.bulkCreate(bulkBody(s, overrides), s.actor);
+
+/** The audit `details` of a bulk-created row. */
+const auditDetails = (row: { details: unknown }) => row.details as Record<string, unknown>;
+
+describe('expandBulkSlots', () => {
+  it('every date (inclusive) at every time, by date then by the order of times', () => {
+    const slots = expandBulkSlots({
+      dateFrom: '2026-11-30',
+      dateTo: '2026-12-01',
+      times: ['18:00', '00:30'],
+    });
+    expect(
+      slots.map((slot) => [slot.date, slot.time, slot.timeIndex, slot.startsAt.toISOString()]),
+    ).toEqual([
+      ['2026-11-30', '18:00', 0, '2026-11-30T12:30:00.000Z'],
+      ['2026-11-30', '00:30', 1, '2026-11-29T19:00:00.000Z'],
+      ['2026-12-01', '18:00', 0, '2026-12-01T12:30:00.000Z'],
+      ['2026-12-01', '00:30', 1, '2026-11-30T19:00:00.000Z'],
+    ]);
+  });
+
+  it('a single day; 31 days x 12 times is 372 slots', () => {
+    expect(
+      expandBulkSlots({ dateFrom: '2026-11-02', dateTo: '2026-11-02', times: ['10:00'] }),
+    ).toHaveLength(1);
+    const times = Array.from({ length: 12 }, (_, i) => `${String(i).padStart(2, '0')}:00`);
+    expect(expandBulkSlots({ dateFrom: '2026-12-01', dateTo: '2026-12-31', times })).toHaveLength(
+      372,
+    );
+  });
+
+  it('throws RangeError for a range the body schema refuses', () => {
+    expect(() =>
+      expandBulkSlots({ dateFrom: '2026-11-02', dateTo: '2026-11-01', times: ['10:00'] }),
+    ).toThrow(RangeError);
+    expect(() =>
+      expandBulkSlots({ dateFrom: '2026-12-01', dateTo: '2027-01-01', times: ['10:00'] }),
+    ).toThrow(RangeError);
+  });
+});
+
+describe('showtime admin service: bulkCreate', () => {
+  it('7 days x 3 times: 21 rows, sorted strict response, 21 CREATE audits sharing one batchId', async () => {
+    const s = setup();
+
+    const result = await bulkCreate(s);
+
+    expect(showtimeBulkCreateResponseSchema.parse(result)).toEqual(result);
+    expect(result.created).toBe(21);
+    expect(s.db.showtimes).toHaveLength(21);
+    const starts = result.items.map((item) => item.startsAt);
+    expect(starts).toEqual([...starts].sort());
+    expect(result.items[0]).toMatchObject({ colomboDate: '2026-11-02', time: '10:00' });
+    expect(result.items.at(-1)).toMatchObject({ colomboDate: '2026-11-08', time: '18:00' });
+    // Every item is a stored row, and every row is returned once.
+    expect(new Set(result.items.map((item) => item.id))).toEqual(
+      new Set(s.db.showtimes.map((row) => row.id)),
+    );
+    for (const item of result.items) {
+      expect(item).toMatchObject({
+        movie: { id: s.movie.id, title: 'Main Feature', durationMinutes: 120 },
+        screen: { id: s.screen.id, name: 'Screen 1' },
+        format: '2D',
+        bookingUrlOverride: null,
+        bookingUrl: `${DEFAULT_BMS_BASE_URL}/${item.colomboDate.replaceAll('-', '')}`,
+        deletedAt: null,
+      });
+    }
+
+    const audits = showtimeAudits(s);
+    expect(audits).toHaveLength(21);
+    const batchIds = new Set(audits.map((row) => auditDetails(row)['batchId']));
+    expect(batchIds.size).toBe(1);
+    const [batchId] = [...batchIds];
+    expect(batchId).toMatch(UUID_RE);
+    expect(new Set(audits.map((row) => row.entityId))).toEqual(
+      new Set(result.items.map((item) => item.id)),
+    );
+    for (const row of audits) {
+      const stored = s.db.showtimes.find((st) => st.id === row.entityId);
+      expect(row).toMatchObject({
+        action: 'CREATE',
+        adminId: s.admin.id,
+        entity: 'Showtime',
+        ipAddress: IP,
+        userAgent: UA,
+        details: {
+          movieId: s.movie.id,
+          screenId: s.screen.id,
+          startsAt: stored?.startsAt.toISOString(),
+          format: '2D',
+          bookingUrlOverride: null,
+          batchId,
+        },
+      });
+    }
+  });
+
+  it('one transaction: locks [Movie, Screen] once, one settings read, one insert, one audit insert, then the cache', async () => {
+    const s = setup();
+
+    await bulkCreate(s);
+
+    expect(s.db.spies.$transaction).toHaveBeenCalledTimes(1);
+    expect(s.db.locks).toEqual([
+      { table: 'Movie', id: s.movie.id },
+      { table: 'Screen', id: s.screen.id },
+    ]);
+    expect(s.db.spies.setting.findMany).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.showtime.createMany).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.showtime.create).not.toHaveBeenCalled();
+    expect(s.db.spies.auditLog.createMany).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.auditLog.create).not.toHaveBeenCalled();
+    expect(s.invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+    const auditOrder = s.db.spies.auditLog.createMany.mock.invocationCallOrder[0] ?? Infinity;
+    expect(s.invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+  });
+
+  it('reads the inserted rows back by movie, screen and the exact instants, live only', async () => {
+    const s = setup();
+
+    await bulkCreate(s, { dateTo: '2026-11-02', times: ['10:00', '14:00'] });
+
+    // The second findMany (the first is the overlap query).
+    const [args] = s.db.spies.showtime.findMany.mock.calls[1] ?? [];
+    expect(args).toMatchObject({
+      where: {
+        movieId: s.movie.id,
+        screenId: s.screen.id,
+        deletedAt: null,
+        startsAt: { in: [colombo('2026-11-02', '10:00'), colombo('2026-11-02', '14:00')] },
+      },
+      orderBy: [...ADMIN_SHOWTIME_LIST_ORDER_BY],
+    });
+  });
+
+  it('00:30 is stored as the UTC instant of the evening before, with the Colombo date link', async () => {
+    const s = setup();
+
+    const { items } = await bulkCreate(s, { dateTo: '2026-11-02', times: ['00:30'] });
+
+    expect(items).toEqual([
+      expect.objectContaining({
+        startsAt: '2026-11-01T19:00:00.000Z',
+        colomboDate: '2026-11-02',
+        time: '00:30',
+        bookingUrl: `${DEFAULT_BMS_BASE_URL}/20261102`,
+      }),
+    ]);
+  });
+
+  it('a range across a month end', async () => {
+    const s = setup({ settings: [testSetting('bmsBaseUrl', CUSTOM_BASE)] });
+
+    const { items } = await bulkCreate(s, {
+      dateFrom: '2026-11-29',
+      dateTo: '2026-12-02',
+      times: ['00:30', '20:00'],
+    });
+
+    expect(items.map((item) => [item.colomboDate, item.time, item.bookingUrl])).toEqual([
+      ['2026-11-29', '00:30', `${CUSTOM_BASE}/20261129`],
+      ['2026-11-29', '20:00', `${CUSTOM_BASE}/20261129`],
+      ['2026-11-30', '00:30', `${CUSTOM_BASE}/20261130`],
+      ['2026-11-30', '20:00', `${CUSTOM_BASE}/20261130`],
+      ['2026-12-01', '00:30', `${CUSTOM_BASE}/20261201`],
+      ['2026-12-01', '20:00', `${CUSTOM_BASE}/20261201`],
+      ['2026-12-02', '00:30', `${CUSTOM_BASE}/20261202`],
+      ['2026-12-02', '20:00', `${CUSTOM_BASE}/20261202`],
+    ]);
+    expect(s.db.spies.setting.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('stores "imax 3d" as "IMAX 3D" on every row; without a format, the default "2D"', async () => {
+    const s = setup();
+
+    const imax = await bulkCreate(s, { dateTo: '2026-11-03', format: 'imax 3d' });
+    expect(imax.items.map((item) => item.format)).toEqual(Array(6).fill('IMAX 3D'));
+    expect(s.db.showtimes.map((row) => row.format)).toEqual(Array(6).fill('IMAX 3D'));
+    expect(showtimeAudits(s).map((row) => auditDetails(row)['format'])).toEqual(
+      Array(6).fill('IMAX 3D'),
+    );
+
+    const plain = await bulkCreate(s, { dateFrom: '2026-11-04', dateTo: '2026-11-04' });
+    expect(plain.items.map((item) => item.format)).toEqual(['2D', '2D', '2D']);
+    // Two requests, two batches.
+    expect(new Set(showtimeAudits(s).map((row) => auditDetails(row)['batchId'])).size).toBe(2);
+  });
+
+  it('allows an UPCOMING hidden movie (admins schedule ahead)', async () => {
+    const other = testMovie({ slug: 'other', title: 'Other', status: 'UPCOMING', isActive: false });
+    const s = setup({ movies: [other] });
+
+    const { created } = await bulkCreate(s, { movieId: other.id, dateTo: '2026-11-02' });
+
+    expect(created).toBe(3);
+  });
+
+  it('two OTHER saved shows that clash with each other under the current gap do not block the batch', async () => {
+    // Saved under a 0-minute gap: 19:00-21:00 and 21:05-23:05; with 15 minutes they clash.
+    const s = setup();
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '19:00'),
+    });
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '21:05'),
+    });
+
+    // 10:00 and 14:00 are clear of both; 23:20 touches the second (23:05 + 15).
+    const { created } = await bulkCreate(s, {
+      dateTo: '2026-11-02',
+      times: ['10:00', '14:00', '23:20'],
+    });
+
+    expect(created).toBe(3);
+    expect(s.db.showtimes).toHaveLength(5);
+  });
+
+  it('soft-deleted shows and shows on other screens do not conflict', async () => {
+    const screen2 = testScreen({ name: 'Screen 2' });
+    const s = setup({ screens: [screen2] });
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: screen2.id,
+      startsAt: colombo('2026-11-02', '10:00'),
+    });
+    s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-02', '14:00'),
+      deletedAt: DELETED_AT,
+    });
+
+    await expect(bulkCreate(s, { dateTo: '2026-11-02' })).resolves.toMatchObject({ created: 3 });
+  });
+});
+
+describe('showtime admin service: bulkCreate refusals', () => {
+  it('400 listing every past slot (today, earlier than now); nothing read or written', async () => {
+    const s = setup();
+
+    const error = await rejection(
+      bulkCreate(s, {
+        dateFrom: '2026-11-01',
+        dateTo: '2026-11-02',
+        times: ['20:00', '09:00', '15:30', '15:31'],
+      }),
+    );
+
+    expect(error).toMatchObject({
+      status: 400,
+      code: 'VALIDATION_ERROR',
+      message: showtimeBulkPastMessage(2),
+    });
+    expect(error.message).toBe(
+      '2 of the requested showtimes are in the past. Choose dates and times in the future.',
+    );
+    expect(error.details).toEqual([
+      {
+        path: ['body', 'times', 1],
+        message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
+        requested: { date: '2026-11-01', time: '09:00' },
+      },
+      {
+        path: ['body', 'times', 2], // exactly now counts as past
+        message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
+        requested: { date: '2026-11-01', time: '15:30' },
+      },
+    ]);
+    expect(
+      showtimePastSlotErrorSchema.parse({
+        error: { code: error.code, message: error.message, details: error.details },
+      }),
+    ).toBeTruthy();
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expectNothingWritten(s, 0);
+  });
+
+  it('one past slot: the singular message', async () => {
+    const s = setup();
+    const error = await rejection(
+      bulkCreate(s, { dateFrom: '2026-11-01', dateTo: '2026-11-03', times: ['15:00'] }),
+    );
+    expect(error.message).toBe(
+      '1 of the requested showtimes is in the past. Choose dates and times in the future.',
+    );
+    expect(error.details).toHaveLength(1);
+  });
+
+  it(`lists at most ${String(SHOWTIME_BULK_MAX_DETAILS)} past slots; the message has the total`, async () => {
+    const s = setup();
+    const times = Array.from({ length: 12 }, (_, i) => `${String(i * 2).padStart(2, '0')}:00`);
+
+    const error = await rejection(
+      bulkCreate(s, { dateFrom: '2026-10-01', dateTo: '2026-10-31', times }),
+    );
+
+    expect(error.message).toBe(showtimeBulkPastMessage(372));
+    expect(error.details).toHaveLength(SHOWTIME_BULK_MAX_DETAILS);
+    expect((error.details as { requested: unknown }[])[0]?.requested).toEqual({
+      date: '2026-10-01',
+      time: '00:00',
+    });
+    expectNothingWritten(s, 0);
+  });
+
+  it('checks the clock before the movie and screen (no transaction for a past slot)', async () => {
+    const s = setup();
+    const error = await rejection(
+      bulkCreate(s, { movieId: randomUUID(), dateFrom: '2026-11-01', dateTo: '2026-11-01' }),
+    );
+    expect(error.status).toBe(400);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('404 on body.movieId / body.screenId for an unknown movie / screen', async () => {
+    const s = setup();
+    expect(await rejection(bulkCreate(s, { movieId: randomUUID() }))).toMatchObject({
+      status: 404,
+      code: 'NOT_FOUND',
+      message: SHOWTIME_MOVIE_NOT_FOUND_MESSAGE,
+      details: [{ path: ['body', 'movieId'], message: SHOWTIME_MOVIE_NOT_FOUND_MESSAGE }],
+    });
+    expect(await rejection(bulkCreate(s, { screenId: randomUUID() }))).toMatchObject({
+      status: 404,
+      code: 'NOT_FOUND',
+      message: SHOWTIME_SCREEN_NOT_FOUND_MESSAGE,
+      details: [{ path: ['body', 'screenId'], message: SHOWTIME_SCREEN_NOT_FOUND_MESSAGE }],
+    });
+    expectNothingWritten(s, 0);
+  });
+
+  it.each([
+    ['a soft-deleted movie', { deletedAt: DELETED_AT }, SHOWTIME_MOVIE_DELETED_MESSAGE],
+    ['an ENDED movie', { status: 'ENDED' }, SHOWTIME_MOVIE_ENDED_MESSAGE],
+  ] as const)('409 on body.movieId for %s', async (_name, overrides, message) => {
+    const other = testMovie({ slug: 'other', title: 'Other', ...overrides });
+    const s = setup({ movies: [other] });
+
+    expect(await rejection(bulkCreate(s, { movieId: other.id }))).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message,
+      details: [{ path: ['body', 'movieId'], message }],
+    });
+    expectNothingWritten(s, 0);
+  });
+
+  it.each([
+    ['a soft-deleted screen', { deletedAt: DELETED_AT }, SHOWTIME_SCREEN_DELETED_MESSAGE],
+    ['a hidden screen', { isActive: false }, SHOWTIME_SCREEN_INACTIVE_MESSAGE],
+  ] as const)('409 on body.screenId for %s', async (_name, overrides, message) => {
+    const other = testScreen({ name: 'Screen 2', ...overrides });
+    const s = setup({ screens: [other] });
+
+    expect(await rejection(bulkCreate(s, { screenId: other.id }))).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message,
+      details: [{ path: ['body', 'screenId'], message }],
+    });
+    expectNothingWritten(s, 0);
+  });
+});
+
+describe('showtime admin service: bulkCreate overlap check', () => {
+  async function expectBulkConflict(s: Setup, overrides: Partial<ShowtimeBulkCreateBodyInput>) {
+    const before = s.db.showtimes.length;
+    const error = await rejection(bulkCreate(s, overrides));
+    expect(error.status).toBe(409);
+    expect(error.code).toBe('CONFLICT');
+    const parsed = showtimeConflictErrorSchema.parse({
+      error: { code: error.code, message: error.message, details: error.details },
+    });
+    expect(s.db.spies.showtime.createMany).not.toHaveBeenCalled();
+    expect(s.db.spies.auditLog.createMany).not.toHaveBeenCalled();
+    expectNothingWritten(s, before);
+    return { message: error.message, details: parsed.error.details };
+  }
+
+  it('one slot clashing with a saved show: 409, nothing inserted, no audit, no invalidation', async () => {
+    const s = setup();
+    const existing = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo('2026-11-05', '15:00'),
+    });
+
+    const { message, details } = await expectBulkConflict(s, {});
+
+    expect(message).toBe('1 of the requested showtimes overlaps other showtimes on this screen');
+    expect(message).toBe(showtimeBulkOverlapMessage(1, 1));
+    // 14:00 + 120 + 15 runs into 15:00; 10:00 ends well before; 18:00 starts after 17:15.
+    expect(details).toEqual([
+      {
+        path: ['body', 'times', 2],
+        message: 'Overlaps "Main Feature" (15:00–17:00), counting the 15-minute gap between shows',
+        requested: { date: '2026-11-05', time: '14:00' },
+        conflict: {
+          showtimeId: existing.id,
+          movieTitle: 'Main Feature',
+          startsAt: '2026-11-05T09:30:00.000Z',
+          endsAt: '2026-11-05T11:30:00.000Z',
+        },
+      },
+    ]);
+  });
+
+  it('in-batch clashes (closer than duration + gap): conflict showtimeId null, reported once on the later slot', async () => {
+    const s = setup();
+
+    const { message, details } = await expectBulkConflict(s, {
+      dateTo: '2026-11-03',
+      times: ['20:00', '19:00'],
+    });
+
+    expect(message).toBe('2 of the requested showtimes overlap other showtimes on this screen');
+    expect(details).toEqual(
+      ['2026-11-02', '2026-11-03'].map((date) => ({
+        path: ['body', 'times', 0],
+        message:
+          'Overlaps another showtime in this request: "Main Feature" (19:00–21:00), counting the 15-minute gap between shows',
+        requested: { date, time: '20:00' },
+        conflict: {
+          showtimeId: null,
+          movieTitle: 'Main Feature',
+          startsAt: colombo(date, '19:00').toISOString(),
+          endsAt: colombo(date, '21:00').toISOString(),
+        },
+      })),
+    );
+  });
+
+  it('a clash across midnight names the Colombo date of the other show', async () => {
+    const s = setup();
+
+    const { details } = await expectBulkConflict(s, {
+      dateTo: '2026-11-03',
+      times: ['23:00', '00:30'],
+    });
+
+    expect(details).toEqual([
+      expect.objectContaining({
+        path: ['body', 'times', 1],
+        requested: { date: '2026-11-03', time: '00:30' },
+        message:
+          'Overlaps another showtime in this request: "Main Feature" (2026-11-02 23:00–01:00), counting the 15-minute gap between shows',
+      }),
+    ]);
+  });
+
+  it(`more than ${String(SHOWTIME_BULK_MAX_DETAILS)} clashes: the first ${String(SHOWTIME_BULK_MAX_DETAILS)} listed, the message has the totals`, async () => {
+    const s = setup();
+
+    // Per day: 19:30 clashes with 19:00; 20:00 with 19:00 and 19:30. 31 days: 62 slots, 93 clashes.
+    const { message, details } = await expectBulkConflict(s, {
+      dateFrom: '2026-11-02',
+      dateTo: '2026-12-02',
+      times: ['19:00', '19:30', '20:00'],
+    });
+
+    expect(message).toBe(
+      '62 of the requested showtimes overlap other showtimes on this screen. Showing the first 50 of 93 conflicts.',
+    );
+    expect(details).toHaveLength(SHOWTIME_BULK_MAX_DETAILS);
+  });
+
+  it('exactly 50 clashes are all listed, without the "showing" note', () => {
+    expect(showtimeBulkOverlapMessage(50, 50)).toBe(
+      '50 of the requested showtimes overlap other showtimes on this screen',
+    );
+  });
+});
+
+describe('showtime admin service: bulkCreate failures', () => {
+  it('a failed showtime insert rolls back; nothing written, cache kept', async () => {
+    const s = setup();
+    const failure = new Error('insert failed');
+    s.db.injectFault('showtime', 'createMany', { error: failure });
+
+    await expect(bulkCreate(s)).rejects.toBe(failure);
+    expectNothingWritten(s, 0);
+  });
+
+  it('a failed audit insert rolls back the showtimes; nothing written, cache kept', async () => {
+    const s = setup();
+    const failure = new Error('audit insert failed');
+    s.db.injectFault('auditLog', 'createMany', { error: failure });
+
+    await expect(bulkCreate(s)).rejects.toBe(failure);
+    expect(s.db.spies.showtime.createMany).toHaveBeenCalledTimes(1);
+    expectNothingWritten(s, 0);
+  });
+
+  it('a failed read-back rolls back the showtimes', async () => {
+    const s = setup();
+    const failure = new Error('read failed');
+    s.db.injectFault('showtime', 'findMany', { onCall: 2, error: failure });
+
+    await expect(bulkCreate(s)).rejects.toBe(failure);
+    expectNothingWritten(s, 0);
+  });
+
+  it('a read-back that does not match the insert (impossible under the screen lock) rolls back', async () => {
+    const s = setup();
+    // Just before the read-back, an unlocked writer adds a live show at one of the instants
+    // (Postgres would have made it wait for the screen lock; the fake does not model that).
+    s.db.injectFault('showtime', 'findMany', {
+      onCall: 2,
+      before: () => {
+        s.db.addShowtime({
+          movieId: s.movie.id,
+          screenId: s.screen.id,
+          startsAt: colombo('2026-11-02', '10:00'),
+        });
+      },
+    });
+
+    await expect(bulkCreate(s, { dateTo: '2026-11-02' })).rejects.toThrow(
+      'Bulk showtime create read back 4 rows, expected 3',
+    );
+    // Only the outside writer's row is left.
+    expectNothingWritten(s, 1);
+  });
+
+  it('a foreign-key failure on the insert is a 409 "changed", never a 500', async () => {
+    const s = setup();
+    s.db.injectFault('showtime', 'createMany', { error: foreignKeyError('showtime', 'screenId') });
+
+    expect(await rejection(bulkCreate(s))).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: SHOWTIME_TARGET_CHANGED_MESSAGE,
+    });
+    expectNothingWritten(s, 0);
+  });
+});
+
+describe('showtime admin service: bulkCreate at the maximum size', () => {
+  it('31 days x 12 well-spaced times (372 showtimes) in one request', async () => {
+    const short = testMovie({ slug: 'short', title: 'Short', durationMinutes: 60 });
+    const s = setup({ movies: [short] });
+    // Every 75 minutes from 00:00: 60 minutes + the 15-minute gap, touching each other.
+    const times = Array.from({ length: 12 }, (_, i) => {
+      const minutes = i * 75;
+      return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+    });
+
+    const started = performance.now();
+    const result = await bulkCreate(s, {
+      movieId: short.id,
+      dateFrom: '2026-11-02',
+      dateTo: '2026-12-02',
+      times,
+    });
+    const ms = performance.now() - started;
+
+    expect(result.created).toBe(372);
+    expect(showtimeBulkCreateResponseSchema.parse(result).items).toHaveLength(372);
+    expect(s.db.showtimes).toHaveLength(372);
+    expect(showtimeAudits(s)).toHaveLength(372);
+    expect(s.db.spies.showtime.createMany).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.auditLog.createMany).toHaveBeenCalledTimes(1);
+    expect(ms).toBeLessThan(10_000);
   });
 });

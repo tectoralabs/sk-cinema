@@ -33,6 +33,12 @@ export const SHOWTIME_BULK_MAX_DAYS = 31;
 /** Bulk create: most start times per day. */
 export const SHOWTIME_BULK_MAX_TIMES = 12;
 
+/**
+ * Bulk create errors: most entries in `details` (past slots on a 400, clashes on a 409). The
+ * error `message` always gives the full count, so a client can say "and N more".
+ */
+export const SHOWTIME_BULK_MAX_DETAILS = 50;
+
 /** Bulk delete: most IDs per request. */
 export const SHOWTIME_BULK_DELETE_MAX_IDS = 200;
 
@@ -445,6 +451,36 @@ export const showtimeConflictErrorSchema = z.strictObject({
 });
 
 export type ShowtimeConflictError = z.infer<typeof showtimeConflictErrorSchema>;
+
+/**
+ * One entry of `details` on the bulk create 400 for slots at or before the current time:
+ * `path` is ["body", "times", i] (the index in `times`), `requested` the Colombo date + time.
+ */
+export const showtimePastSlotDetailSchema = z.strictObject({
+  path: z.array(z.union([z.string(), z.number()])),
+  message: z.string().min(1),
+  requested: z.strictObject({
+    date: calendarDateSchema,
+    time: clockTimeSchema,
+  }),
+});
+
+export type ShowtimePastSlotDetail = z.infer<typeof showtimePastSlotDetailSchema>;
+
+/**
+ * Full error body of the bulk create 400 for past slots:
+ * `{ error: { code: 'VALIDATION_ERROR', message, details } }`, 1 to SHOWTIME_BULK_MAX_DETAILS
+ * entries; the message gives the total.
+ */
+export const showtimePastSlotErrorSchema = z.strictObject({
+  error: z.strictObject({
+    code: z.literal('VALIDATION_ERROR'),
+    message: z.string().min(1),
+    details: z.array(showtimePastSlotDetailSchema).min(1).max(SHOWTIME_BULK_MAX_DETAILS),
+  }),
+});
+
+export type ShowtimePastSlotError = z.infer<typeof showtimePastSlotErrorSchema>;
 
 /** Response of GET /api/movies/:id/dates: future Colombo dates with showtimes, ascending. */
 export const publicShowtimeDatesResponseSchema = z.strictObject({

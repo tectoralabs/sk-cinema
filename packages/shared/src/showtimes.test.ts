@@ -5,6 +5,7 @@ import { publicMovieSchema } from './movies.js';
 import {
   SHOWTIME_BULK_DELETE_MAX_IDS,
   SHOWTIME_BULK_MAX_DAYS,
+  SHOWTIME_BULK_MAX_DETAILS,
   SHOWTIME_BULK_MAX_TIMES,
   SHOWTIME_FORMAT_MAX_LENGTH,
   adminShowtimeListQuerySchema,
@@ -29,6 +30,8 @@ import {
   showtimeCreateBodySchema,
   showtimeFormatSchema,
   showtimeIdParamsSchema,
+  showtimePastSlotDetailSchema,
+  showtimePastSlotErrorSchema,
   showtimeUpdateBodySchema,
 } from './showtimes.js';
 
@@ -979,6 +982,47 @@ describe('showtime conflict details', () => {
       showtimeConflictErrorSchema.safeParse({ error: { ...body.error, code: 'VALIDATION_ERROR' } })
         .success,
     ).toBe(false);
+  });
+});
+
+describe('bulk create past-slot details', () => {
+  const pastDetail = {
+    path: ['body', 'times', 0],
+    message: '2026-11-01 09:00 is in the past',
+    requested: { date: '2026-11-01', time: '09:00' },
+  };
+  const body = (details: unknown[]) => ({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: '1 of the requested showtimes is in the past',
+      details,
+    },
+  });
+
+  it('accepts a past slot and the full 400 body', () => {
+    expect(showtimePastSlotDetailSchema.parse(pastDetail)).toEqual(pastDetail);
+    expect(showtimePastSlotErrorSchema.parse(body([pastDetail]))).toEqual(body([pastDetail]));
+  });
+
+  it('rejects unknown keys, a bad requested time and another error code', () => {
+    expect(showtimePastSlotDetailSchema.safeParse({ ...pastDetail, extra: 1 }).success).toBe(false);
+    const requested = { date: '2026-11-01', time: '9:00' };
+    expect(showtimePastSlotDetailSchema.safeParse({ ...pastDetail, requested }).success).toBe(
+      false,
+    );
+    expect(
+      showtimePastSlotErrorSchema.safeParse({
+        error: { ...body([pastDetail]).error, code: 'CONFLICT' },
+      }).success,
+    ).toBe(false);
+  });
+
+  it(`holds 1 to ${String(SHOWTIME_BULK_MAX_DETAILS)} details`, () => {
+    expect(SHOWTIME_BULK_MAX_DETAILS).toBe(50);
+    expect(showtimePastSlotErrorSchema.safeParse(body([])).success).toBe(false);
+    const max = Array.from({ length: SHOWTIME_BULK_MAX_DETAILS }, () => pastDetail);
+    expect(showtimePastSlotErrorSchema.safeParse(body(max)).success).toBe(true);
+    expect(showtimePastSlotErrorSchema.safeParse(body([...max, pastDetail])).success).toBe(false);
   });
 });
 

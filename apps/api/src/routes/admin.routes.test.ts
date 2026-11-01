@@ -411,7 +411,7 @@ describe('admin router: authentication by default', () => {
     );
   });
 
-  it('sees every /showtimes route (Phase 5 T10), so the 401 walk below probes each one', () => {
+  it('sees every /showtimes route (Phase 5 T10, T11), so the 401 walk below probes each one', () => {
     const { app, mounts } = setup();
     const showtimes = `${ADMIN_API_PATH}/showtimes`;
     const showtimeEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
@@ -419,7 +419,12 @@ describe('admin router: authentication by default', () => {
     );
 
     expect(showtimeEndpoints.sort()).toEqual(
-      [`GET ${showtimes}`, `POST ${showtimes}`, `GET ${showtimes}/:id`].sort(),
+      [
+        `GET ${showtimes}`,
+        `POST ${showtimes}`,
+        `POST ${showtimes}/bulk`,
+        `GET ${showtimes}/:id`,
+      ].sort(),
     );
   });
 
