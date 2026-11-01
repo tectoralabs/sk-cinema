@@ -23,6 +23,12 @@ export const AUTO_SLUG_MAX_ATTEMPTS = 3;
 export const MOVIE_NOT_FOUND_MESSAGE = 'Movie not found';
 /** A soft-deleted movie cannot be edited, re-statused or shown/hidden until it is restored. */
 export const MOVIE_RESTORE_FIRST_MESSAGE = 'Restore the movie first';
+/** DELETE /:id on a movie that is already in the trash (soft-deleted). */
+export const MOVIE_ALREADY_DELETED_MESSAGE = 'Movie is already deleted';
+/** POST /:id/restore on a movie that is not in the trash. */
+export const MOVIE_NOT_DELETED_MESSAGE = 'Movie is not deleted';
+/** DELETE /:id/permanent on a live movie: it must be moved to the trash (soft-deleted) first. */
+export const MOVIE_DELETE_FIRST_MESSAGE = 'Delete the movie before removing it permanently';
 export const SLUG_IN_USE_MESSAGE = 'Slug is already in use';
 export const SLUG_REQUIRED_MESSAGE =
   'A slug cannot be made from this title (it has no Latin letters or digits). ' +
@@ -237,12 +243,12 @@ class SlugClash extends Error {
 }
 
 /**
- * Thrown inside an update transaction when the conditional update matched no row (P2025): the
- * movie was deleted or soft-deleted by a concurrent request after it was read.
+ * Thrown inside a write transaction when the conditional update or delete matched no row
+ * (P2025): a concurrent request deleted, soft-deleted or restored the movie after it was read.
  */
 class MovieGone extends Error {
   constructor(readonly original: unknown) {
-    super('Movie gone before the update');
+    super('Movie changed before the write');
     this.name = 'MovieGone';
   }
 }
@@ -266,6 +272,37 @@ function unavailableMovieError(row: Pick<Movie, 'deletedAt'> | null): AppError |
 interface PlannedChange {
   data: Prisma.MovieUpdateInput;
   audit: Required<Pick<AuditEntry, 'action' | 'details'>>;
+}
+
+/** Where a movie is: live (deletedAt null) or in the trash (soft-deleted). */
+type MoviePlace = 'live' | 'trash';
+
+/**
+ * Why a movie cannot be moved from `from`: 404 when there is no such movie, 409 with
+ * `conflictMessage` when it is somewhere else. Null when it can be moved.
+ */
+function misplacedMovieError(
+  row: Pick<Movie, 'deletedAt'> | null,
+  from: MoviePlace,
+  conflictMessage: string,
+): AppError | null {
+  if (row === null) return notFound(MOVIE_NOT_FOUND_MESSAGE);
+  const place: MoviePlace = row.deletedAt === null ? 'live' : 'trash';
+  return place === from ? null : new AppError(409, ERROR_CODES.CONFLICT, conflictMessage);
+}
+
+/** The columns every soft delete, restore and hard delete audit row records. */
+type AuditedMovieRow = Pick<Movie, 'id' | 'title' | 'slug'>;
+
+/** One soft delete, restore or hard delete (see moveMovie). */
+interface MovieMove<R extends AuditedMovieRow> {
+  /** Where the movie must be for the move; anywhere else is a 409 with `conflictMessage`. */
+  from: MoviePlace;
+  conflictMessage: string;
+  /** The conditional write. `where` is `{ id, deletedAt }` repeating the `from` check. */
+  write: (tx: Prisma.TransactionClient, where: Prisma.MovieWhereUniqueInput) => Promise<R>;
+  /** The audit row, from the row the write returned. */
+  audit: (row: R) => Required<Pick<AuditEntry, 'action' | 'details'>>;
 }
 
 /** Who made an admin change, for the audit row. Raw request values; writeAudit fits them. */
@@ -480,6 +517,67 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     return toAdminMovie(outcome.row);
   }
 
+  /**
+   * The shared flow of soft delete, restore and hard delete, in one transaction:
+   * 1. read the movie: 404 when unknown, 409 when it is not at `move.from`;
+   * 2. the conditional write, `where: { id, deletedAt }` repeating that check;
+   * 3. the audit row, from the row the write returned (its failure rolls the write back and
+   *    propagates as a 500);
+   * then, only after the commit, the public movie cache is dropped. There is no no-op: a move
+   * always changes the movie, or is refused.
+   *
+   * A P2025 from step 2 means a concurrent request moved or removed the movie after step 1 (at
+   * READ COMMITTED, Postgres re-checks the WHERE on the locked row). The movie is re-read after
+   * the rollback and the request answered as if that change had come first: 404 or 409.
+   */
+  async function moveMovie<R extends AuditedMovieRow>(
+    id: string,
+    actor: AuditActor,
+    move: MovieMove<R>,
+  ): Promise<R> {
+    const where: Prisma.MovieWhereUniqueInput = {
+      id,
+      deletedAt: move.from === 'live' ? null : { not: null },
+    };
+    let row: R;
+    try {
+      row = await db.$transaction(async (tx) => {
+        const current = await tx.movie.findUnique({ where: { id }, select: { deletedAt: true } });
+        const refused = misplacedMovieError(current, move.from, move.conflictMessage);
+        if (refused) throw refused;
+
+        let written: R;
+        try {
+          written = await move.write(tx, where);
+        } catch (error) {
+          if (isRecordNotFound(error)) throw new MovieGone(error);
+          throw error;
+        }
+
+        await writeAudit(tx, {
+          ...move.audit(written),
+          adminId: actor.adminId,
+          entity: AUDIT_ENTITY,
+          entityId: written.id,
+          ipAddress: actor.ipAddress,
+          userAgent: actor.userAgent,
+        });
+        return written;
+      });
+    } catch (error) {
+      if (error instanceof MovieGone) {
+        // The transaction is over, so this read is a new statement.
+        const now = await db.movie.findUnique({ where: { id }, select: { deletedAt: true } });
+        throw misplacedMovieError(now, move.from, move.conflictMessage) ?? error.original;
+      }
+      throw error;
+    }
+
+    // Only after the commit, so no request can re-cache the movie as it was.
+    invalidatePublicMovies(cache);
+    return row;
+  }
+
   return {
     /**
      * Creates a movie and its CREATE audit row atomically, then drops the cached public movie
@@ -573,6 +671,60 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
               },
             },
       );
+    },
+
+    /**
+     * Moves a live movie to the trash: sets `deletedAt` (DELETE, `{ mode: 'soft', title, slug }`).
+     * It disappears from the public site but keeps its slug, isActive and status, so a restore
+     * brings it back as it was. 409 when it is already in the trash.
+     */
+    async softDelete(id: string, actor: AuditActor): Promise<AdminMovie> {
+      const row = await moveMovie(id, actor, {
+        from: 'live',
+        conflictMessage: MOVIE_ALREADY_DELETED_MESSAGE,
+        write: (tx, where) =>
+          tx.movie.update({ where, data: { deletedAt: new Date() }, select: adminMovieSelect }),
+        audit: ({ title, slug }) => ({ action: 'DELETE', details: { mode: 'soft', title, slug } }),
+      });
+      return toAdminMovie(row);
+    },
+
+    /**
+     * Takes a movie out of the trash: clears `deletedAt`
+     * (UPDATE, `{ restored: true, title, slug }`). isActive and status are untouched. Its slug
+     * cannot have been taken meanwhile, as slugs are unique across every movie, deleted ones
+     * included. 409 when it is not in the trash.
+     */
+    async restore(id: string, actor: AuditActor): Promise<AdminMovie> {
+      const row = await moveMovie(id, actor, {
+        from: 'trash',
+        conflictMessage: MOVIE_NOT_DELETED_MESSAGE,
+        write: (tx, where) =>
+          tx.movie.update({ where, data: { deletedAt: null }, select: adminMovieSelect }),
+        audit: ({ title, slug }) => ({
+          action: 'UPDATE',
+          details: { restored: true, title, slug },
+        }),
+      });
+      return toAdminMovie(row);
+    },
+
+    /**
+     * Removes a movie from the trash for good (DELETE, `{ mode: 'hard', title, slug }`); its slug
+     * becomes free. Only a movie already in the trash: 409 for a live one. The caller must
+     * restrict this to SUPER_ADMIN (the route does). The audit row survives the movie:
+     * AuditLog.entityId is a plain column, with no foreign key to Movie.
+     */
+    async hardDelete(id: string, actor: AuditActor): Promise<void> {
+      await moveMovie(id, actor, {
+        from: 'trash',
+        conflictMessage: MOVIE_DELETE_FIRST_MESSAGE,
+        // The movie's showtimes go with it: Showtime.movieId is ON DELETE CASCADE in Postgres.
+        // Phase 6: delete its Cloudinary images (posterPublicId, bannerPublicId) once this commits.
+        write: (tx, where) =>
+          tx.movie.delete({ where, select: { id: true, title: true, slug: true } }),
+        audit: ({ title, slug }) => ({ action: 'DELETE', details: { mode: 'hard', title, slug } }),
+      });
     },
   };
 }

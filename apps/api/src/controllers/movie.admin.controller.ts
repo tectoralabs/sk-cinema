@@ -70,7 +70,29 @@ export function createMovieAdminController(service: MovieAdminService) {
     res.json({ movie } satisfies AdminMovieResponse);
   };
 
-  return { create, list, getById, update, setStatus, setActive };
+  const softDelete: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as MovieIdParams;
+    const movie = await service.softDelete(id, { adminId: req.admin.id, ...clientInfo(req) });
+    res.json({ movie } satisfies AdminMovieResponse);
+  };
+
+  const restore: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as MovieIdParams;
+    const movie = await service.restore(id, { adminId: req.admin.id, ...clientInfo(req) });
+    res.json({ movie } satisfies AdminMovieResponse);
+  };
+
+  /** SUPER_ADMIN only (route-level requireRole). 204: the movie is gone, nothing to send. */
+  const hardDelete: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as MovieIdParams;
+    await service.hardDelete(id, { adminId: req.admin.id, ...clientInfo(req) });
+    res.status(204).end();
+  };
+
+  return { create, list, getById, update, setStatus, setActive, softDelete, restore, hardDelete };
 }
 
 export type MovieAdminController = ReturnType<typeof createMovieAdminController>;

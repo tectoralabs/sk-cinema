@@ -14,10 +14,14 @@ import request from 'supertest';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { AdminRole, Movie } from '../generated/prisma/client.js';
 import { hashPassword } from '../lib/password.js';
+import { FORBIDDEN_MESSAGE } from '../middleware/auth.js';
 import { CSRF_HEADER } from '../middleware/csrf.js';
 import {
   AUTO_SLUG_MAX_ATTEMPTS,
   adminMovieSelect,
+  MOVIE_ALREADY_DELETED_MESSAGE,
+  MOVIE_DELETE_FIRST_MESSAGE,
+  MOVIE_NOT_DELETED_MESSAGE,
   MOVIE_NOT_FOUND_MESSAGE,
   MOVIE_RESTORE_FIRST_MESSAGE,
   SLUG_GENERATION_FAILED_MESSAGE,
@@ -1131,10 +1135,16 @@ describe('GET /api/admin/movies', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * A browser-like PATCH with the session (by default), CSRF cookie and token, and Origin: the
- * same request authClient.post sends, as the auth client has no patch.
+ * A browser-like PATCH, POST or DELETE to /movies/{path} with the session (by default), CSRF
+ * cookie and token, and Origin: the same request authClient.post sends, as the auth client only
+ * has post and get.
  */
-function patchMovie(s: Setup, path: string, options: SendOptions = {}) {
+function sendMovie(
+  s: Setup,
+  method: 'patch' | 'post' | 'delete',
+  path: string,
+  options: SendOptions = {},
+) {
   const {
     body,
     cookies = [s.session.access],
@@ -1142,7 +1152,9 @@ function patchMovie(s: Setup, path: string, options: SendOptions = {}) {
     token = s.client.csrf.token,
   } = options;
   const all = [...(options.csrfCookie === false ? [] : [s.client.csrf.cookie]), ...cookies];
-  let req = request(s.app).patch(`${ADMIN_BASE}/movies/${path}`).set('User-Agent', TEST_USER_AGENT);
+  let req = request(s.app)
+    [method](`${ADMIN_BASE}/movies/${path}`)
+    .set('User-Agent', TEST_USER_AGENT);
   if (all.length > 0) req = req.set('Cookie', all.join('; '));
   if (origin !== null) req = req.set('Origin', origin);
   if (token !== null) req = req.set(CSRF_HEADER, token);
@@ -1151,6 +1163,9 @@ function patchMovie(s: Setup, path: string, options: SendOptions = {}) {
     ? req.set('Content-Type', 'application/json').send(body)
     : req.send(body);
 }
+
+const patchMovie = (s: Setup, path: string, options: SendOptions = {}) =>
+  sendMovie(s, 'patch', path, options);
 
 const patchDetails = (s: Setup, id: string, body: object | string) => patchMovie(s, id, { body });
 const patchStatus = (s: Setup, id: string, body: object | string) =>
@@ -1863,5 +1878,571 @@ describe('PATCH /api/admin/movies/:id/active', () => {
     expect(s.db.spies.$transaction).not.toHaveBeenCalled();
     expect(storedMovie(s, seeded.id)).toEqual(seeded);
     expect(movieAudits(s.db)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/admin/movies/:id, POST /:id/restore, DELETE /:id/permanent
+// ---------------------------------------------------------------------------
+
+const FORBIDDEN_BODY = { error: { code: 'FORBIDDEN', message: FORBIDDEN_MESSAGE } };
+
+const softDeletePath = (id: string) => id;
+const restorePath = (id: string) => `${id}/restore`;
+const hardDeletePath = (id: string) => `${id}/permanent`;
+
+const softDelete = (s: Setup, id: string, options: SendOptions = {}) =>
+  sendMovie(s, 'delete', softDeletePath(id), options);
+const restore = (s: Setup, id: string, options: SendOptions = {}) =>
+  sendMovie(s, 'post', restorePath(id), options);
+const hardDelete = (s: Setup, id: string, options: SendOptions = {}) =>
+  sendMovie(s, 'delete', hardDeletePath(id), options);
+
+/** avatar() in the trash (soft-deleted). */
+const trashedAvatar = (overrides: Partial<Movie> = {}) =>
+  avatar({ deletedAt: new Date('2026-10-01T00:00:00.000Z'), ...overrides });
+
+const isStored = (s: Setup, id: string) => s.db.movies.some((m) => m.id === id);
+
+/** A 204 with no body, not cached. */
+function expectNoContent(res: request.Response) {
+  expect(res.status).toBe(204);
+  expect(res.headers['cache-control']).toBe('no-store');
+  expect(res.text).toBe('');
+  expect(res.headers['content-type']).toBeUndefined();
+}
+
+interface MoveEndpoint {
+  name: string;
+  method: 'post' | 'delete';
+  /** The path below /movies/. */
+  path: (id: string) => string;
+  /** The role the shared tests sign in as (hard delete is SUPER_ADMIN only). */
+  role: AdminRole;
+  /** A movie the endpoint accepts. */
+  movable: (overrides?: Partial<Movie>) => Movie;
+  /** A movie the endpoint refuses with a 409 (`conflictMessage`). */
+  misplaced: () => Movie;
+  conflictMessage: string;
+  /** The conditional write the endpoint makes. */
+  write: 'update' | 'delete';
+  /** What a concurrent request does to the row to make it misplaced. */
+  misplace: (row: Movie) => void;
+  /** The success response check. */
+  expectSuccess: (res: request.Response) => void;
+}
+
+const MOVE_ENDPOINTS: MoveEndpoint[] = [
+  {
+    name: 'DELETE /api/admin/movies/:id',
+    method: 'delete',
+    path: softDeletePath,
+    role: 'EDITOR',
+    movable: avatar,
+    misplaced: trashedAvatar,
+    conflictMessage: MOVIE_ALREADY_DELETED_MESSAGE,
+    write: 'update',
+    misplace: (row) => {
+      row.deletedAt = new Date('2026-10-31T00:00:00.000Z');
+    },
+    expectSuccess: (res) => {
+      expect(expectOk(res).deletedAt).not.toBeNull();
+    },
+  },
+  {
+    name: 'POST /api/admin/movies/:id/restore',
+    method: 'post',
+    path: restorePath,
+    role: 'EDITOR',
+    movable: trashedAvatar,
+    misplaced: avatar,
+    conflictMessage: MOVIE_NOT_DELETED_MESSAGE,
+    write: 'update',
+    misplace: (row) => {
+      row.deletedAt = null;
+    },
+    expectSuccess: (res) => {
+      expect(expectOk(res).deletedAt).toBeNull();
+    },
+  },
+  {
+    name: 'DELETE /api/admin/movies/:id/permanent',
+    method: 'delete',
+    path: hardDeletePath,
+    role: 'SUPER_ADMIN',
+    movable: trashedAvatar,
+    misplaced: avatar,
+    conflictMessage: MOVIE_DELETE_FIRST_MESSAGE,
+    write: 'delete',
+    misplace: (row) => {
+      row.deletedAt = null;
+    },
+    expectSuccess: expectNoContent,
+  },
+];
+
+describe.each(MOVE_ENDPOINTS)(
+  '$name: shared behaviour',
+  ({ method, path, role, movable, misplaced, conflictMessage, write, misplace, expectSuccess }) => {
+    const send = (s: Setup, id: string, options: SendOptions = {}) =>
+      sendMovie(s, method, path(id), options);
+
+    it('accepts no body and an empty JSON object as the body', async () => {
+      const first = movable();
+      const second = movable({ slug: 'avatar-2' });
+      const s = await setup({ role, movies: [first, second] });
+
+      expectSuccess(await send(s, first.id));
+      expectSuccess(await send(s, second.id, { body: {} }));
+
+      expect(s.db.spies.movie[write]).toHaveBeenCalledTimes(2);
+      expect(movieAudits(s.db)).toHaveLength(2);
+    });
+
+    it('answers 401 without a session, before reading anything', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+
+      const res = await send(s, seeded.id, { cookies: [] });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(UNAUTHORIZED_BODY);
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    });
+
+    it('answers 401 for an invalid session cookie, even with a bad body and id', async () => {
+      const s = await setup({ role, movies: [movable()] });
+
+      const res = await send(s, 'not-a-uuid', {
+        body: { foo: 1 },
+        cookies: [`${s.session.access}x`],
+      });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    });
+
+    it.each([
+      ['a missing CSRF token', { token: null }],
+      ['a wrong CSRF token', { token: 'not-the-token' }],
+      ['a missing CSRF cookie', { csrfCookie: false }],
+      ['a missing Origin', { origin: null }],
+      ['a foreign Origin', { origin: 'https://evil.example' }],
+    ] as const)('answers 403 for %s, even with a session', async (_name, overrides) => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+
+      const res = await send(s, seeded.id, overrides);
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual(CSRF_BODY);
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+      expect(movieAudits(s.db)).toEqual([]);
+    });
+
+    it('answers 404 for an unknown id', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const error = expectError(await send(s, randomUUID()), 404, 'NOT_FOUND');
+
+      expect(error.message).toBe(MOVIE_NOT_FOUND_MESSAGE);
+      expect(s.db.spies.movie[write]).not.toHaveBeenCalled();
+      expect(movieAudits(s.db)).toEqual([]);
+      expect(invalidate).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    });
+
+    it(`answers 409 "${conflictMessage}", changing nothing`, async () => {
+      const seeded = misplaced();
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const error = expectError(await send(s, seeded.id), 409, 'CONFLICT');
+
+      expect(error.message).toBe(conflictMessage);
+      expect(error.details).toBeUndefined();
+      expect(s.db.spies.movie[write]).not.toHaveBeenCalled();
+      expect(movieAudits(s.db)).toEqual([]);
+      expect(invalidate).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    });
+
+    it.each(['not-a-uuid', '123', 'avatar'])('answers 400 for the id %s', async (id) => {
+      const s = await setup({ role, movies: [movable()] });
+
+      const error = expectError(await send(s, id), 400, 'VALIDATION_ERROR');
+
+      expect(error.details).toEqual([expect.objectContaining({ path: ['params', 'id'] })]);
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('answers 400 for query parameters', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+
+      const res = await sendMovie(s, method, `${path(seeded.id)}?force=1`);
+
+      const error = expectError(res, 400, 'VALIDATION_ERROR');
+
+      expect(error.details).toEqual([expect.objectContaining({ path: ['query'] })]);
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    });
+
+    it.each<[string, object | string]>([
+      ['an unknown key', { foo: 1 }],
+      ['deletedAt', { deletedAt: null }],
+      ['a JSON array', '[]'],
+    ])('answers 400 for a body with %s, writing nothing', async (_name, body) => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+
+      const error = expectError(await send(s, seeded.id, { body }), 400, 'VALIDATION_ERROR');
+
+      expect(error.details).toEqual([expect.objectContaining({ path: ['body'] })]);
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+      expect(movieAudits(s.db)).toEqual([]);
+    });
+
+    it('rolls the write back and answers a generic 500 when the audit write fails', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+      s.db.injectFault('auditLog', 'create', {
+        error: new Error('relation "AuditLog" does not exist'),
+      });
+
+      const res = await send(s, seeded.id);
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual(INTERNAL_BODY);
+      // The write ran inside the transaction and was undone.
+      expect(s.db.spies.movie[write]).toHaveBeenCalledTimes(1);
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+      expect(movieAudits(s.db)).toEqual([]);
+      expect(invalidate).not.toHaveBeenCalled();
+    });
+
+    it('answers a generic 500 when the database fails', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+      s.db.injectFault('movie', write, { error: new Error('connection reset') });
+
+      const res = await send(s, seeded.id);
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual(INTERNAL_BODY);
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+      expect(movieAudits(s.db)).toEqual([]);
+    });
+
+    it('answers 409 when a concurrent request moves the movie before the write', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+      s.db.injectFault('movie', write, {
+        before: () => {
+          const row = s.db.movies.find((m) => m.id === seeded.id);
+          if (row) misplace(row);
+        },
+      });
+
+      const error = expectError(await send(s, seeded.id), 409, 'CONFLICT');
+
+      expect(error.message).toBe(conflictMessage);
+      expect(isStored(s, seeded.id)).toBe(true);
+      expect(movieAudits(s.db)).toEqual([]);
+      expect(invalidate).not.toHaveBeenCalled();
+    });
+
+    it('answers 404 when a concurrent request hard-deletes the movie before the write', async () => {
+      const seeded = movable();
+      const s = await setup({ role, movies: [seeded] });
+      s.db.injectFault('movie', write, {
+        before: () => {
+          s.db.movies.splice(
+            s.db.movies.findIndex((m) => m.id === seeded.id),
+            1,
+          );
+        },
+      });
+
+      const error = expectError(await send(s, seeded.id), 404, 'NOT_FOUND');
+
+      expect(error.message).toBe(MOVIE_NOT_FOUND_MESSAGE);
+      expect(movieAudits(s.db)).toEqual([]);
+    });
+  },
+);
+
+describe('DELETE /api/admin/movies/:id (soft delete)', () => {
+  it.each<AdminRole>(['EDITOR', 'SUPER_ADMIN'])(
+    'a %s moves the movie to the trash: one DELETE audit row, then the cache is dropped',
+    async (role) => {
+      const seeded = avatar({ status: 'NOW_SHOWING' });
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const movie = expectOk(await softDelete(s, seeded.id));
+
+      expect(movie.id).toBe(seeded.id);
+      expect(movie.deletedAt).not.toBeNull();
+      expect(movie.updatedAt > SEEDED_AT).toBe(true);
+      // Only deletedAt changes: slug, visibility and status are kept for a restore.
+      expect(movie).toMatchObject({ slug: 'avatar', isActive: true, status: 'NOW_SHOWING' });
+      expect(storedMovie(s, seeded.id)).toEqual({
+        ...seeded,
+        deletedAt: new Date(movie.deletedAt ?? ''),
+        updatedAt: new Date(movie.updatedAt),
+      });
+      expect(s.db.spies.movie.update).toHaveBeenCalledExactlyOnceWith({
+        where: { id: seeded.id, deletedAt: null },
+        data: { deletedAt: expect.any(Date) as unknown },
+        select: adminMovieSelect,
+      });
+      const audits = movieAudits(s.db);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({
+        action: 'DELETE',
+        adminId: s.adminId,
+        entity: 'Movie',
+        entityId: seeded.id,
+        details: { mode: 'soft', title: 'Avatar', slug: 'avatar' },
+        userAgent: TEST_USER_AGENT,
+      });
+      expect(audits[0]?.ipAddress).toEqual(expect.any(String));
+      expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+      const auditOrder = s.db.spies.auditLog.create.mock.invocationCallOrder.at(-1) ?? Infinity;
+      expect(invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+    },
+  );
+
+  it('the movie leaves the cached public list and page at once; admins still see it', async () => {
+    const seeded = avatar({ status: 'NOW_SHOWING' });
+    const s = await setup({ movies: [seeded] });
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual(['avatar']);
+    expect((await publicGet(s, '/avatar')).status).toBe(200);
+
+    const movie = expectOk(await softDelete(s, seeded.id));
+
+    expect(await publicSlugs(s)).toEqual([]);
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual([]);
+    expectError(await publicGet(s, '/avatar'), 404, 'NOT_FOUND');
+    // The admin detail and the trash list still have it; the default list does not.
+    expect(expectOk(await getMovie(s, seeded.id))).toEqual(movie);
+    const trash = await s.client.get('/movies?deleted=only', [s.session.access]);
+    expect(adminMovieListResponseSchema.parse(trash.body).items).toEqual([movie]);
+    const live = await s.client.get('/movies', [s.session.access]);
+    expect(adminMovieListResponseSchema.parse(live.body).items).toEqual([]);
+  });
+
+  it('keeps the slug taken: a new movie cannot have it', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    expectOk(await softDelete(s, seeded.id));
+
+    const explicit = await createMovie(s, { title: 'Avatar', slug: 'avatar', durationMinutes: 90 });
+    expect(expectError(explicit, 409, 'CONFLICT').message).toBe(SLUG_IN_USE_MESSAGE);
+    const generated = expectCreated(await createMovie(s, { title: 'Avatar', durationMinutes: 90 }));
+    expect(generated.slug).toBe('avatar-2');
+  });
+
+  it('a soft-deleted movie cannot be edited until it is restored', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    expectOk(await softDelete(s, seeded.id));
+
+    const error = expectError(await patchDetails(s, seeded.id, { title: 'X' }), 409, 'CONFLICT');
+
+    expect(error.message).toBe(MOVIE_RESTORE_FIRST_MESSAGE);
+  });
+});
+
+describe('POST /api/admin/movies/:id/restore', () => {
+  it.each<AdminRole>(['EDITOR', 'SUPER_ADMIN'])(
+    'a %s restores the movie: one UPDATE audit row, then the cache is dropped',
+    async (role) => {
+      const seeded = trashedAvatar();
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const movie = expectOk(await restore(s, seeded.id));
+
+      expect(movie.id).toBe(seeded.id);
+      expect(movie.deletedAt).toBeNull();
+      expect(movie.updatedAt > SEEDED_AT).toBe(true);
+      expect(storedMovie(s, seeded.id)).toEqual({
+        ...seeded,
+        deletedAt: null,
+        updatedAt: new Date(movie.updatedAt),
+      });
+      expect(s.db.spies.movie.update).toHaveBeenCalledExactlyOnceWith({
+        where: { id: seeded.id, deletedAt: { not: null } },
+        data: { deletedAt: null },
+        select: adminMovieSelect,
+      });
+      const audits = movieAudits(s.db);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({
+        action: 'UPDATE',
+        adminId: s.adminId,
+        entity: 'Movie',
+        entityId: seeded.id,
+        details: { restored: true, title: 'Avatar', slug: 'avatar' },
+        userAgent: TEST_USER_AGENT,
+      });
+      expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+      const auditOrder = s.db.spies.auditLog.create.mock.invocationCallOrder.at(-1) ?? Infinity;
+      expect(invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+    },
+  );
+
+  it('an active, listable movie reappears in the cached public list and page at once', async () => {
+    const seeded = trashedAvatar({ status: 'NOW_SHOWING' });
+    const s = await setup({ movies: [seeded] });
+    expect(await publicSlugs(s)).toEqual([]);
+    expectError(await publicGet(s, '/avatar'), 404, 'NOT_FOUND');
+
+    const movie = expectOk(await restore(s, seeded.id));
+
+    expect(movie.slug).toBe('avatar');
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual(['avatar']);
+    expect((await publicGet(s, '/avatar')).status).toBe(200);
+  });
+
+  it('keeps the visibility and status it had: a hidden movie stays hidden', async () => {
+    const seeded = trashedAvatar({ isActive: false, status: 'ENDED' });
+    const s = await setup({ movies: [seeded] });
+
+    const movie = expectOk(await restore(s, seeded.id));
+
+    expect(movie).toMatchObject({ slug: 'avatar', isActive: false, status: 'ENDED' });
+    expect(await publicSlugs(s)).toEqual([]);
+    expectError(await publicGet(s, '/avatar'), 404, 'NOT_FOUND');
+  });
+
+  it('a restored movie can be edited again', async () => {
+    const seeded = trashedAvatar();
+    const s = await setup({ movies: [seeded] });
+    expectError(await patchDetails(s, seeded.id, { title: 'Avatar 2' }), 409, 'CONFLICT');
+
+    expectOk(await restore(s, seeded.id));
+    const edited = expectOk(await patchDetails(s, seeded.id, { title: 'Avatar 2' }));
+
+    expect(edited).toMatchObject({ title: 'Avatar 2', slug: 'avatar', deletedAt: null });
+    expect(movieAudits(s.db).map((row) => row.action)).toEqual(['UPDATE', 'UPDATE']);
+  });
+});
+
+describe('DELETE /api/admin/movies/:id/permanent (hard delete)', () => {
+  it.each<[string, () => Movie, (id: string) => string]>([
+    ['a soft-deleted movie', () => trashedAvatar(), (id) => id],
+    ['a live movie', () => avatar(), (id) => id],
+    ['an unknown id', () => trashedAvatar(), () => randomUUID()],
+    ['a bad id and body', () => trashedAvatar(), () => 'not-a-uuid'],
+  ])('an EDITOR is refused (403) for %s, before any database access', async (_n, seed, idOf) => {
+    const seeded = seed();
+    const s = await setup({ role: 'EDITOR', movies: [seeded] });
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+    const id = idOf(seeded.id);
+
+    const res = await hardDelete(s, id, id === seeded.id ? {} : { body: { foo: 1 } });
+
+    expect(res.status).toBe(403);
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.body).toEqual(FORBIDDEN_BODY);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(s.db.spies.movie.findUnique).not.toHaveBeenCalled();
+    expect(s.db.spies.movie.delete).not.toHaveBeenCalled();
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    expect(movieAudits(s.db)).toEqual([]);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it('a SUPER_ADMIN removes a soft-deleted movie for good: 204, one DELETE audit row', async () => {
+    const seeded = trashedAvatar();
+    const other = testMovie({ slug: 'other', title: 'Other' });
+    const s = await setup({ role: 'SUPER_ADMIN', movies: [seeded, other] });
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+    expectNoContent(await hardDelete(s, seeded.id));
+
+    expect(isStored(s, seeded.id)).toBe(false);
+    expect(storedMovie(s, other.id)).toEqual(other);
+    expect(s.db.spies.movie.delete).toHaveBeenCalledExactlyOnceWith({
+      where: { id: seeded.id, deletedAt: { not: null } },
+      select: { id: true, title: true, slug: true },
+    });
+    const audits = movieAudits(s.db);
+    expect(audits).toHaveLength(1);
+    // The audit row outlives the movie and records what it was.
+    expect(audits[0]).toMatchObject({
+      action: 'DELETE',
+      adminId: s.adminId,
+      entity: 'Movie',
+      entityId: seeded.id,
+      details: { mode: 'hard', title: 'Avatar', slug: 'avatar' },
+      userAgent: TEST_USER_AGENT,
+    });
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+    const auditOrder = s.db.spies.auditLog.create.mock.invocationCallOrder.at(-1) ?? Infinity;
+    expect(invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+    // Gone for admins too.
+    expectError(await getMovie(s, seeded.id), 404, 'NOT_FOUND');
+    expectError(await restore(s, seeded.id), 404, 'NOT_FOUND');
+  });
+
+  it('frees the slug: a new movie can take it', async () => {
+    const seeded = trashedAvatar();
+    const s = await setup({ role: 'SUPER_ADMIN', movies: [seeded] });
+
+    expectNoContent(await hardDelete(s, seeded.id));
+    const created = expectCreated(await createMovie(s, { title: 'Avatar', durationMinutes: 90 }));
+
+    expect(created.slug).toBe('avatar');
+    expect(created.id).not.toBe(seeded.id);
+  });
+
+  it('a second hard delete of the same movie is a 404', async () => {
+    const seeded = trashedAvatar();
+    const s = await setup({ role: 'SUPER_ADMIN', movies: [seeded] });
+
+    expectNoContent(await hardDelete(s, seeded.id));
+    const error = expectError(await hardDelete(s, seeded.id), 404, 'NOT_FOUND');
+
+    expect(error.message).toBe(MOVIE_NOT_FOUND_MESSAGE);
+    expect(movieAudits(s.db)).toHaveLength(1);
+  });
+});
+
+describe('movie lifecycle', () => {
+  it('create -> soft delete -> restore -> soft delete -> permanent delete, all audited', async () => {
+    const s = await setup({ role: 'SUPER_ADMIN' });
+
+    const created = expectCreated(await createMovie(s, { title: 'Avatar', durationMinutes: 162 }));
+    const { id } = created;
+    expect(expectOk(await softDelete(s, id)).deletedAt).not.toBeNull();
+    expect(expectOk(await restore(s, id)).deletedAt).toBeNull();
+    expect(expectOk(await softDelete(s, id)).deletedAt).not.toBeNull();
+    expectNoContent(await hardDelete(s, id));
+
+    expect(s.db.movies).toEqual([]);
+    const audits = movieAudits(s.db);
+    expect(audits.map((row) => [row.action, row.details])).toEqual([
+      ['CREATE', { title: 'Avatar', slug: 'avatar' }],
+      ['DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }],
+      ['UPDATE', { restored: true, title: 'Avatar', slug: 'avatar' }],
+      ['DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }],
+      ['DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar' }],
+    ]);
+    expect(new Set(audits.map((row) => row.entityId))).toEqual(new Set([id]));
+    expect(new Set(audits.map((row) => row.adminId))).toEqual(new Set([s.adminId]));
   });
 });
