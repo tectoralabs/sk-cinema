@@ -1,4 +1,12 @@
 import { z } from 'zod';
+import {
+  calendarDateSchema,
+  deletedFilterSchema,
+  pageQuerySchema,
+  pageSizeQuerySchema,
+  queryBooleanSchema,
+  querySearchSchema,
+} from './common.js';
 
 /* -------------------------------------------------------------------------- */
 /* Building blocks                                                            */
@@ -28,9 +36,6 @@ export const slugSchema = z
   // abort: the pattern below never runs on over-long input.
   .max(SLUG_MAX_LENGTH, { abort: true })
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase letters, digits and single hyphens');
-
-/** Calendar date as `YYYY-MM-DD`. Rejects impossible dates such as 2026-02-30. */
-const calendarDateSchema = z.iso.date();
 
 const TRAILER_URL_MAX_LENGTH = 500;
 
@@ -217,36 +222,19 @@ export type MovieActiveBody = z.infer<typeof movieActiveBodySchema>;
 /* Query strings                                                              */
 /* -------------------------------------------------------------------------- */
 
-/** Positive integer from a query string. Digits only (no signs, decimals or exponents). */
-function queryInt(min: number, max: number) {
-  return z
-    .string()
-    .regex(/^\d{1,6}$/, 'Must be a whole number')
-    .transform(Number)
-    .pipe(z.number().int().min(min).max(max));
-}
-
 export const ADMIN_MOVIE_SORT_FIELDS = ['updatedAt', 'createdAt', 'title', 'releaseDate'] as const;
 
 /** Query of GET /api/admin/movies. All values arrive as strings and are converted here. */
 export const adminMovieListQuerySchema = z.strictObject({
   /** Free-text search. Whitespace-only is treated as no search. */
-  search: z
-    .string()
-    .trim()
-    .max(100)
-    .transform((value) => (value === '' ? undefined : value))
-    .optional(),
+  search: querySearchSchema.optional(),
   status: movieStatusSchema.optional(),
   /** Only the literal strings 'true' and 'false' are accepted. */
-  isActive: z
-    .enum(['true', 'false'])
-    .transform((value) => value === 'true')
-    .optional(),
+  isActive: queryBooleanSchema.optional(),
   /** Soft-deleted movies: hide them (default), include them, or show only them. */
-  deleted: z.enum(['exclude', 'include', 'only']).default('exclude'),
-  page: queryInt(1, 999_999).default(1),
-  pageSize: queryInt(1, 100).default(20),
+  deleted: deletedFilterSchema.default('exclude'),
+  page: pageQuerySchema,
+  pageSize: pageSizeQuerySchema,
   sort: z.enum(ADMIN_MOVIE_SORT_FIELDS).default('updatedAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
 });
