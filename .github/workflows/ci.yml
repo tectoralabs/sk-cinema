@@ -16,7 +16,29 @@ jobs:
   check:
     name: Lint, typecheck and test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
+    # Throwaway Postgres for `pnpm test:pg` (apps/api/src/**/*.pg.test.ts). Postgres 18 with the
+    # C.UTF-8 collation to match Neon; the smoke test checks both. The credentials below are NOT
+    # secrets: the database only exists inside this job and is destroyed with it.
+    services:
+      postgres:
+        # Major tag on purpose: picks up 18.x patch releases like Neon does, while the smoke test
+        # fails the run if the major version ever differs.
+        image: postgres:18
+        env:
+          POSTGRES_USER: sk_test
+          POSTGRES_PASSWORD: sk_test
+          POSTGRES_DB: sk_cinema_test
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sk_test -d sk_cinema_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v7
         with:
@@ -44,3 +66,12 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      # The pg global setup runs `prisma migrate deploy` against TEST_DATABASE_URL itself.
+      # REQUIRE_PG_TESTS=true turns a missing URL into a failure, so these tests never skip
+      # silently. DATABASE_URL / DIRECT_URL stay unset: the guard refuses a test URL equal to them.
+      - name: Test (real Postgres)
+        run: pnpm test:pg
+        env:
+          TEST_DATABASE_URL: postgresql://sk_test:sk_test@localhost:5432/sk_cinema_test
+          REQUIRE_PG_TESTS: 'true'
