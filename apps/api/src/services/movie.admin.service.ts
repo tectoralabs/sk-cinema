@@ -11,7 +11,7 @@ import { Prisma, type Movie, type PrismaClient } from '../generated/prisma/clien
 import type { MemoryCache } from '../lib/cache.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { escapeLikePattern } from '../lib/likePattern.js';
-import { firstFreeSlug, slugify } from '../lib/slug.js';
+import { firstFreeSlug, isSlugOrSuffixed, slugify } from '../lib/slug.js';
 import { writeAudit, type AuditEntry } from './audit.service.js';
 import { formatDateOnly, invalidatePublicMovies } from './movie.public.service.js';
 
@@ -437,11 +437,15 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     // Slugs that clashed in an earlier attempt, in case the clashing row is not visible yet.
     const clashed: string[] = [];
     for (let attempt = 1; attempt <= AUTO_SLUG_MAX_ATTEMPTS; attempt += 1) {
+      // Only `base` and `base-...` rows, not every slug starting with the letters of `base`
+      // (`theatre` for `the`). `startsWith` is not LIKE-escaped by Prisma, which is safe here:
+      // a slugify() base only contains [a-z0-9-], never the wildcards `%` or `_`.
       const rows = await db.movie.findMany({
-        where: { slug: { startsWith: base } },
+        where: { OR: [{ slug: base }, { slug: { startsWith: `${base}-` } }] },
         select: { slug: true },
       });
-      const slug = firstFreeSlug(base, [...rows.map((r) => r.slug), ...clashed]);
+      const taken = rows.map((r) => r.slug).filter((slug) => isSlugOrSuffixed(slug, base));
+      const slug = firstFreeSlug(base, [...taken, ...clashed]);
       try {
         return await insertWithAudit(input, slug, actor);
       } catch (error) {

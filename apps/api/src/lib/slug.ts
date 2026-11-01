@@ -76,6 +76,19 @@ export function withSuffix(base: string, n: number): string {
   return `${truncateSlug(base, SLUG_MAX_LENGTH - suffix.length)}${suffix}`;
 }
 
+const DIGITS = /^[0-9]+$/;
+
+/**
+ * True for `base` itself and `${base}-<digits>`: every slug `firstFreeSlug(base, ...)` can
+ * produce for a slugify() base (at most SLUG_BASE_MAX_LENGTH characters, so withSuffix never
+ * shortens it). Other slugs sharing the prefix, e.g. `the-batman` for base `the`, can never be
+ * a candidate. Plain string checks: nothing is compiled from the base.
+ */
+export function isSlugOrSuffixed(slug: string, base: string): boolean {
+  if (slug === base) return true;
+  return slug.startsWith(`${base}-`) && DIGITS.test(slug.slice(base.length + 1));
+}
+
 /**
  * Returns the first `withSuffix(base, n)` (n = 1, 2, 3, ...) that is not in `taken`.
  * Pure: the caller supplies the slugs already in use.

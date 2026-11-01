@@ -12,6 +12,8 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import { Prisma, type Movie } from '../generated/prisma/client.js';
 import { MemoryCache } from '../lib/cache.js';
 import { AppError } from '../lib/errors.js';
+import type * as SlugModule from '../lib/slug.js';
+import { firstFreeSlug } from '../lib/slug.js';
 import {
   inMemoryAuthDb,
   recordNotFoundError,
@@ -36,6 +38,12 @@ import {
   toAdminMovie,
 } from './movie.admin.service.js';
 import { PUBLIC_MOVIES_CACHE_PREFIX } from './movie.public.service.js';
+
+// The real firstFreeSlug, wrapped in a spy so tests can see which taken slugs it is given.
+vi.mock('../lib/slug.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof SlugModule>();
+  return { ...actual, firstFreeSlug: vi.fn(actual.firstFreeSlug) };
+});
 
 const DETECTION_FILE = 'apps/api/src/services/movie.admin.service.ts';
 const UPDATE_DETECTION =
@@ -305,6 +313,60 @@ describe('createMovieAdminService.create', () => {
     ).rejects.toBe(auditClash);
     expect(db.spies.$transaction).toHaveBeenCalledTimes(1);
     expect(db.movies).toEqual([]);
+  });
+
+  describe('generated slug lookup', () => {
+    beforeEach(() => {
+      vi.mocked(firstFreeSlug).mockClear();
+    });
+
+    const PREFIX_NEIGHBOURS = ['theatre', 'the-batman', 'the-matrix', 'the-2-towers', 'the-2x'];
+
+    it('loads only base and base-... slugs and passes firstFreeSlug only base and base-<n>', async () => {
+      const { db, service, actor } = setup([
+        testMovie({ slug: 'the', title: 'The' }),
+        testMovie({ slug: 'the-3', title: 'The 3' }),
+        ...PREFIX_NEIGHBOURS.map((slug) => testMovie({ slug, title: slug })),
+      ]);
+
+      const movie = await service.create(body({ title: 'The', durationMinutes: 90 }), actor);
+
+      expect(movie.slug).toBe('the-2');
+      expect(db.spies.movie.findMany).toHaveBeenCalledExactlyOnceWith({
+        where: { OR: [{ slug: 'the' }, { slug: { startsWith: 'the-' } }] },
+        select: { slug: true },
+      });
+      expect(vi.mocked(firstFreeSlug)).toHaveBeenCalledExactlyOnceWith('the', ['the', 'the-3']);
+    });
+
+    it('yields the base when only unrelated slugs share its prefix', async () => {
+      const { db, service, actor } = setup(
+        PREFIX_NEIGHBOURS.map((slug) => testMovie({ slug, title: slug })),
+      );
+
+      const movie = await service.create(body({ title: 'The', durationMinutes: 90 }), actor);
+
+      expect(movie.slug).toBe('the');
+      expect(vi.mocked(firstFreeSlug)).toHaveBeenCalledExactlyOnceWith('the', []);
+      expect(db.movies.map((m) => m.slug)).toContain('the');
+    });
+
+    it('counts soft-deleted holders of base-<n>, and remembers earlier clashes on retry', async () => {
+      const { db, service, actor } = setup([
+        testMovie({ slug: 'the', title: 'The' }),
+        testMovie({ slug: 'the-2', title: 'The 2', deletedAt: new Date('2026-10-01T00:00:00Z') }),
+        testMovie({ slug: 'the-batman', title: 'The Batman' }),
+      ]);
+      db.injectFault('movie', 'create', { error: uniqueConstraintError('movie', 'slug') });
+
+      const movie = await service.create(body({ title: 'The', durationMinutes: 90 }), actor);
+
+      expect(movie.slug).toBe('the-4');
+      expect(vi.mocked(firstFreeSlug).mock.calls).toEqual([
+        ['the', ['the', 'the-2']],
+        ['the', ['the', 'the-2', 'the-3']],
+      ]);
+    });
   });
 
   it('refuses a title with nothing to slugify before touching the database', async () => {

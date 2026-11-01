@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { z } from 'zod';
 import {
   adminMovieListQuerySchema,
   adminMovieListResponseSchema,
@@ -20,6 +21,14 @@ import {
 } from './movies.js';
 
 const MOVIE_ID = '01928f6e-7c3a-7b2e-9f4d-3a1b2c3d4e5f';
+
+/** One safeParse and how long it took, after a warm-up parse so JIT compilation is not timed. */
+function timeSafeParse<S extends z.ZodType>(schema: S, input: unknown) {
+  schema.safeParse('warm-up');
+  const start = performance.now();
+  const result = schema.safeParse(input);
+  return { result, ms: performance.now() - start };
+}
 
 const validPublicMovie = {
   id: MOVIE_ID,
@@ -82,6 +91,22 @@ describe('slugSchema', () => {
   ])('rejects %s', (_label, slug) => {
     expect(slugSchema.safeParse(slug).success).toBe(false);
   });
+
+  it('checks the length before the pattern, so the pattern never sees over-long input', () => {
+    const result = slugSchema.safeParse(`${'x'.repeat(160)}!`);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.code)).toEqual(['too_big']);
+  });
+
+  it.each([
+    ['hyphenated groups', `${'a-'.repeat(50_000)}!`],
+    ['one long group', `${'a'.repeat(100_000)}-`],
+  ])('rejects a ~100 KB malformed slug quickly with only a length issue (%s)', (_label, slug) => {
+    const { result, ms } = timeSafeParse(slugSchema, slug);
+    expect(ms).toBeLessThan(50);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.code)).toEqual(['too_big']);
+  });
 });
 
 describe('trailerUrlSchema', () => {
@@ -123,8 +148,55 @@ describe('trailerUrlSchema', () => {
     ['fragment', 'https://youtu.be/dQw4w9WgXcQ#x'],
     ['protocol-relative', '//www.youtube.com/watch?v=dQw4w9WgXcQ'],
     ['empty', ''],
+    ['uppercase scheme and host', 'HTTPS://WWW.YOUTUBE.COM/watch?v=dQw4w9WgXcQ'],
+    ['default port', 'https://www.youtube.com:443/watch?v=dQw4w9WgXcQ'],
+    ['dot segment', 'https://www.youtube.com/./watch?v=dQw4w9WgXcQ'],
+    ['watch fragment', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ#t=30'],
+    ['watch without query', 'https://www.youtube.com/watch'],
+    ['v only as a suffix of another name', 'https://www.youtube.com/watch?vv=dQw4w9WgXcQ'],
+    ['12-character video id', 'https://www.youtube.com/watch?v=dQw4w9WgXcQX'],
+    ['second question mark', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ?x=1'],
+    ['space in the query', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=3 0'],
+    ['youtu.be extra path', 'https://youtu.be/dQw4w9WgXcQ/extra'],
+    ['youtu.be short id', 'https://youtu.be/dQw4w9WgXc?si=x'],
+    ['youtu.be second question mark', 'https://youtu.be/dQw4w9WgXcQ?si=a?b'],
+    ['youtu.be credentials', 'https://user@youtu.be/dQw4w9WgXcQ'],
   ])('rejects %s', (_label, url) => {
     expect(trailerUrlSchema.safeParse(url).success).toBe(false);
+  });
+
+  it.each([
+    'https://www.youtube.com/watch?&&v=dQw4w9WgXcQ&',
+    'https://www.youtube.com/watch?a=1&v=dQw4w9WgXcQ&b=2&c',
+    'https://youtu.be/dQw4w9WgXcQ?',
+    'https://youtu.be/dQw4w9WgXcQ?a&&b=%20',
+  ])('accepts edge-case query strings: %s', (url) => {
+    expect(trailerUrlSchema.safeParse(url).success).toBe(true);
+  });
+
+  it('accepts exactly 500 characters and rejects 501 with only a length issue', () => {
+    const prefix = 'https://youtu.be/dQw4w9WgXcQ?si=';
+    const atMax = prefix + 'a'.repeat(500 - prefix.length);
+    expect(trailerUrlSchema.safeParse(atMax).success).toBe(true);
+
+    const result = trailerUrlSchema.safeParse(`${atMax}a`);
+    expect(result.success).toBe(false);
+    // The pattern check did not run on the over-long input (no second issue).
+    expect(result.error?.issues.map((issue) => issue.code)).toEqual(['too_big']);
+  });
+
+  // Regression: the old watch-URL regex backtracked quadratically on this shape and took ~1.4 s
+  // here, blocking the event loop. The input is the size the 100 KB JSON body limit allows.
+  it.each([
+    ['repeated v= parameters', `https://youtube.com/watch?${'v=aaaaaaaaaaa&'.repeat(7000)}!`],
+    ['repeated empty parameters', `https://youtube.com/watch?${'&'.repeat(98_000)}!`],
+    ['long youtu.be query', `https://youtu.be/dQw4w9WgXcQ?${'a&'.repeat(49_000)}!`],
+  ])('rejects a ~100 KB adversarial URL quickly (%s)', (_label, url) => {
+    expect(url.length).toBeGreaterThan(95_000);
+    const { result, ms } = timeSafeParse(trailerUrlSchema, url);
+    expect(ms).toBeLessThan(50);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.code)).toEqual(['too_big']);
   });
 });
 

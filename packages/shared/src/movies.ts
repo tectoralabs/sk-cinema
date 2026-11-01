@@ -9,41 +9,84 @@ export const movieStatusSchema = z.enum(['UPCOMING', 'NOW_SHOWING', 'ENDED']);
 
 export type MovieStatus = z.infer<typeof movieStatusSchema>;
 
+/*
+ * Regex safety: Zod 4 keeps running a string's later checks after one fails, so without
+ * `abort: true` a `.regex()` or `.refine()` placed after `.max(n)` still sees the whole input
+ * (up to the 100 KB JSON body limit). Every pattern below therefore runs only on input whose
+ * length has already been checked, and is linear in that input (no nested or overlapping
+ * quantifiers). Keep it that way when adding patterns.
+ */
+
+const SLUG_MAX_LENGTH = 160;
+
 /** URL slug: lowercase letters and digits in groups separated by single hyphens. */
 export const slugSchema = z
   .string()
   .min(1)
-  .max(160)
+  // abort: the pattern below never runs on over-long input.
+  .max(SLUG_MAX_LENGTH, { abort: true })
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase letters, digits and single hyphens');
 
 /** Calendar date as `YYYY-MM-DD`. Rejects impossible dates such as 2026-02-30. */
 const calendarDateSchema = z.iso.date();
 
-/** One query-string component, e.g. `t=30s`. Only URL-safe characters. */
-const QUERY_PART = '[A-Za-z0-9_.~%=-]*';
+const TRAILER_URL_MAX_LENGTH = 500;
+
+/** Prefixes of accepted watch links; the query string follows. */
+const YOUTUBE_WATCH_PREFIXES = [
+  'https://youtube.com/watch?',
+  'https://www.youtube.com/watch?',
+  'https://m.youtube.com/watch?',
+] as const;
+const YOUTUBE_SHORT_PREFIX = 'https://youtu.be/';
+/** A whole query string: URL-safe characters and `&` separators only (no `#`, `?`, `/`, `@`). */
+const QUERY_STRING = /^[A-Za-z0-9_.~%=&-]*$/;
 /** YouTube video IDs are 11 characters from this alphabet. */
-const VIDEO_ID = '[A-Za-z0-9_-]{11}';
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+
+/** A query string whose `&`-separated parameters include exactly `v=<video id>`. */
+function hasVideoIdParam(query: string): boolean {
+  return query.split('&').some((param) => param.startsWith('v=') && VIDEO_ID.test(param.slice(2)));
+}
 
 /**
  * Accepted trailer URLs (https only, no ports, credentials or fragments):
  * - https://youtube.com/watch?v=ID, https://www.youtube.com/watch?v=ID, https://m.youtube.com/watch?v=ID
  *   (other query parameters may appear before or after `v`)
  * - https://youtu.be/ID (optionally with a query, e.g. `?si=...` from the share button)
- * The patterns are anchored, so lookalike hosts such as youtube.com.evil.com are rejected.
+ *
+ * Plain string checks against exact prefixes, so lookalike hosts such as youtube.com.evil.com
+ * are rejected. Deliberately not `new URL()`: it normalises (lowercases the scheme and host,
+ * drops the default port `:443`, resolves `/./`, strips tabs and newlines), which would accept
+ * links these exact checks reject. Every step is linear, and the length is checked first.
  */
-const YOUTUBE_WATCH_URL = new RegExp(
-  `^https://(?:(?:www|m)\\.)?youtube\\.com/watch\\?(?:${QUERY_PART}&)*v=${VIDEO_ID}(?:&${QUERY_PART})*$`,
-);
-const YOUTUBE_SHORT_URL = new RegExp(
-  `^https://youtu\\.be/${VIDEO_ID}(?:\\?${QUERY_PART}(?:&${QUERY_PART})*)?$`,
-);
+function isYouTubeTrailerUrl(url: string): boolean {
+  if (url.length > TRAILER_URL_MAX_LENGTH) return false;
 
-/** HTTPS YouTube trailer link. See the patterns above for what is accepted. */
+  const watchPrefix = YOUTUBE_WATCH_PREFIXES.find((prefix) => url.startsWith(prefix));
+  if (watchPrefix !== undefined) {
+    const query = url.slice(watchPrefix.length);
+    return QUERY_STRING.test(query) && hasVideoIdParam(query);
+  }
+
+  if (url.startsWith(YOUTUBE_SHORT_PREFIX)) {
+    const rest = url.slice(YOUTUBE_SHORT_PREFIX.length);
+    const queryStart = rest.indexOf('?');
+    const videoId = queryStart === -1 ? rest : rest.slice(0, queryStart);
+    const query = queryStart === -1 ? '' : rest.slice(queryStart + 1);
+    return VIDEO_ID.test(videoId) && QUERY_STRING.test(query);
+  }
+
+  return false;
+}
+
+/** HTTPS YouTube trailer link. See isYouTubeTrailerUrl for what is accepted. */
 export const trailerUrlSchema = z
   .string()
   .trim()
-  .max(500)
-  .refine((url) => YOUTUBE_WATCH_URL.test(url) || YOUTUBE_SHORT_URL.test(url), {
+  // abort: the refine below never runs on over-long input (it also checks the length itself).
+  .max(TRAILER_URL_MAX_LENGTH, { abort: true })
+  .refine(isYouTubeTrailerUrl, {
     message: 'Must be an https YouTube link (youtube.com/watch?v=... or youtu.be/...)',
   });
 

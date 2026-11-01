@@ -421,6 +421,32 @@ describe('POST /api/admin/movies', () => {
       expect(movie.slug).toBe('avatar-2');
     });
 
+    it('a short base ignores the many slugs that merely start with it, and loads none of `theatre`', async () => {
+      const neighbours = ['theatre', 'the-batman', 'the-matrix', 'the-2-towers'].map((slug) =>
+        testMovie({ slug, title: slug }),
+      );
+      const s = await setup({ movies: neighbours });
+
+      const first = expectCreated(await createMovie(s, { title: 'The', durationMinutes: 90 }));
+      const second = expectCreated(await createMovie(s, { title: 'THE!', durationMinutes: 90 }));
+
+      expect([first.slug, second.slug]).toEqual(['the', 'the-2']);
+      expect(s.db.spies.movie.findMany).toHaveBeenCalledWith({
+        where: { OR: [{ slug: 'the' }, { slug: { startsWith: 'the-' } }] },
+        select: { slug: true },
+      });
+      // What each slug lookup returned: rows under `the-` (filtered later), never `theatre`.
+      const loaded = await Promise.all(
+        s.db.spies.movie.findMany.mock.results.map(
+          (result) => result.value as Promise<{ slug: string }[]>,
+        ),
+      );
+      expect(loaded.map((rows) => rows.map((row) => row.slug).sort())).toEqual([
+        ['the-2-towers', 'the-batman', 'the-matrix'],
+        ['the', 'the-2-towers', 'the-batman', 'the-matrix'],
+      ]);
+    });
+
     it('an explicit slug that is taken (even by a deleted movie) is a 409, never altered', async () => {
       const s = await setup({ movies: [deleted({ slug: 'avatar', title: 'Old Avatar' })] });
 

@@ -2,6 +2,7 @@ import { slugSchema } from '@sk-cinema/shared';
 import { describe, expect, it } from 'vitest';
 import {
   firstFreeSlug,
+  isSlugOrSuffixed,
   SLUG_BASE_MAX_LENGTH,
   SLUG_MAX_LENGTH,
   slugify,
@@ -123,6 +124,26 @@ describe('withSuffix', () => {
     ['too long', 'x'.repeat(SLUG_MAX_LENGTH + 1)],
   ])('throws for a %s base', (_label, base) => {
     expect(() => withSuffix(base, 2)).toThrow(TypeError);
+  });
+});
+
+describe('isSlugOrSuffixed', () => {
+  it.each(['the', 'the-2', 'the-10', 'the-2026', 'the-02'])('keeps %s for base "the"', (slug) => {
+    expect(isSlugOrSuffixed(slug, 'the')).toBe(true);
+  });
+
+  it.each(['theatre', 'the-', 'the-batman', 'the-2-towers', 'the-2x', 'the-x2', 'th', 'a-the-2'])(
+    'drops %s for base "the"',
+    (slug) => {
+      expect(isSlugOrSuffixed(slug, 'the')).toBe(false);
+    },
+  );
+
+  it('keeps every slug firstFreeSlug can produce from a slugify() base, even the longest', () => {
+    const base = 'x'.repeat(SLUG_BASE_MAX_LENGTH);
+    for (const n of [1, 2, 9, 10, 999_999]) {
+      expect(isSlugOrSuffixed(withSuffix(base, n), base)).toBe(true);
+    }
   });
 });
 
