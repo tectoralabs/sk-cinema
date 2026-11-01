@@ -24,6 +24,7 @@ import {
   adminMovieListWhere,
   createMovieAdminService,
   isMovieSlugClash,
+  MOVIE_CHANGED_MESSAGE,
   movieDetailChanges,
   parseDateOnly,
   toAdminMovie,
@@ -443,13 +444,58 @@ describe('createMovieAdminService updates', () => {
     ]);
   });
 
-  it('rethrows a P2025 unchanged when the movie is still there afterwards', async () => {
+  it('turns a P2025 into a 409 "changed" when the movie is still live afterwards', async () => {
     const movie = testMovie();
     const { db, service, actor } = setup([movie]);
-    const missing = recordNotFoundError('movie', 'an update');
-    db.injectFault('movie', 'update', { error: missing });
+    db.injectFault('movie', 'update', { error: recordNotFoundError('movie', 'an update') });
 
-    await expect(service.setActive(movie.id, false, actor)).rejects.toBe(missing);
+    const error = await service.setActive(movie.id, false, actor).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: MOVIE_CHANGED_MESSAGE,
+      details: undefined,
+    });
+    expect(db.auditLogs).toEqual([]);
+    expect(db.movies).toEqual([movie]);
+  });
+
+  it.each([
+    ['softDelete', testMovie()],
+    ['restore', testMovie({ deletedAt: new Date('2026-10-01T00:00:00.000Z') })],
+    ['hardDelete', testMovie({ deletedAt: new Date('2026-10-01T00:00:00.000Z') })],
+  ] as const)(
+    '%s turns a P2025 into a 409 "changed" when the movie is still in place afterwards',
+    async (operation, movie) => {
+      const { db, service, actor } = setup([movie]);
+      const write = operation === 'hardDelete' ? 'delete' : 'update';
+      db.injectFault('movie', write, {
+        error: recordNotFoundError('movie', write === 'delete' ? 'a delete' : 'an update'),
+      });
+
+      const error = await service[operation](movie.id, actor).catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(AppError);
+      expect(error).toMatchObject({
+        status: 409,
+        code: 'CONFLICT',
+        message: MOVIE_CHANGED_MESSAGE,
+      });
+      expect(db.auditLogs).toEqual([]);
+      expect(db.movies).toEqual([movie]);
+    },
+  );
+
+  it('propagates a failure of the re-read after a P2025 unchanged', async () => {
+    const movie = testMovie();
+    const { db, service, actor } = setup([movie]);
+    const failure = new Error('connection reset');
+    db.injectFault('movie', 'update', { error: recordNotFoundError('movie', 'an update') });
+    db.injectFault('movie', 'findUnique', { onCall: 2, error: failure });
+
+    await expect(service.setStatus(movie.id, 'NOW_SHOWING', actor)).rejects.toBe(failure);
     expect(db.auditLogs).toEqual([]);
   });
 

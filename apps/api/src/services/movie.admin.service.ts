@@ -29,6 +29,12 @@ export const MOVIE_ALREADY_DELETED_MESSAGE = 'Movie is already deleted';
 export const MOVIE_NOT_DELETED_MESSAGE = 'Movie is not deleted';
 /** DELETE /:id/permanent on a live movie: it must be moved to the trash (soft-deleted) first. */
 export const MOVIE_DELETE_FIRST_MESSAGE = 'Delete the movie before removing it permanently';
+/**
+ * A write lost a race but the movie is back where the write needed it (e.g. soft-deleted and
+ * restored by others between our read and our write). Not retried: the admin's request was
+ * based on a state that changed underneath them, so they must reload.
+ */
+export const MOVIE_CHANGED_MESSAGE = 'The movie was changed by someone else. Reload and try again.';
 export const SLUG_IN_USE_MESSAGE = 'Slug is already in use';
 export const SLUG_REQUIRED_MESSAGE =
   'A slug cannot be made from this title (it has no Latin letters or digits). ' +
@@ -245,9 +251,10 @@ class SlugClash extends Error {
 /**
  * Thrown inside a write transaction when the conditional update or delete matched no row
  * (P2025): a concurrent request deleted, soft-deleted or restored the movie after it was read.
+ * Turned into a 404 or 409 after the rollback (see lostWriteError), never a 500.
  */
 class MovieGone extends Error {
-  constructor(readonly original: unknown) {
+  constructor() {
     super('Movie changed before the write');
     this.name = 'MovieGone';
   }
@@ -258,15 +265,6 @@ const isRecordNotFound = (error: unknown) =>
 
 /** A 409 for a write to a soft-deleted movie: it exists, so the admin can restore it first. */
 const restoreFirst = () => new AppError(409, ERROR_CODES.CONFLICT, MOVIE_RESTORE_FIRST_MESSAGE);
-
-/**
- * Why a movie cannot be changed: 404 when there is no such movie, 409 when it is soft-deleted.
- * Null when it can be changed.
- */
-function unavailableMovieError(row: Pick<Movie, 'deletedAt'> | null): AppError | null {
-  if (row === null) return notFound(MOVIE_NOT_FOUND_MESSAGE);
-  return row.deletedAt === null ? null : restoreFirst();
-}
 
 /** What one admin write changes: the Prisma data and the audit row describing it. */
 interface PlannedChange {
@@ -325,6 +323,28 @@ export interface MovieAdminServiceDeps {
  * transaction; a write that would change nothing is not made, audited or cache-invalidating.
  */
 export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
+  /**
+   * The answer to a conditional write that matched no row (MovieGone), from the movie re-read
+   * after the rollback (the transaction is over, so this read is a new statement):
+   * - 404 when it is gone;
+   * - 409 `conflictMessage` when it is somewhere other than `from`, as if that change had come
+   *   before the request;
+   * - 409 MOVIE_CHANGED_MESSAGE when it is back at `from` (it left and returned between our read
+   *   and our write). The write is not retried: the request was based on a state that changed.
+   * Never a 500 (unless the re-read itself fails).
+   */
+  async function lostWriteError(
+    id: string,
+    from: MoviePlace,
+    conflictMessage: string,
+  ): Promise<AppError> {
+    const now = await db.movie.findUnique({ where: { id }, select: { deletedAt: true } });
+    return (
+      misplacedMovieError(now, from, conflictMessage) ??
+      new AppError(409, ERROR_CODES.CONFLICT, MOVIE_CHANGED_MESSAGE)
+    );
+  }
+
   /**
    * One transaction: insert the movie with `slug`, then its CREATE audit row. A unique
    * violation from the insert becomes a SlugClash (and the transaction rolls back); any other
@@ -442,6 +462,11 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
    * 5. the audit row (its failure rolls the update back and propagates as a 500);
    * then, only after the commit, the public movie cache is dropped.
    *
+   * A P2025 from step 4 means a concurrent request removed or soft-deleted the movie after
+   * step 1. It never becomes a 500: lostWriteError re-reads the movie after the rollback and
+   * answers 404, 409 MOVIE_RESTORE_FIRST_MESSAGE, or 409 MOVIE_CHANGED_MESSAGE when the movie
+   * is live again (soft-deleted and restored in between). Any other error is a 500.
+   *
    * Concurrency: the from-values come from step 1. Two admins changing the same field at the
    * same moment can both be recorded as changes from the same value; the row ends up with the
    * last committed write, as Postgres serialises the two UPDATEs on the row lock.
@@ -487,7 +512,7 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
           // request took the slug after the pre-check. Update isMovieSlugClash if Movie gains
           // another unique field (its guard test in movie.admin.service.test.ts fails then).
           if (isMovieSlugClash(error)) throw new SlugClash(newSlug ?? current.slug);
-          if (isRecordNotFound(error)) throw new MovieGone(error);
+          if (isRecordNotFound(error)) throw new MovieGone();
           throw error;
         }
 
@@ -503,11 +528,9 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
       });
     } catch (error) {
       if (error instanceof SlugClash) throw slugConflict(SLUG_IN_USE_MESSAGE);
+      // Deleted, soft-deleted (or soft-deleted and restored) between the read and the update.
       if (error instanceof MovieGone) {
-        // Deleted or soft-deleted between the read and the update: answer as if it had been
-        // so from the start. (The transaction is over, so this read is a new statement.)
-        const now = await db.movie.findUnique({ where: { id }, select: { deletedAt: true } });
-        throw unavailableMovieError(now) ?? error.original;
+        throw await lostWriteError(id, 'live', MOVIE_RESTORE_FIRST_MESSAGE);
       }
       throw error;
     }
@@ -527,8 +550,10 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
    * always changes the movie, or is refused.
    *
    * A P2025 from step 2 means a concurrent request moved or removed the movie after step 1 (at
-   * READ COMMITTED, Postgres re-checks the WHERE on the locked row). The movie is re-read after
-   * the rollback and the request answered as if that change had come first: 404 or 409.
+   * READ COMMITTED, Postgres re-checks the WHERE on the locked row). It never becomes a 500:
+   * lostWriteError re-reads the movie after the rollback and answers as if that change had come
+   * first (404, or 409 `move.conflictMessage`), or 409 MOVIE_CHANGED_MESSAGE when the movie is
+   * back at `move.from` (moved away and back in between). Any other error is a 500.
    */
   async function moveMovie<R extends AuditedMovieRow>(
     id: string,
@@ -550,7 +575,7 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
         try {
           written = await move.write(tx, where);
         } catch (error) {
-          if (isRecordNotFound(error)) throw new MovieGone(error);
+          if (isRecordNotFound(error)) throw new MovieGone();
           throw error;
         }
 
@@ -566,9 +591,7 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
       });
     } catch (error) {
       if (error instanceof MovieGone) {
-        // The transaction is over, so this read is a new statement.
-        const now = await db.movie.findUnique({ where: { id }, select: { deletedAt: true } });
-        throw misplacedMovieError(now, move.from, move.conflictMessage) ?? error.original;
+        throw await lostWriteError(id, move.from, move.conflictMessage);
       }
       throw error;
     }

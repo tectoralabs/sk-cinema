@@ -20,6 +20,7 @@ import {
   AUTO_SLUG_MAX_ATTEMPTS,
   adminMovieSelect,
   MOVIE_ALREADY_DELETED_MESSAGE,
+  MOVIE_CHANGED_MESSAGE,
   MOVIE_DELETE_FIRST_MESSAGE,
   MOVIE_NOT_DELETED_MESSAGE,
   MOVIE_NOT_FOUND_MESSAGE,
@@ -2179,6 +2180,105 @@ describe.each(MOVE_ENDPOINTS)(
     });
   },
 );
+
+/** When the other admins put a trashed movie back in the trash (see RACE_ENDPOINTS). */
+const TRASHED_AGAIN_AT = new Date('2026-10-31T12:00:00.000Z');
+
+interface RaceEndpoint {
+  name: string;
+  role: AdminRole;
+  /** A request the endpoint accepts for `seed()`. */
+  send: (s: Setup, id: string) => request.Test;
+  seed: () => Movie;
+  /** The conditional write the endpoint makes. */
+  write: 'update' | 'delete';
+  /** What other admins do between our read and our write: move the movie away from `seed()`. */
+  away: (row: Movie) => void;
+}
+
+const RACE_ENDPOINTS: RaceEndpoint[] = [
+  ...PATCH_ENDPOINTS.map(({ name, path, change }): RaceEndpoint => ({
+    name,
+    role: 'EDITOR',
+    send: (s, id) => patchMovie(s, path(id), { body: change }),
+    seed: avatar,
+    write: 'update',
+    away: (row) => {
+      row.deletedAt = new Date('2026-10-31T00:00:00.000Z');
+    },
+  })),
+  ...MOVE_ENDPOINTS.map(({ name, method, path, role, movable, write, misplace }): RaceEndpoint => ({
+    name,
+    role,
+    send: (s, id) => sendMovie(s, method, path(id)),
+    seed: () => movable(),
+    write,
+    away: misplace,
+  })),
+];
+
+describe.each(RACE_ENDPOINTS)('$name: concurrent change', ({ role, send, seed, write, away }) => {
+  it('answers 409 "changed" when the movie leaves and comes back between our read and write', async () => {
+    const seeded = seed();
+    // Where the other admins leave the movie: back where our request needed it.
+    const final: Movie = {
+      ...seeded,
+      deletedAt: seeded.deletedAt === null ? null : TRASHED_AGAIN_AT,
+    };
+    const s = await setup({ role, movies: [seeded] });
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+    const row = () => {
+      const found = s.db.movies.find((m) => m.id === seeded.id);
+      if (!found) throw new Error('movie vanished');
+      return found;
+    };
+    const events: string[] = [];
+    // Other admins move the movie away just before our conditional write (so it gets P2025)...
+    s.db.injectFault('movie', write, {
+      before: () => {
+        away(row());
+        events.push('away');
+      },
+    });
+    // ...and back just before our re-read (findUnique call 1 is our read inside the transaction).
+    s.db.injectFault('movie', 'findUnique', {
+      onCall: 2,
+      before: () => {
+        row().deletedAt = final.deletedAt;
+        events.push('back');
+      },
+    });
+
+    const res = await send(s, seeded.id);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: { code: 'CONFLICT', message: MOVIE_CHANGED_MESSAGE } });
+    // The scenario really happened: read, write (P2025 after "away"), re-read (after "back").
+    expect(events).toEqual(['away', 'back']);
+    const findUnique = s.db.spies.movie.findUnique;
+    const writeSpy = s.db.spies.movie[write];
+    expect(findUnique).toHaveBeenCalledTimes(2);
+    expect(findUnique.mock.calls[0]?.[0]).toMatchObject({ where: { id: seeded.id } });
+    expect(findUnique.mock.calls[1]).toEqual([
+      { where: { id: seeded.id }, select: { deletedAt: true } },
+    ]);
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    expect(writeSpy.mock.settledResults[0]).toMatchObject({
+      type: 'rejected',
+      value: { code: 'P2025' },
+    });
+    const [readOrder, reReadOrder] = findUnique.mock.invocationCallOrder;
+    const writeOrder = writeSpy.mock.invocationCallOrder[0] ?? NaN;
+    expect(writeOrder).toBeGreaterThan(readOrder ?? Infinity);
+    expect(reReadOrder).toBeGreaterThan(writeOrder);
+    // Not retried, nothing of ours written, and the other admins' final state kept.
+    expect(s.db.spies.$transaction).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.auditLog.create).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(storedMovie(s, seeded.id)).toEqual(final);
+  });
+});
 
 describe('DELETE /api/admin/movies/:id (soft delete)', () => {
   it.each<AdminRole>(['EDITOR', 'SUPER_ADMIN'])(
