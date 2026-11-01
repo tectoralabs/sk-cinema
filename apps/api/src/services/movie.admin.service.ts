@@ -12,7 +12,7 @@ import type { MemoryCache } from '../lib/cache.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { escapeLikePattern } from '../lib/likePattern.js';
 import { firstFreeSlug, isSlugOrSuffixed, slugify } from '../lib/slug.js';
-import { writeAudit, type AuditEntry } from './audit.service.js';
+import { writeAudit, type AuditActor, type AuditEntry } from './audit.service.js';
 import { formatDateOnly, invalidatePublicMovies } from './movie.public.service.js';
 
 const AUDIT_ENTITY = 'Movie';
@@ -303,12 +303,8 @@ interface MovieMove<R extends AuditedMovieRow> {
   audit: (row: R) => Required<Pick<AuditEntry, 'action' | 'details'>>;
 }
 
-/** Who made an admin change, for the audit row. Raw request values; writeAudit fits them. */
-export interface AuditActor {
-  adminId: string;
-  ipAddress?: string | undefined;
-  userAgent?: string | undefined;
-}
+/** Re-exported for existing importers; defined with writeAudit, which all admin services use. */
+export type { AuditActor };
 
 export type MovieAdminDb = Pick<PrismaClient, 'movie' | 'auditLog' | '$transaction'>;
 

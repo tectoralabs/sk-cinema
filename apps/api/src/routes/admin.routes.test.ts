@@ -391,6 +391,26 @@ describe('admin router: authentication by default', () => {
     expect(endpoints).toEqual(expect.arrayContaining(PUBLIC_AUTH_ENDPOINTS));
   });
 
+  it('sees every /screens route (Phase 5 T9), so the 401 walk below probes each one', () => {
+    const { app, mounts } = setup();
+    const screens = `${ADMIN_API_PATH}/screens`;
+    const screenEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
+      isUnder(e.split(' ')[1] ?? '', screens),
+    );
+
+    expect(screenEndpoints.sort()).toEqual(
+      [
+        `GET ${screens}`,
+        `POST ${screens}`,
+        `GET ${screens}/:id`,
+        `PATCH ${screens}/:id`,
+        `PATCH ${screens}/:id/active`,
+        `DELETE ${screens}/:id`,
+        `POST ${screens}/:id/restore`,
+      ].sort(),
+    );
+  });
+
   it('exposes only csrf, login, refresh and logout under /auth', () => {
     const { app, mounts } = setup();
     const authEndpoints = walkApp(app, mounts).endpoints.filter((e) =>

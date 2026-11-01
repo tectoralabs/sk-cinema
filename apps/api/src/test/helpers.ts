@@ -411,7 +411,7 @@ const MODELS: Record<ModelName, ModelSpec> = {
     foreignKeys: [],
     operators: {
       '*': new Set(SHOWTIME_ANY_COLUMN_OPERATORS),
-      name: new Set([...SHOWTIME_ANY_COLUMN_OPERATORS, 'equals', 'mode']),
+      name: new Set([...SHOWTIME_ANY_COLUMN_OPERATORS, 'equals', 'contains', 'mode']),
     },
     logic: NO_LOGIC,
   },
@@ -617,8 +617,8 @@ function relationWhere(condition: unknown, key: string, at: string): unknown {
  * Accepts only what the services use. Every model: per-column equality (Dates by time), `null`
  * (IS NULL) and `{ lt, lte, gt, gte }` with Date or number bounds. Per model (see MODELS):
  * movie `{ not: null }`, `{ in }`, `contains` (+ `mode`) on title and slug, `startsWith`
- * (+ `mode`) on slug, and `OR`; screen `{ not: null | value }`, `{ in }`, and `equals`
- * (+ `mode`) on name; showtime `{ not: null | value }`, `{ in }`, AND / OR / NOT, and the
+ * (+ `mode`) on slug, and `OR`; screen `{ not: null | value }`, `{ in }`, and `equals` /
+ * `contains` (+ `mode`) on name; showtime `{ not: null | value }`, `{ in }`, AND / OR / NOT, and the
  * relation filters `movie` / `screen` (`{ is: {...} }` or shorthand, judged by the related
  * model's own rules); setting `{ in }`. Everything else throws: other operators (`endsWith`,
  * `has`, `notIn`...), `isNot`, to-many relation filters, unknown columns, Json and list filters,
@@ -1422,7 +1422,8 @@ const includeOption = (model: ModelName): string[] =>
  * Per model:
  * - movie: findUnique, findFirst, findMany (where, orderBy, skip, take, select), count,
  *   create, update, delete, deleteMany. Text search follows Postgres LIKE/ILIKE (see `like`).
- * - screen: findUnique, findFirst, findMany, count, create, update, updateMany, delete.
+ * - screen: findUnique, findFirst, findMany, count, create, update, updateMany, delete. Name
+ *   search (`contains`) and the insensitive `equals` follow Postgres LIKE/ILIKE too.
  * - showtime: findUnique, findFirst, findMany, count, create, createMany, update, updateMany,
  *   deleteMany; `select` / `include` of `movie` and `screen` (nested select too); where with
  *   AND / OR / NOT and `movie` / `screen` relation filters.

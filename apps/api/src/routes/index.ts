@@ -4,11 +4,13 @@ import { createAuthController } from '../controllers/auth.controller.js';
 import { createHealthController } from '../controllers/health.controller.js';
 import { createMovieAdminController } from '../controllers/movie.admin.controller.js';
 import { createPublicMovieController } from '../controllers/movie.public.controller.js';
+import { createScreenAdminController } from '../controllers/screen.admin.controller.js';
 import { ADMIN_PREFIX, PUBLIC_MOVIES_PREFIX } from '../lib/apiPaths.js';
 import type { AuthServiceDeps } from '../services/auth.service.js';
 import { createHealthService } from '../services/health.service.js';
 import { createMovieAdminService } from '../services/movie.admin.service.js';
 import { createPublicMovieService } from '../services/movie.public.service.js';
+import { createScreenAdminService } from '../services/screen.admin.service.js';
 import { adminRoutes } from './admin.routes.js';
 import { healthRoutes } from './health.routes.js';
 import { publicMovieRoutes } from './movie.public.routes.js';
@@ -20,8 +22,8 @@ export function apiRouter({ config, prisma, cache, logger }: AppDeps): Router {
   const healthService = createHealthService(prisma, cache, logger);
   router.use(healthRoutes(createHealthController(healthService)));
 
-  // Public, read-only, cached in `cache`. Admin movie writes call invalidatePublicMovies(cache)
-  // on this same instance (the admin movie service below gets it).
+  // Public, read-only, cached in `cache`. Admin movie and screen writes call
+  // invalidatePublicMovies(cache) on this same instance (the admin services below get it).
   const publicMovieService = createPublicMovieService({ db: prisma, cache });
   router.use(
     PUBLIC_MOVIES_PREFIX,
@@ -38,6 +40,9 @@ export function apiRouter({ config, prisma, cache, logger }: AppDeps): Router {
       authController: createAuthController({ service: authService, config }),
       movieAdminController: createMovieAdminController(
         createMovieAdminService({ db: prisma, cache }),
+      ),
+      screenAdminController: createScreenAdminController(
+        createScreenAdminService({ db: prisma, cache }),
       ),
     }),
   );

@@ -1,6 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import {
   ADMIN_MOVIE_SORT_FIELDS,
   adminMovieListQuerySchema,
@@ -14,6 +12,7 @@ import { MemoryCache } from '../lib/cache.js';
 import { AppError } from '../lib/errors.js';
 import type * as SlugModule from '../lib/slug.js';
 import { firstFreeSlug } from '../lib/slug.js';
+import { readModelUniqueness, readSchemaPrisma } from '../test/prismaSchema.js';
 import {
   inMemoryAuthDb,
   recordNotFoundError,
@@ -56,74 +55,13 @@ const UPDATE_DETECTION =
 // Prisma 7's `prisma-client` generator exposes no runtime schema metadata with uniqueness:
 // there is no `Prisma.dmmf`, and the generated `runtimeDataModel` (internal/class.ts) lists
 // only field names, kinds and types. So the guard reads the source of truth, schema.prisma,
-// with the minimal reader below, and cross-checks the reader against the generated client
+// with the minimal reader in test/prismaSchema.ts, and cross-checks the reader against the generated client
 // (field list at runtime, unique inputs at compile time) so that a reader bug or a stale
 // client cannot make the guard pass silently.
 // ---------------------------------------------------------------------------
 
-const SCHEMA_PATH = fileURLToPath(new URL('../../prisma/schema.prisma', import.meta.url));
-
-/** Removes a `//` (or `///`) comment, ignoring `//` inside a double-quoted string. */
-function stripComment(line: string): string {
-  let inString = false;
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i];
-    if (ch === '\\' && inString) i += 1;
-    else if (ch === '"') inString = !inString;
-    else if (!inString && ch === '/' && line[i + 1] === '/') return line.slice(0, i);
-  }
-  return line;
-}
-
-/** Replaces double-quoted strings with "", so text inside them is never read as an attribute. */
-const blankStrings = (line: string) => line.replace(/"(?:[^"\\]|\\.)*"/g, '""');
-
-interface ModelUniqueness {
-  /** Every field name, in declaration order (scalar and relation fields). */
-  fields: string[];
-  /** Fields with a field-level `@id`. */
-  idFields: string[];
-  /** Fields with a field-level `@unique`. */
-  uniqueFields: string[];
-  /** Block-level `@@id(...)` and `@@unique(...)` attributes, as written. */
-  blockAttributes: string[];
-}
-
-/**
- * Reads one `model X { ... }` block of schema.prisma. Deliberately minimal: one field or block
- * attribute per line (what `prisma format` produces), comments and string contents ignored.
- * Throws if the block is missing or unterminated rather than guessing.
- */
-function readModelUniqueness(schema: string, model: string): ModelUniqueness {
-  const lines = schema.split(/\r?\n/).map((line) => blankStrings(stripComment(line)).trim());
-  const start = lines.findIndex((line) => new RegExp(`^model\\s+${model}\\s*\\{$`).test(line));
-  if (start === -1) throw new Error(`schema.prisma: model ${model} not found`);
-  const length = lines.slice(start + 1).findIndex((line) => line === '}');
-  if (length === -1) throw new Error(`schema.prisma: model ${model} is not closed`);
-
-  const result: ModelUniqueness = {
-    fields: [],
-    idFields: [],
-    uniqueFields: [],
-    blockAttributes: [],
-  };
-  for (const line of lines.slice(start + 1, start + 1 + length)) {
-    if (line === '') continue;
-    if (line.startsWith('@@')) {
-      if (/^@@(id|unique)\b/.test(line)) result.blockAttributes.push(line);
-      continue;
-    }
-    const [name = '', , ...attributes] = line.split(/\s+/);
-    result.fields.push(name);
-    const attrs = attributes.join(' ');
-    if (/(^|\s)@id\b/.test(attrs)) result.idFields.push(name);
-    if (/(^|\s)@unique\b/.test(attrs)) result.uniqueFields.push(name);
-  }
-  return result;
-}
-
 describe('guard: Movie unique fields (isMovieSlugClash assumption)', () => {
-  const movie = readModelUniqueness(readFileSync(SCHEMA_PATH, 'utf8'), 'Movie');
+  const movie = readModelUniqueness(readSchemaPrisma(), 'Movie');
 
   it('the schema reader sees every Movie scalar field the generated client has', () => {
     const scalarFields = Object.values(Prisma.MovieScalarFieldEnum) as string[];
@@ -157,47 +95,6 @@ describe('guard: Movie unique fields (isMovieSlugClash assumption)', () => {
     // If either line fails typecheck: see UPDATE_DETECTION above.
     expectTypeOf<UniqueColumn>().toEqualTypeOf<'id' | 'slug'>();
     expectTypeOf<CompoundUnique>().toEqualTypeOf<never>();
-  });
-
-  describe('the schema reader itself', () => {
-    const read = (body: string) => readModelUniqueness(`model M {\n${body}\n}\n`, 'M');
-
-    it('finds field-level @id and @unique, and block-level @@id / @@unique', () => {
-      expect(
-        read(
-          [
-            'a String @id @default(uuid(7)) @db.Uuid',
-            'b String @unique(map: "b_key") @db.VarChar(10)',
-            'c Int',
-            '@@unique([a, c])',
-            '@@id([a, b])',
-            '@@index([c])',
-          ].join('\n'),
-        ),
-      ).toEqual({
-        fields: ['a', 'b', 'c'],
-        idFields: ['a'],
-        uniqueFields: ['b'],
-        blockAttributes: ['@@unique([a, c])', '@@id([a, b])'],
-      });
-    });
-
-    it('ignores comments and string contents', () => {
-      expect(
-        read(
-          [
-            '/// docs mentioning @unique',
-            'a String // @unique in a comment',
-            'b String @default("@unique // not a comment")',
-            '// @@unique([a, b])',
-          ].join('\n'),
-        ),
-      ).toEqual({ fields: ['a', 'b'], idFields: [], uniqueFields: [], blockAttributes: [] });
-    });
-
-    it('throws for a missing model', () => {
-      expect(() => readModelUniqueness('model Other {\n}\n', 'Movie')).toThrow('not found');
-    });
   });
 });
 

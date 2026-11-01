@@ -29,6 +29,16 @@ export interface AuditEntry {
   userAgent?: string | null | undefined;
 }
 
+/**
+ * Who made an admin change, for the audit row: the signed-in admin plus raw request values
+ * (see lib/clientInfo.ts); writeAudit fits them to the columns.
+ */
+export interface AuditActor {
+  adminId: string;
+  ipAddress?: string | undefined;
+  userAgent?: string | undefined;
+}
+
 /** Accepts the PrismaClient or an interactive-transaction client. */
 export type AuditDb = Pick<Prisma.TransactionClient, 'auditLog'>;
 

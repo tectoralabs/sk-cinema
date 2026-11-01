@@ -2,12 +2,14 @@ import { Router, type RequestHandler } from 'express';
 import type { Config } from '../config/env.js';
 import type { AuthController } from '../controllers/auth.controller.js';
 import type { MovieAdminController } from '../controllers/movie.admin.controller.js';
+import type { ScreenAdminController } from '../controllers/screen.admin.controller.js';
 import { ADMIN_AUTH_PREFIX } from '../lib/apiPaths.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { csrfProtection } from '../middleware/csrf.js';
 import type { AuthDb } from '../services/auth.service.js';
 import { authRoutes } from './auth.routes.js';
 import { movieAdminRoutes } from './movie.admin.routes.js';
+import { screenAdminRoutes } from './screen.admin.routes.js';
 
 export interface AdminRoutesDeps {
   config: Pick<Config, 'auth' | 'adminOrigins'>;
@@ -16,6 +18,8 @@ export interface AdminRoutesDeps {
   authController: AuthController;
   /** Built in routes/index.ts with the app's shared cache, so writes can invalidate it. */
   movieAdminController: MovieAdminController;
+  /** Built in routes/index.ts with the same shared cache. */
+  screenAdminController: ScreenAdminController;
 }
 
 /** Admin responses are per-user and may be sensitive: never cache them anywhere. */
@@ -44,6 +48,7 @@ export function adminRoutes({
   db,
   authController,
   movieAdminController,
+  screenAdminController,
 }: AdminRoutesDeps): Router {
   const router = Router();
   const authenticated = requireAuth({ db, config });
@@ -63,6 +68,11 @@ export function adminRoutes({
     '/movies',
     requireRole('SUPER_ADMIN', 'EDITOR'),
     movieAdminRoutes(movieAdminController),
+  );
+  router.use(
+    '/screens',
+    requireRole('SUPER_ADMIN', 'EDITOR'),
+    screenAdminRoutes(screenAdminController),
   );
 
   return router;
