@@ -306,20 +306,20 @@ describePg('movies on real Postgres', () => {
 
   describePg('Unicode case-folding edges', () => {
     // Postgres ILIKE compares lower(text) with lower(pattern), character by character. The fake
-    // uses JavaScript's /iu matching (Unicode simple case folding), which differs on these.
+    // (helpers.ts `like`) now lowers each character the same way, so it matches on these too.
     beforeEach(async () => {
       await insertMovies(['Caſe Study', 'İzmir Nights', 'οδυσσευς'].map((title) => ({ title })));
     });
 
-    it('long s (ſ) does not match "s": lower(ſ) is ſ (the fake folds it to s)', async () => {
+    it('long s (ſ) does not match "s": lower(ſ) is ſ (the fake matches this)', async () => {
       expect(await adminTitles({ search: 'case' })).toEqual([]);
     });
 
-    it('dotted capital I (İ) matches "i": lower(İ) is i (the fake does not match it)', async () => {
+    it('dotted capital I (İ) matches "i": lower(İ) is i (the fake matches this)', async () => {
       expect(await adminTitles({ search: 'izmir' })).toEqual(['İzmir Nights']);
     });
 
-    it('final sigma (ς) does not match capital sigma: lower(Σ) is σ (the fake folds ς to σ)', async () => {
+    it('final sigma (ς) does not match capital sigma: lower(Σ) is σ (the fake matches this)', async () => {
       expect(await adminTitles({ search: 'ΕΥΣ' })).toEqual([]);
       expect(await adminTitles({ search: 'ΕΥ' })).toEqual(['οδυσσευς']);
     });
@@ -356,7 +356,7 @@ describePg('movies on real Postgres', () => {
       ]);
     });
 
-    it('orders by code point, so an emoji title sorts after U+FB00 (the fake compares UTF-16 units)', async () => {
+    it('orders by code point, so an emoji title sorts after U+FB00 (the fake sorts by code point too)', async () => {
       await insertMovies(
         ['\u{1F600} Smile', '\uFB00 Ligature', 'Élan', 'Zed'].map((title) => ({ title })),
       );
