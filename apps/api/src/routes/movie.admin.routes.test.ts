@@ -13,7 +13,6 @@ import type { Express } from 'express';
 import request from 'supertest';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { AdminRole, Movie } from '../generated/prisma/client.js';
-import { hashPassword } from '../lib/password.js';
 import { FORBIDDEN_MESSAGE } from '../middleware/auth.js';
 import { CSRF_HEADER } from '../middleware/csrf.js';
 import {
@@ -41,6 +40,7 @@ import {
   sessionFrom,
   testAdmin,
   testMovie,
+  testPasswordHash,
   uniqueConstraintError,
   type AuthClient,
   type InMemoryAuthDb,
@@ -60,7 +60,7 @@ const TAMIL_TITLE = 'விடுதலை';
 let passwordHash: string;
 
 beforeAll(async () => {
-  passwordHash = await hashPassword(PASSWORD);
+  passwordHash = await testPasswordHash(PASSWORD);
 });
 
 interface Setup {
@@ -341,6 +341,56 @@ describe('POST /api/admin/movies', () => {
 
       expect(movie).toMatchObject({ title: SINHALA_TITLE, slug: 'gahanu-lamai' });
       expect(movieAudits(s.db)).toHaveLength(1);
+    });
+
+    it('a Sinhala-only title end to end: 400 without a slug, 201 with one, then public by it', async () => {
+      const s = await setup();
+
+      expectError(
+        await createMovie(s, { title: SINHALA_TITLE, durationMinutes: 120, status: 'NOW_SHOWING' }),
+        400,
+        'VALIDATION_ERROR',
+      );
+      const movie = expectCreated(
+        await createMovie(s, {
+          title: SINHALA_TITLE,
+          slug: 'gahanu-lamai',
+          durationMinutes: 120,
+          status: 'NOW_SHOWING',
+        }),
+      );
+
+      const detail = await publicGet(s, '/gahanu-lamai');
+      expect(detail.status).toBe(200);
+      expect(publicMovieResponseSchema.parse(detail.body).movie).toMatchObject({
+        id: movie.id,
+        slug: 'gahanu-lamai',
+        title: SINHALA_TITLE,
+      });
+      const list = publicMovieListResponseSchema.parse((await publicGet(s, '')).body).movies;
+      expect(list.map((m) => [m.slug, m.title])).toEqual([['gahanu-lamai', SINHALA_TITLE]]);
+      // Only the successful create is audited.
+      expect(movieAudits(s.db).map((row) => row.details)).toEqual([
+        { title: SINHALA_TITLE, slug: 'gahanu-lamai' },
+      ]);
+    });
+
+    it('concurrent creates of the same title both succeed, with distinct slugs and audit rows', async () => {
+      const s = await setup();
+      const body = { title: 'Avatar', durationMinutes: 162 };
+
+      const responses = await Promise.all([createMovie(s, body), createMovie(s, body)]);
+
+      const movies = responses.map(expectCreated);
+      expect(movies.map((m) => m.slug).sort()).toEqual(['avatar', 'avatar-2']);
+      expect(new Set(movies.map((m) => m.id)).size).toBe(2);
+      expect(s.db.movies.map((m) => m.slug).sort()).toEqual(['avatar', 'avatar-2']);
+      const audits = movieAudits(s.db);
+      expect(audits.map((row) => row.action)).toEqual(['CREATE', 'CREATE']);
+      expect(audits.map((row) => row.entityId).sort()).toEqual(movies.map((m) => m.id).sort());
+      expect(audits.map((row) => row.details)).toEqual(
+        expect.arrayContaining(movies.map((m) => ({ title: 'Avatar', slug: m.slug }))),
+      );
     });
 
     it('suffixes -2, then -3, counting a soft-deleted movie that holds the base slug', async () => {
@@ -2508,6 +2558,140 @@ describe('DELETE /api/admin/movies/:id/permanent (hard delete)', () => {
 
     expect(created.slug).toBe('avatar');
     expect(created.id).not.toBe(seeded.id);
+  });
+
+  describe('order of checks, with several failures in one request', () => {
+    // The real order: express.json (app.ts) -> csrfProtection -> requireAuth (admin.routes.ts)
+    // -> requireRole('SUPER_ADMIN', 'EDITOR') at the /movies mount -> requireRole('SUPER_ADMIN')
+    // on the route -> validate (params, query, body) -> the service (404, then 409).
+    // Each row has every failure of the rows below it, and must get only its own answer.
+    const BAD = 'not-a-uuid/permanent?force=1';
+    const BAD_BODY = { foo: 1 };
+
+    interface OrderCase {
+      role: AdminRole;
+      /** The path below /movies/ (a function of the seeded live movie's id). */
+      path: (id: string) => string;
+      options: SendOptions;
+      status: number;
+      code: string;
+      /** Whether the request gets as far as the database (only 404 and 409 do). */
+      reachesDb: boolean;
+    }
+
+    const ORDER: [string, OrderCase][] = [
+      [
+        'a malformed JSON body, before CSRF and session (app-level body parser)',
+        {
+          role: 'EDITOR',
+          path: () => BAD,
+          options: { body: '{"foo":', token: 'wrong', cookies: [] },
+          status: 400,
+          code: 'INVALID_JSON',
+          reachesDb: false,
+        },
+      ],
+      [
+        'a bad CSRF token, no session, a bad id, query and body',
+        {
+          role: 'EDITOR',
+          path: () => BAD,
+          options: { body: BAD_BODY, token: 'wrong', cookies: [] },
+          status: 403,
+          code: 'CSRF_INVALID',
+          reachesDb: false,
+        },
+      ],
+      [
+        'a bad CSRF token with an EDITOR session (CSRF before the role)',
+        {
+          role: 'EDITOR',
+          path: () => BAD,
+          options: { body: BAD_BODY, token: 'wrong' },
+          status: 403,
+          code: 'CSRF_INVALID',
+          reachesDb: false,
+        },
+      ],
+      [
+        'good CSRF, no session, a bad id, query and body',
+        {
+          role: 'SUPER_ADMIN',
+          path: () => BAD,
+          options: { body: BAD_BODY, cookies: [] },
+          status: 401,
+          code: 'UNAUTHORIZED',
+          reachesDb: false,
+        },
+      ],
+      [
+        'an EDITOR with a bad id, query and body (role before validation)',
+        {
+          role: 'EDITOR',
+          path: () => BAD,
+          options: { body: BAD_BODY },
+          status: 403,
+          code: 'FORBIDDEN',
+          reachesDb: false,
+        },
+      ],
+      [
+        'a SUPER_ADMIN with a bad id, query and body',
+        {
+          role: 'SUPER_ADMIN',
+          path: () => BAD,
+          options: { body: BAD_BODY },
+          status: 400,
+          code: 'VALIDATION_ERROR',
+          reachesDb: false,
+        },
+      ],
+      [
+        'a SUPER_ADMIN with an unknown id',
+        {
+          role: 'SUPER_ADMIN',
+          path: () => `${randomUUID()}/permanent`,
+          options: {},
+          status: 404,
+          code: 'NOT_FOUND',
+          reachesDb: true,
+        },
+      ],
+      [
+        'a SUPER_ADMIN with a live (not yet deleted) movie',
+        {
+          role: 'SUPER_ADMIN',
+          path: (id) => `${id}/permanent`,
+          options: {},
+          status: 409,
+          code: 'CONFLICT',
+          reachesDb: true,
+        },
+      ],
+    ];
+
+    it.each(ORDER)('%s', async (_name, { role, path, options, status, code, reachesDb }) => {
+      const seeded = avatar();
+      const s = await setup({ role, movies: [seeded] });
+
+      const res = await sendMovie(s, 'delete', path(seeded.id), options);
+
+      const error = expectError(res, status, code);
+      if (code === 'VALIDATION_ERROR') {
+        // Every part is reported at once: validation runs after all the guards.
+        const parts = ['params', 'query', 'body'].map((part): unknown =>
+          expect.objectContaining({ path: expect.arrayContaining([part]) as unknown }),
+        );
+        expect(error.details).toEqual(expect.arrayContaining(parts));
+      }
+      if (code === 'CONFLICT') expect(error.message).toBe(MOVIE_DELETE_FIRST_MESSAGE);
+      // The body parser runs before the admin router (and its no-store), so only that 400 lacks it.
+      if (code !== 'INVALID_JSON') expect(res.headers['cache-control']).toBe('no-store');
+      expect(s.db.spies.movie.findUnique).toHaveBeenCalledTimes(reachesDb ? 1 : 0);
+      expect(s.db.spies.movie.delete).not.toHaveBeenCalled();
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+      expect(movieAudits(s.db)).toEqual([]);
+    });
   });
 
   it('a second hard delete of the same movie is a 404', async () => {

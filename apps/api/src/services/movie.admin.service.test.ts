@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
@@ -7,7 +8,7 @@ import {
   movieCreateBodySchema,
   movieUpdateBodySchema,
 } from '@sk-cinema/shared';
-import { describe, expect, expectTypeOf, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { Prisma, type Movie } from '../generated/prisma/client.js';
 import { MemoryCache } from '../lib/cache.js';
 import { AppError } from '../lib/errors.js';
@@ -21,14 +22,20 @@ import {
 import {
   AUTO_SLUG_MAX_ATTEMPTS,
   adminMovieListOrderBy,
+  adminMovieSelect,
   adminMovieListWhere,
   createMovieAdminService,
   isMovieSlugClash,
+  MOVIE_ALREADY_DELETED_MESSAGE,
   MOVIE_CHANGED_MESSAGE,
+  MOVIE_DELETE_FIRST_MESSAGE,
+  MOVIE_NOT_DELETED_MESSAGE,
+  MOVIE_NOT_FOUND_MESSAGE,
   movieDetailChanges,
   parseDateOnly,
   toAdminMovie,
 } from './movie.admin.service.js';
+import { PUBLIC_MOVIES_CACHE_PREFIX } from './movie.public.service.js';
 
 const DETECTION_FILE = 'apps/api/src/services/movie.admin.service.ts';
 const UPDATE_DETECTION =
@@ -508,5 +515,362 @@ describe('createMovieAdminService updates', () => {
     await expect(
       service.update(movie.id, movieUpdateBodySchema.parse({ title: 'New' }), actor),
     ).rejects.toBe(failure);
+  });
+});
+
+describe('createMovieAdminService: softDelete, restore and hardDelete', () => {
+  /** Date is frozen so the soft-delete timestamp and updatedAt are exact. */
+  const NOW = new Date('2026-11-01T04:30:00.000Z');
+  const TRASHED_AT = new Date('2026-10-01T00:00:00.000Z');
+  /** A cached public response; it must survive every refused or failed move. */
+  const CACHED_KEY = `${PUBLIC_MOVIES_CACHE_PREFIX}list:all`;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const live = (overrides: Partial<Movie> = {}) =>
+    testMovie({ slug: 'avatar', title: 'Avatar', status: 'NOW_SHOWING', ...overrides });
+  const trashed = (overrides: Partial<Movie> = {}) => live({ deletedAt: TRASHED_AT, ...overrides });
+
+  /**
+   * The service over the fake, with an event log: 'read' for every movie.findUnique,
+   * 'commit' / 'rollback' when a transaction settles, 'invalidate' when the public cache is
+   * dropped. The cache holds CACHED_KEY to start with.
+   */
+  function setup(movies: Movie[]) {
+    const admin = testAdmin();
+    const db = inMemoryAuthDb({ admins: [admin], movies });
+    const cache = new MemoryCache();
+    cache.set(CACHED_KEY, ['cached'], 60_000);
+    const events: string[] = [];
+
+    const transaction = db.spies.$transaction.getMockImplementation();
+    const read = db.spies.movie.findUnique.getMockImplementation();
+    if (!transaction || !read) throw new Error('the fake has no implementation to wrap');
+    db.spies.$transaction.mockImplementation((fn, options) =>
+      transaction(fn, options).then(
+        (value) => {
+          events.push('commit');
+          return value;
+        },
+        (error: unknown) => {
+          events.push('rollback');
+          throw error;
+        },
+      ),
+    );
+    db.spies.movie.findUnique.mockImplementation((args) => {
+      events.push('read');
+      return read(args);
+    });
+    const invalidate = cache.invalidatePrefix.bind(cache);
+    const invalidateSpy = vi.spyOn(cache, 'invalidatePrefix').mockImplementation((prefix) => {
+      events.push('invalidate');
+      invalidate(prefix);
+    });
+
+    const service = createMovieAdminService({ db: db.prisma, cache });
+    const actor = { adminId: admin.id, ipAddress: '203.0.113.7', userAgent: 'test-agent' };
+    return { db, cache, events, invalidateSpy, service, actor };
+  }
+
+  type Setup = ReturnType<typeof setup>;
+
+  /** The audit row (ignoring id and createdAt) a move by `actor` records. */
+  const auditRow = (s: Setup, entityId: string, action: string, details: object) => ({
+    adminId: s.actor.adminId,
+    action,
+    entity: 'Movie',
+    entityId,
+    details,
+    ipAddress: '203.0.113.7',
+    userAgent: 'test-agent',
+  });
+
+  /** Nothing of a refused or failed move survives: no audit row, movies and cache as they were. */
+  function expectUntouched(s: Setup, movies: Movie[]) {
+    expect(s.db.movies).toEqual(movies);
+    expect(s.db.auditLogs).toEqual([]);
+    expect(s.invalidateSpy).not.toHaveBeenCalled();
+    expect(s.cache.get(CACHED_KEY)).toEqual(['cached']);
+  }
+
+  describe('happy paths', () => {
+    it('softDelete stamps deletedAt with the current time and keeps everything else', async () => {
+      const movie = live({ isActive: false });
+      const s = setup([movie]);
+
+      const result = await s.service.softDelete(movie.id, s.actor);
+
+      expect(result).toEqual(toAdminMovie({ ...movie, deletedAt: NOW, updatedAt: NOW }));
+      expect(s.db.spies.movie.update).toHaveBeenCalledExactlyOnceWith({
+        where: { id: movie.id, deletedAt: null },
+        data: { deletedAt: NOW },
+        select: adminMovieSelect,
+      });
+      expect(s.db.movies).toEqual([{ ...movie, deletedAt: NOW, updatedAt: NOW }]);
+      expect(s.db.auditLogs).toEqual([
+        expect.objectContaining(
+          auditRow(s, movie.id, 'DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }),
+        ),
+      ]);
+      // The public cache is dropped once, and only after the transaction committed.
+      expect(s.events).toEqual(['read', 'commit', 'invalidate']);
+      expect(s.invalidateSpy).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+      expect(s.cache.get(CACHED_KEY)).toBeUndefined();
+    });
+
+    it('restore clears deletedAt and keeps visibility and status as they were', async () => {
+      const movie = trashed({ isActive: false, status: 'ENDED' });
+      const s = setup([movie]);
+
+      const result = await s.service.restore(movie.id, s.actor);
+
+      expect(result).toEqual(toAdminMovie({ ...movie, deletedAt: null, updatedAt: NOW }));
+      expect(result).toMatchObject({ isActive: false, status: 'ENDED', slug: 'avatar' });
+      expect(s.db.spies.movie.update).toHaveBeenCalledExactlyOnceWith({
+        where: { id: movie.id, deletedAt: { not: null } },
+        data: { deletedAt: null },
+        select: adminMovieSelect,
+      });
+      expect(s.db.auditLogs).toEqual([
+        expect.objectContaining(
+          auditRow(s, movie.id, 'UPDATE', { restored: true, title: 'Avatar', slug: 'avatar' }),
+        ),
+      ]);
+      expect(s.events).toEqual(['read', 'commit', 'invalidate']);
+      expect(s.cache.get(CACHED_KEY)).toBeUndefined();
+    });
+
+    it('hardDelete removes only that row, returns nothing, and audits what it was', async () => {
+      const before = live({ slug: 'before', title: 'Before' });
+      const movie = trashed();
+      const after = trashed({ slug: 'after', title: 'After' });
+      const s = setup([before, movie, after]);
+
+      await expect(s.service.hardDelete(movie.id, s.actor)).resolves.toBeUndefined();
+
+      expect(s.db.spies.movie.delete).toHaveBeenCalledExactlyOnceWith({
+        where: { id: movie.id, deletedAt: { not: null } },
+        select: { id: true, title: true, slug: true },
+      });
+      expect(s.db.movies).toEqual([before, after]);
+      expect(s.db.auditLogs).toEqual([
+        expect.objectContaining(
+          auditRow(s, movie.id, 'DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar' }),
+        ),
+      ]);
+      expect(s.events).toEqual(['read', 'commit', 'invalidate']);
+      expect(s.cache.get(CACHED_KEY)).toBeUndefined();
+    });
+
+    it('stores missing client details as NULL in the audit row', async () => {
+      const movie = live();
+      const s = setup([movie]);
+
+      await s.service.softDelete(movie.id, { adminId: s.actor.adminId });
+
+      expect(s.db.auditLogs[0]).toMatchObject({ ipAddress: null, userAgent: null });
+    });
+  });
+
+  type Operation = 'softDelete' | 'restore' | 'hardDelete';
+
+  interface MoveCase {
+    operation: Operation;
+    /** A movie the operation accepts. */
+    movable: () => Movie;
+    /** A movie in the wrong place for it. */
+    misplaced: () => Movie;
+    /** The 409 message for `misplaced()`. */
+    conflictMessage: string;
+    write: 'update' | 'delete';
+    /** Moves a row to where `misplaced()` is, as a concurrent request would. */
+    misplace: (row: Movie) => void;
+  }
+
+  const MOVES: MoveCase[] = [
+    {
+      operation: 'softDelete',
+      movable: live,
+      misplaced: trashed,
+      conflictMessage: MOVIE_ALREADY_DELETED_MESSAGE,
+      write: 'update',
+      misplace: (row) => {
+        row.deletedAt = TRASHED_AT;
+      },
+    },
+    {
+      operation: 'restore',
+      movable: trashed,
+      misplaced: live,
+      conflictMessage: MOVIE_NOT_DELETED_MESSAGE,
+      write: 'update',
+      misplace: (row) => {
+        row.deletedAt = null;
+      },
+    },
+    {
+      operation: 'hardDelete',
+      movable: trashed,
+      misplaced: live,
+      conflictMessage: MOVIE_DELETE_FIRST_MESSAGE,
+      write: 'delete',
+      misplace: (row) => {
+        row.deletedAt = null;
+      },
+    },
+  ];
+
+  /** The rejection of `promise` (null if it resolves). */
+  const failure = (promise: Promise<unknown>) =>
+    promise.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+  type Race = (s: Setup, id: string, move: MoveCase) => void;
+
+  /** What happens to the movie between the service's read and its conditional write. */
+  const RACES: [string, number, (move: MoveCase) => string, Race][] = [
+    [
+      'gone (hard-deleted)',
+      404,
+      () => MOVIE_NOT_FOUND_MESSAGE,
+      (s, id, { write }) => {
+        s.db.injectFault('movie', write, {
+          before: () => {
+            s.db.movies.splice(
+              s.db.movies.findIndex((m) => m.id === id),
+              1,
+            );
+          },
+        });
+      },
+    ],
+    [
+      'moved away',
+      409,
+      ({ conflictMessage }) => conflictMessage,
+      (s, id, { write, misplace }) => {
+        s.db.injectFault('movie', write, {
+          before: () => {
+            const row = s.db.movies.find((m) => m.id === id);
+            if (row) misplace(row);
+          },
+        });
+      },
+    ],
+    [
+      'moved away and back',
+      409,
+      () => MOVIE_CHANGED_MESSAGE,
+      (s, _id, { write }) => {
+        s.db.injectFault('movie', write, {
+          error: recordNotFoundError('movie', write === 'delete' ? 'a delete' : 'an update'),
+        });
+      },
+    ],
+  ];
+
+  describe.each(MOVES)('$operation', (move) => {
+    const { operation, movable, misplaced, conflictMessage, write } = move;
+
+    it('404 for an unknown id: read, rolled back, no write', async () => {
+      const movie = movable();
+      const s = setup([movie]);
+
+      const error = await failure(s.service[operation](randomUUID(), s.actor));
+
+      expect(error).toBeInstanceOf(AppError);
+      expect(error).toMatchObject({
+        status: 404,
+        code: 'NOT_FOUND',
+        message: MOVIE_NOT_FOUND_MESSAGE,
+      });
+      expect(s.db.spies.movie[write]).not.toHaveBeenCalled();
+      expect(s.events).toEqual(['read', 'rollback']);
+      expectUntouched(s, [movie]);
+    });
+
+    it(`409 "${conflictMessage}" for a movie in the wrong place: no write`, async () => {
+      const movie = misplaced();
+      const s = setup([movie]);
+
+      const error = await failure(s.service[operation](movie.id, s.actor));
+
+      expect(error).toBeInstanceOf(AppError);
+      expect(error).toMatchObject({
+        status: 409,
+        code: 'CONFLICT',
+        message: conflictMessage,
+        details: undefined,
+      });
+      expect(s.db.spies.movie[write]).not.toHaveBeenCalled();
+      expect(s.events).toEqual(['read', 'rollback']);
+      expectUntouched(s, [movie]);
+    });
+
+    it.each(RACES)(
+      'a P2025 when the movie is %s after the read: %i, from a re-read after the rollback',
+      async (_name, status, messageFor, race) => {
+        const movie = movable();
+        const s = setup([movie]);
+        race(s, movie.id, move);
+
+        const error = await failure(s.service[operation](movie.id, s.actor));
+
+        expect(error).toBeInstanceOf(AppError);
+        expect(error).toMatchObject({ status, message: messageFor(move) });
+        expect(s.db.spies.movie[write]).toHaveBeenCalledTimes(1);
+        // Read in the transaction, rollback, then one re-read outside it, of deletedAt only.
+        expect(s.events).toEqual(['read', 'rollback', 'read']);
+        expect(s.db.spies.movie.findUnique).toHaveBeenLastCalledWith({
+          where: { id: movie.id },
+          select: { deletedAt: true },
+        });
+        // Not retried, nothing audited, the cache kept.
+        expect(s.db.spies.$transaction).toHaveBeenCalledTimes(1);
+        expect(s.db.auditLogs).toEqual([]);
+        expect(s.invalidateSpy).not.toHaveBeenCalled();
+        expect(s.cache.get(CACHED_KEY)).toEqual(['cached']);
+      },
+    );
+
+    it('an audit failure rolls the write back and propagates the same error', async () => {
+      const before = live({ slug: 'before', title: 'Before' });
+      const movie = movable();
+      const after = live({ slug: 'after', title: 'After' });
+      const s = setup([before, movie, after]);
+      const auditError = new Error('audit table unavailable');
+      s.db.injectFault('auditLog', 'create', { error: auditError });
+
+      const error = await failure(s.service[operation](movie.id, s.actor));
+
+      expect(error).toBe(auditError);
+      expect(s.db.spies.movie[write]).toHaveBeenCalledTimes(1);
+      expect(s.events).toEqual(['read', 'rollback']);
+      // The row is back exactly as it was, in its place.
+      expectUntouched(s, [before, movie, after]);
+    });
+
+    it('any other write failure propagates unchanged, with no re-read', async () => {
+      const movie = movable();
+      const s = setup([movie]);
+      const writeError = new Error('connection reset');
+      s.db.injectFault('movie', write, { error: writeError });
+
+      const error = await failure(s.service[operation](movie.id, s.actor));
+
+      expect(error).toBe(writeError);
+      expect(s.events).toEqual(['read', 'rollback']);
+      expectUntouched(s, [movie]);
+    });
   });
 });
