@@ -36,6 +36,26 @@ describe('loginBodySchema', () => {
     expect(loginBodySchema.safeParse({ email, password: 'x' }).success).toBe(false);
   });
 
+  it.each([
+    ['dotted local part', `${'a.'.repeat(50_000)}@`],
+    ['long domain', `a@${'a-'.repeat(50_000)}.`],
+    ['no at sign', 'a'.repeat(100_000)],
+  ])(
+    'rejects a ~100 KB email quickly with only a length issue, before the pattern (%s)',
+    (_label, email) => {
+      const body = { email, password: 'x' };
+      loginBodySchema.safeParse({ email: 'warm@up.lk', password: 'x' }); // JIT warm-up, not timed
+      const start = performance.now();
+      const result = loginBodySchema.safeParse(body);
+      const ms = performance.now() - start;
+      expect(ms).toBeLessThan(50);
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => [issue.path, issue.code])).toEqual([
+        [['email'], 'too_big'],
+      ]);
+    },
+  );
+
   it('rejects an empty password', () => {
     expect(loginBodySchema.safeParse({ email: 'a@b.lk', password: '' }).success).toBe(false);
   });

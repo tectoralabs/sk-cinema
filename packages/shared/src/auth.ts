@@ -5,9 +5,13 @@ export const adminRoleSchema = z.enum(['SUPER_ADMIN', 'EDITOR']);
 
 export type AdminRole = z.infer<typeof adminRoleSchema>;
 
-/** Body of POST /api/admin/auth/login. Email is normalised; the password is used as typed. */
+/**
+ * Body of POST /api/admin/auth/login. Email is normalised; the password is used as typed.
+ * The length is checked before the email pattern: a pipe stops at the first failing step, so
+ * the pattern never runs on over-long input (Zod would otherwise run it after a failed max).
+ */
 export const loginBodySchema = z.strictObject({
-  email: z.string().trim().toLowerCase().pipe(z.email().max(254)),
+  email: z.string().trim().toLowerCase().max(254).pipe(z.email()),
   password: z.string().min(1).max(128),
 });
 

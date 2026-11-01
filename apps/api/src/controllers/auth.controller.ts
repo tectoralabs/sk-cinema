@@ -1,7 +1,8 @@
 import type { AdminProfileResponse, CsrfTokenResponse, LoginBody } from '@sk-cinema/shared';
-import type { Request, RequestHandler } from 'express';
+import type { RequestHandler } from 'express';
 import type { Config } from '../config/env.js';
 import { clearAuthCookies, readRefreshToken, setAuthCookies } from '../lib/authCookies.js';
+import { clientInfo } from '../lib/clientInfo.js';
 import { AppError } from '../lib/errors.js';
 import { issueCsrfToken } from '../middleware/csrf.js';
 import {
@@ -18,9 +19,6 @@ export interface AuthControllerDeps {
   service: AuthServiceDeps;
   config: Pick<Config, 'auth'>;
 }
-
-/** Client details recorded with sessions and audit rows (the service trims them). */
-const clientInfo = (req: Request) => ({ ipAddress: req.ip, userAgent: req.get('user-agent') });
 
 /**
  * Auth endpoints. Tokens only ever travel in cookies: response bodies carry the admin

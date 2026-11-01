@@ -14,3 +14,6 @@ export const ADMIN_API_PATH = `${API_PREFIX}${ADMIN_PREFIX}`;
 
 /** The admin router mounts the public auth routes (csrf, login, refresh, logout) here. */
 export const ADMIN_AUTH_PREFIX = '/auth';
+
+/** apiRouter mounts the public movie routes here: `/api/movies`. */
+export const PUBLIC_MOVIES_PREFIX = '/movies';

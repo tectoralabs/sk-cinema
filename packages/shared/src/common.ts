@@ -7,3 +7,11 @@ import { z } from 'zod';
 export const emptyBodySchema = z.strictObject({});
 
 export type EmptyBody = z.infer<typeof emptyBodySchema>;
+
+/**
+ * Query of endpoints that take no query parameters (e.g. GET /api/movies/:slug).
+ * Only an empty query string is accepted; any key is rejected.
+ */
+export const emptyQuerySchema = z.strictObject({});
+
+export type EmptyQuery = z.infer<typeof emptyQuerySchema>;
