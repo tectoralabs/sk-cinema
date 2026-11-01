@@ -2,8 +2,11 @@ import type {
   AdminMovieListQuery,
   AdminMovieListResponse,
   AdminMovieResponse,
+  MovieActiveBody,
   MovieCreateBody,
   MovieIdParams,
+  MovieStatusBody,
+  MovieUpdateBody,
 } from '@sk-cinema/shared';
 import type { RequestHandler } from 'express';
 import { clientInfo } from '../lib/clientInfo.js';
@@ -35,7 +38,39 @@ export function createMovieAdminController(service: MovieAdminService) {
     res.json({ movie } satisfies AdminMovieResponse);
   };
 
-  return { create, list, getById };
+  const update: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as MovieIdParams;
+    const movie = await service.update(id, req.body as MovieUpdateBody, {
+      adminId: req.admin.id,
+      ...clientInfo(req),
+    });
+    res.json({ movie } satisfies AdminMovieResponse);
+  };
+
+  const setStatus: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as MovieIdParams;
+    const { status } = req.body as MovieStatusBody;
+    const movie = await service.setStatus(id, status, {
+      adminId: req.admin.id,
+      ...clientInfo(req),
+    });
+    res.json({ movie } satisfies AdminMovieResponse);
+  };
+
+  const setActive: RequestHandler = async (req, res) => {
+    if (!req.admin) throw sessionExpired();
+    const { id } = req.params as MovieIdParams;
+    const { isActive } = req.body as MovieActiveBody;
+    const movie = await service.setActive(id, isActive, {
+      adminId: req.admin.id,
+      ...clientInfo(req),
+    });
+    res.json({ movie } satisfies AdminMovieResponse);
+  };
+
+  return { create, list, getById, update, setStatus, setActive };
 }
 
 export type MovieAdminController = ReturnType<typeof createMovieAdminController>;

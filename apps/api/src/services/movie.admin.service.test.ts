@@ -5,6 +5,7 @@ import {
   adminMovieListQuerySchema,
   adminMovieSchema,
   movieCreateBodySchema,
+  movieUpdateBodySchema,
 } from '@sk-cinema/shared';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { Prisma, type Movie } from '../generated/prisma/client.js';
@@ -23,6 +24,7 @@ import {
   adminMovieListWhere,
   createMovieAdminService,
   isMovieSlugClash,
+  movieDetailChanges,
   parseDateOnly,
   toAdminMovie,
 } from './movie.admin.service.js';
@@ -367,5 +369,98 @@ describe('adminMovieListOrderBy', () => {
       { releaseDate: { sort: order, nulls: 'last' } },
       { id: order },
     ]);
+  });
+});
+
+describe('movieDetailChanges', () => {
+  const current = toAdminMovie(
+    testMovie({
+      title: 'Avatar',
+      synopsis: null,
+      genres: ['Sci-Fi', 'Adventure'],
+      cast: [],
+      releaseDate: parseDateOnly('2026-11-01'),
+    }),
+  );
+  const changes = (input: Record<string, unknown>) =>
+    movieDetailChanges(current, movieUpdateBodySchema.parse(input));
+
+  it('ignores omitted fields and lists only the ones whose value differs', () => {
+    expect(changes({ title: 'Avatar', durationMinutes: 150 })).toEqual({
+      durationMinutes: { from: 120, to: 150 },
+    });
+  });
+
+  it('treats null as equal to a stored NULL, and a cleared value as a change', () => {
+    expect(changes({ synopsis: null })).toEqual({});
+    expect(changes({ releaseDate: null })).toEqual({
+      releaseDate: { from: '2026-11-01', to: null },
+    });
+  });
+
+  it('compares dates as YYYY-MM-DD', () => {
+    expect(changes({ releaseDate: '2026-11-01' })).toEqual({});
+    expect(changes({ releaseDate: '2026-11-02' })).toEqual({
+      releaseDate: { from: '2026-11-01', to: '2026-11-02' },
+    });
+  });
+
+  it('compares lists element by element: order and case matter', () => {
+    expect(changes({ genres: ['Sci-Fi', 'Adventure'], cast: [] })).toEqual({});
+    expect(changes({ genres: ['Adventure', 'Sci-Fi'] })).toEqual({
+      genres: { from: ['Sci-Fi', 'Adventure'], to: ['Adventure', 'Sci-Fi'] },
+    });
+    expect(changes({ genres: ['sci-fi', 'Adventure'] })).toHaveProperty('genres');
+    expect(changes({ genres: ['Sci-Fi'] })).toHaveProperty('genres');
+  });
+});
+
+describe('createMovieAdminService updates', () => {
+  const setup = (movies: Movie[]) => {
+    const admin = testAdmin();
+    const db = inMemoryAuthDb({ admins: [admin], movies });
+    const service = createMovieAdminService({ db: db.prisma, cache: new MemoryCache() });
+    const actor = { adminId: admin.id, ipAddress: '203.0.113.7', userAgent: 'test-agent' };
+    return { db, service, actor };
+  };
+
+  it('stores the audit actor and the change in one row', async () => {
+    const movie = testMovie({ status: 'UPCOMING' });
+    const { db, service, actor } = setup([movie]);
+
+    await service.setStatus(movie.id, 'NOW_SHOWING', actor);
+
+    expect(db.auditLogs).toEqual([
+      expect.objectContaining({
+        action: 'STATUS_CHANGE',
+        adminId: actor.adminId,
+        entity: 'Movie',
+        entityId: movie.id,
+        details: { field: 'status', from: 'UPCOMING', to: 'NOW_SHOWING' },
+        ipAddress: '203.0.113.7',
+        userAgent: 'test-agent',
+      }),
+    ]);
+  });
+
+  it('rethrows a P2025 unchanged when the movie is still there afterwards', async () => {
+    const movie = testMovie();
+    const { db, service, actor } = setup([movie]);
+    const missing = recordNotFoundError('movie', 'an update');
+    db.injectFault('movie', 'update', { error: missing });
+
+    await expect(service.setActive(movie.id, false, actor)).rejects.toBe(missing);
+    expect(db.auditLogs).toEqual([]);
+  });
+
+  it('does not treat errors other than P2002 / P2025 from the update as conflicts', async () => {
+    const movie = testMovie();
+    const { db, service, actor } = setup([movie]);
+    const failure = new Error('connection reset');
+    db.injectFault('movie', 'update', { error: failure });
+
+    await expect(
+      service.update(movie.id, movieUpdateBodySchema.parse({ title: 'New' }), actor),
+    ).rejects.toBe(failure);
   });
 });

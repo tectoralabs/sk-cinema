@@ -1,8 +1,11 @@
 import {
   adminMovieListQuerySchema,
   emptyQuerySchema,
+  movieActiveBodySchema,
   movieCreateBodySchema,
   movieIdParamsSchema,
+  movieStatusBodySchema,
+  movieUpdateBodySchema,
 } from '@sk-cinema/shared';
 import { Router } from 'express';
 import type { MovieAdminController } from '../controllers/movie.admin.controller.js';
@@ -25,6 +28,21 @@ export function movieAdminRoutes(controller: MovieAdminController): Router {
     '/:id',
     validate({ params: movieIdParamsSchema, query: emptyQuerySchema }),
     controller.getById,
+  );
+  router.patch(
+    '/:id',
+    validate({ params: movieIdParamsSchema, body: movieUpdateBodySchema, query: emptyQuerySchema }),
+    controller.update,
+  );
+  router.patch(
+    '/:id/status',
+    validate({ params: movieIdParamsSchema, body: movieStatusBodySchema, query: emptyQuerySchema }),
+    controller.setStatus,
+  );
+  router.patch(
+    '/:id/active',
+    validate({ params: movieIdParamsSchema, body: movieActiveBodySchema, query: emptyQuerySchema }),
+    controller.setActive,
   );
 
   return router;

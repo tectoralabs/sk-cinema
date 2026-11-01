@@ -4,6 +4,7 @@ import {
   adminMovieResponseSchema,
   apiErrorSchema,
   publicMovieListResponseSchema,
+  publicMovieResponseSchema,
   type AdminMovie,
   type AdminMovieListResponse,
   type MovieCreateBodyInput,
@@ -13,9 +14,12 @@ import request from 'supertest';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { AdminRole, Movie } from '../generated/prisma/client.js';
 import { hashPassword } from '../lib/password.js';
+import { CSRF_HEADER } from '../middleware/csrf.js';
 import {
   AUTO_SLUG_MAX_ATTEMPTS,
   adminMovieSelect,
+  MOVIE_NOT_FOUND_MESSAGE,
+  MOVIE_RESTORE_FIRST_MESSAGE,
   SLUG_GENERATION_FAILED_MESSAGE,
   SLUG_IN_USE_MESSAGE,
   SLUG_REQUIRED_MESSAGE,
@@ -24,6 +28,7 @@ import { PUBLIC_MOVIES_CACHE_PREFIX } from '../services/movie.public.service.js'
 import { SESSION_EXPIRED_MESSAGE } from '../services/auth.service.js';
 import {
   ADMIN_BASE,
+  ADMIN_ORIGIN,
   TEST_USER_AGENT,
   authClient,
   buildTestApp,
@@ -34,6 +39,7 @@ import {
   uniqueConstraintError,
   type AuthClient,
   type InMemoryAuthDb,
+  type SendOptions,
   type Session,
 } from '../test/helpers.js';
 
@@ -1117,5 +1123,745 @@ describe('GET /api/admin/movies', () => {
         expect(res.body).toEqual(INTERNAL_BODY);
       },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/admin/movies/:id, /:id/status, /:id/active
+// ---------------------------------------------------------------------------
+
+/**
+ * A browser-like PATCH with the session (by default), CSRF cookie and token, and Origin: the
+ * same request authClient.post sends, as the auth client has no patch.
+ */
+function patchMovie(s: Setup, path: string, options: SendOptions = {}) {
+  const {
+    body,
+    cookies = [s.session.access],
+    origin = ADMIN_ORIGIN,
+    token = s.client.csrf.token,
+  } = options;
+  const all = [...(options.csrfCookie === false ? [] : [s.client.csrf.cookie]), ...cookies];
+  let req = request(s.app).patch(`${ADMIN_BASE}/movies/${path}`).set('User-Agent', TEST_USER_AGENT);
+  if (all.length > 0) req = req.set('Cookie', all.join('; '));
+  if (origin !== null) req = req.set('Origin', origin);
+  if (token !== null) req = req.set(CSRF_HEADER, token);
+  if (body === undefined) return req;
+  return typeof body === 'string'
+    ? req.set('Content-Type', 'application/json').send(body)
+    : req.send(body);
+}
+
+const patchDetails = (s: Setup, id: string, body: object | string) => patchMovie(s, id, { body });
+const patchStatus = (s: Setup, id: string, body: object | string) =>
+  patchMovie(s, `${id}/status`, { body });
+const patchActive = (s: Setup, id: string, body: object | string) =>
+  patchMovie(s, `${id}/active`, { body });
+
+/** 200, no-store, and a body the strict shared response schema accepts. */
+function expectOk(res: request.Response): AdminMovie {
+  expect(res.status).toBe(200);
+  expect(res.headers['cache-control']).toBe('no-store');
+  return adminMovieResponseSchema.parse(res.body).movie;
+}
+
+/** A visitor's request (no cookies) to the public movie API. */
+const publicGet = (s: Setup, path: string) => request(s.app).get(`/api/movies${path}`);
+
+const publicSlugs = async (s: Setup, query = '') => {
+  const res = await publicGet(s, query);
+  expect(res.status).toBe(200);
+  return publicMovieListResponseSchema.parse(res.body).movies.map((m) => m.slug);
+};
+
+/** The live row (a copy, so later writes do not change it). */
+const storedMovie = (s: Setup, id: string): Movie => {
+  const row = s.db.movies.find((m) => m.id === id);
+  if (!row) throw new Error(`no movie ${id}`);
+  return structuredClone(row);
+};
+
+const SEEDED_AT = '2026-01-01T00:00:00.000Z';
+
+/** An UPCOMING, active movie with every editable field filled in. */
+const avatar = (overrides: Partial<Movie> = {}) =>
+  testMovie({
+    slug: 'avatar',
+    title: 'Avatar',
+    synopsis: 'Pandora.',
+    durationMinutes: 162,
+    language: 'English',
+    genres: ['Sci-Fi', 'Adventure'],
+    rating: 'PG-13',
+    director: 'James Cameron',
+    cast: ['Sam Worthington', 'Zoe Saldaña'],
+    releaseDate: new Date('2026-11-01T00:00:00.000Z'),
+    trailerUrl: 'https://youtu.be/dQw4w9WgXcQ',
+    ...overrides,
+  });
+
+interface PatchEndpoint {
+  name: string;
+  path: (id: string) => string;
+  /** A body that changes avatar(). */
+  change: object;
+  /** A body equal to what avatar() already has. */
+  noop: object;
+}
+
+const PATCH_ENDPOINTS: PatchEndpoint[] = [
+  {
+    name: 'PATCH /api/admin/movies/:id',
+    path: (id) => id,
+    change: { title: 'Avatar 2' },
+    noop: { title: 'Avatar' },
+  },
+  {
+    name: 'PATCH /api/admin/movies/:id/status',
+    path: (id) => `${id}/status`,
+    change: { status: 'NOW_SHOWING' },
+    noop: { status: 'UPCOMING' },
+  },
+  {
+    name: 'PATCH /api/admin/movies/:id/active',
+    path: (id) => `${id}/active`,
+    change: { isActive: false },
+    noop: { isActive: true },
+  },
+];
+
+describe.each(PATCH_ENDPOINTS)('$name: shared behaviour', ({ path, change, noop }) => {
+  const send = (s: Setup, id: string, options: SendOptions = {}) =>
+    patchMovie(s, path(id), options);
+
+  it.each<AdminRole>(['EDITOR', 'SUPER_ADMIN'])(
+    'a %s makes a change: one audit row, then the public cache is dropped',
+    async (role) => {
+      const seeded = avatar();
+      const s = await setup({ role, movies: [seeded] });
+      const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+      const movie = expectOk(await send(s, seeded.id, { body: change }));
+
+      expect(movie.id).toBe(seeded.id);
+      expect(movie.updatedAt > SEEDED_AT).toBe(true);
+      expect(s.db.spies.movie.update).toHaveBeenCalledTimes(1);
+      const audits = movieAudits(s.db);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({
+        adminId: s.adminId,
+        entity: 'Movie',
+        entityId: seeded.id,
+        userAgent: TEST_USER_AGENT,
+      });
+      expect(audits[0]?.ipAddress).toEqual(expect.any(String));
+      expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+      const auditOrder = s.db.spies.auditLog.create.mock.invocationCallOrder.at(-1) ?? Infinity;
+      expect(invalidate.mock.invocationCallOrder[0]).toBeGreaterThan(auditOrder);
+    },
+  );
+
+  it('a no-op answers 200 with the movie: no update, no audit, the public cache kept', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    const before = adminMovieResponseSchema.parse((await getMovie(s, seeded.id)).body).movie;
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    const listLoads = s.db.spies.movie.findMany.mock.calls.length;
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+    const movie = expectOk(await send(s, seeded.id, { body: noop }));
+
+    expect(movie).toEqual(before);
+    expect(movie.updatedAt).toBe(SEEDED_AT);
+    expect(s.db.spies.movie.update).not.toHaveBeenCalled();
+    expect(s.db.spies.auditLog.create).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+    expect(invalidate).not.toHaveBeenCalled();
+    // Still served from the cache: no new list query.
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    expect(s.db.spies.movie.findMany).toHaveBeenCalledTimes(listLoads);
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+  });
+
+  it('answers 401 without a session, before reading anything', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const res = await send(s, seeded.id, { body: change, cookies: [] });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+  });
+
+  it('answers 401 for an invalid session cookie, even with a bad body', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const res = await send(s, seeded.id, { body: {}, cookies: [`${s.session.access}x`] });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual(UNAUTHORIZED_BODY);
+  });
+
+  it.each([
+    ['a missing CSRF token', { token: null }],
+    ['a wrong CSRF token', { token: 'not-the-token' }],
+    ['a missing CSRF cookie', { csrfCookie: false }],
+    ['a missing Origin', { origin: null }],
+    ['a foreign Origin', { origin: 'https://evil.example' }],
+  ] as const)('answers 403 for %s, even with a session', async (_name, overrides) => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const res = await send(s, seeded.id, { body: change, ...overrides });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(CSRF_BODY);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it.each([
+    ['a change', change],
+    ['a no-op', noop],
+  ])('answers 404 for an unknown id (%s)', async (_name, body) => {
+    const s = await setup({ movies: [avatar()] });
+
+    const error = expectError(await send(s, randomUUID(), { body }), 404, 'NOT_FOUND');
+
+    expect(error.message).toBe(MOVIE_NOT_FOUND_MESSAGE);
+    expect(s.db.spies.movie.update).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it.each([
+    ['a change', change],
+    ['a no-op', noop],
+  ])('answers 409 for a soft-deleted movie (%s), changing nothing', async (_name, body) => {
+    const gone = avatar({ deletedAt: new Date('2026-10-01T00:00:00.000Z') });
+    const s = await setup({ movies: [gone] });
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+
+    const error = expectError(await send(s, gone.id, { body }), 409, 'CONFLICT');
+
+    expect(error.message).toBe(MOVIE_RESTORE_FIRST_MESSAGE);
+    expect(s.db.spies.movie.update).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(storedMovie(s, gone.id)).toEqual(gone);
+  });
+
+  it.each(['not-a-uuid', '123', 'avatar'])('answers 400 for the id %s', async (id) => {
+    const s = await setup({ movies: [avatar()] });
+
+    const error = expectError(await send(s, id, { body: change }), 400, 'VALIDATION_ERROR');
+
+    expect(error.details).toEqual([expect.objectContaining({ path: ['params', 'id'] })]);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('answers 400 for query parameters', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const error = expectError(
+      await patchMovie(s, `${path(seeded.id)}?force=1`, { body: change }),
+      400,
+      'VALIDATION_ERROR',
+    );
+
+    expect(error.details).toEqual([expect.objectContaining({ path: ['query'] })]);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it.each<[string, object | string | undefined]>([
+    ['an empty body', {}],
+    ['no body', undefined],
+    ['an unknown key', { ...change, foo: 1 }],
+    ['a JSON array', '[]'],
+    ['posterUrl', { ...change, posterUrl: 'https://res.cloudinary.com/x/image/upload/p.jpg' }],
+    ['bannerPublicId', { ...change, bannerPublicId: 'sk/banners/x' }],
+    ['deletedAt', { ...change, deletedAt: null }],
+  ])('answers 400 for %s, writing nothing', async (_name, body) => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const res = await send(s, seeded.id, body === undefined ? {} : { body });
+
+    expectError(res, 400, 'VALIDATION_ERROR');
+
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+  });
+
+  it('rolls the change back and answers a generic 500 when the audit write fails', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    const invalidate = vi.spyOn(s.cache, 'invalidatePrefix');
+    s.db.injectFault('auditLog', 'create', {
+      error: new Error('relation "AuditLog" does not exist'),
+    });
+
+    const res = await send(s, seeded.id, { body: change });
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual(INTERNAL_BODY);
+    // The update ran inside the transaction and was undone.
+    expect(s.db.spies.movie.update).toHaveBeenCalledTimes(1);
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    expect(movieAudits(s.db)).toEqual([]);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it('answers 409 when the movie is soft-deleted between the read and the update', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    s.db.injectFault('movie', 'update', {
+      before: () => {
+        const row = s.db.movies.find((m) => m.id === seeded.id);
+        if (row) row.deletedAt = new Date('2026-10-31T00:00:00.000Z');
+      },
+    });
+
+    const error = expectError(await send(s, seeded.id, { body: change }), 409, 'CONFLICT');
+
+    expect(error.message).toBe(MOVIE_RESTORE_FIRST_MESSAGE);
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it('answers 404 when the movie is hard-deleted between the read and the update', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    s.db.injectFault('movie', 'update', {
+      before: () => {
+        s.db.movies.splice(
+          s.db.movies.findIndex((m) => m.id === seeded.id),
+          1,
+        );
+      },
+    });
+
+    const error = expectError(await send(s, seeded.id, { body: change }), 404, 'NOT_FOUND');
+
+    expect(error.message).toBe(MOVIE_NOT_FOUND_MESSAGE);
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+});
+
+describe('PATCH /api/admin/movies/:id (details)', () => {
+  it('changes several fields, audits only the changed ones and keeps the slug', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const movie = expectOk(
+      await patchDetails(s, seeded.id, {
+        title: '  Avatar: The Way of Water  ',
+        synopsis: null,
+        durationMinutes: 192,
+        language: 'English', // unchanged
+        genres: ['Sci-Fi', 'Action', 'action'],
+        rating: 'PG-13', // unchanged
+        director: null,
+        cast: ['Sam Worthington'],
+        releaseDate: '2026-12-16',
+      }),
+    );
+
+    expect(movie).toEqual({
+      ...adminMovieResponseSchema.parse((await getMovie(s, seeded.id)).body).movie,
+      id: seeded.id,
+      slug: 'avatar',
+      title: 'Avatar: The Way of Water',
+      synopsis: null,
+      durationMinutes: 192,
+      language: 'English',
+      genres: ['Sci-Fi', 'Action'],
+      rating: 'PG-13',
+      director: null,
+      cast: ['Sam Worthington'],
+      releaseDate: '2026-12-16',
+      trailerUrl: 'https://youtu.be/dQw4w9WgXcQ',
+      status: 'UPCOMING',
+      isActive: true,
+      deletedAt: null,
+      createdAt: SEEDED_AT,
+    });
+    expect(movie.updatedAt > SEEDED_AT).toBe(true);
+
+    // Only the changed columns are written; the date as UTC midnight (a DATE column).
+    expect(s.db.spies.movie.update).toHaveBeenCalledExactlyOnceWith({
+      where: { id: seeded.id, deletedAt: null },
+      data: {
+        title: 'Avatar: The Way of Water',
+        synopsis: null,
+        durationMinutes: 192,
+        genres: ['Sci-Fi', 'Action'],
+        director: null,
+        cast: ['Sam Worthington'],
+        releaseDate: new Date('2026-12-16T00:00:00.000Z'),
+      },
+      select: adminMovieSelect,
+    });
+    expect(storedMovie(s, seeded.id).releaseDate?.toISOString()).toBe('2026-12-16T00:00:00.000Z');
+
+    const audits = movieAudits(s.db);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ action: 'UPDATE', entityId: seeded.id });
+    expect(audits[0]?.details).toEqual({
+      changes: {
+        title: { from: 'Avatar', to: 'Avatar: The Way of Water' },
+        synopsis: { from: 'Pandora.', to: null },
+        durationMinutes: { from: 162, to: 192 },
+        genres: { from: ['Sci-Fi', 'Adventure'], to: ['Sci-Fi', 'Action'] },
+        director: { from: 'James Cameron', to: null },
+        cast: { from: ['Sam Worthington', 'Zoe Saldaña'], to: ['Sam Worthington'] },
+        releaseDate: { from: '2026-11-01', to: '2026-12-16' },
+      },
+    });
+  });
+
+  it('fills fields that were empty, auditing from null', async () => {
+    const seeded = testMovie({ slug: 'bare', title: 'Bare' });
+    const s = await setup({ movies: [seeded] });
+
+    expectOk(
+      await patchDetails(s, seeded.id, {
+        language: 'Sinhala',
+        releaseDate: '2026-11-07',
+        trailerUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      }),
+    );
+
+    expect(movieAudits(s.db)[0]?.details).toEqual({
+      changes: {
+        language: { from: null, to: 'Sinhala' },
+        releaseDate: { from: null, to: '2026-11-07' },
+        trailerUrl: { from: null, to: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
+      },
+    });
+  });
+
+  it('a title change keeps the slug, and the public detail shows the new title', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    expect((await publicGet(s, '/avatar')).status).toBe(200); // cached now
+
+    const movie = expectOk(await patchDetails(s, seeded.id, { title: 'Avatar Remastered' }));
+
+    expect(movie.slug).toBe('avatar');
+    const detail = await publicGet(s, '/avatar');
+    expect(detail.status).toBe(200);
+    expect(publicMovieResponseSchema.parse(detail.body).movie.title).toBe('Avatar Remastered');
+    expect(s.db.spies.movie.update.mock.calls[0]?.[0].data).toEqual({ title: 'Avatar Remastered' });
+  });
+
+  it('an explicit slug changes it: the old public slug is gone, the new one served', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    expect((await publicGet(s, '/avatar')).status).toBe(200); // cached now
+
+    const movie = expectOk(await patchDetails(s, seeded.id, { slug: 'avatar-2009' }));
+
+    expect(movie).toMatchObject({ slug: 'avatar-2009', title: 'Avatar' });
+    expect(movieAudits(s.db)[0]?.details).toEqual({
+      changes: { slug: { from: 'avatar', to: 'avatar-2009' } },
+    });
+    expect((await publicGet(s, '/avatar')).status).toBe(404);
+    expect((await publicGet(s, '/avatar-2009')).status).toBe(200);
+  });
+
+  it('the current slug is not a change: no slug lookup, only the other fields written', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    expectOk(await patchDetails(s, seeded.id, { slug: 'avatar', title: 'Avatar (2009)' }));
+
+    // Only the read of the movie itself.
+    expect(s.db.spies.movie.findUnique).toHaveBeenCalledTimes(1);
+    expect(s.db.spies.movie.update.mock.calls[0]?.[0].data).toEqual({ title: 'Avatar (2009)' });
+    expect(movieAudits(s.db)[0]?.details).toEqual({
+      changes: { title: { from: 'Avatar', to: 'Avatar (2009)' } },
+    });
+  });
+
+  it.each([
+    ['an active movie', testMovie({ slug: 'taken', title: 'Taken' })],
+    ['a soft-deleted movie', deleted({ slug: 'taken', title: 'Taken' })],
+    ['a hidden movie', testMovie({ slug: 'taken', title: 'Taken', isActive: false })],
+  ])('a slug held by %s is a 409 on body.slug, changing nothing', async (_name, holder) => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded, holder] });
+
+    const error = expectError(
+      await patchDetails(s, seeded.id, { slug: 'taken', title: 'Renamed' }),
+      409,
+      'CONFLICT',
+    );
+
+    expect(error.message).toBe(SLUG_IN_USE_MESSAGE);
+    expect(error.details).toEqual([{ path: ['body', 'slug'], message: SLUG_IN_USE_MESSAGE }]);
+    expect(s.db.spies.movie.update).not.toHaveBeenCalled();
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it('a P2002 from the update is a 409 (never a 500), changing nothing', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    s.db.injectFault('movie', 'update', { error: uniqueConstraintError('movie', 'slug') });
+
+    const error = expectError(
+      await patchDetails(s, seeded.id, { slug: 'avatar-2009' }),
+      409,
+      'CONFLICT',
+    );
+
+    expect(error.message).toBe(SLUG_IN_USE_MESSAGE);
+    expect(s.db.spies.$transaction).toHaveBeenCalledTimes(1);
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it('a slug taken by a concurrent insert after the check is a 409', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    s.db.injectFault('movie', 'update', {
+      before: () => s.db.addMovie({ slug: 'avatar-2009', title: 'Racer', durationMinutes: 100 }),
+    });
+
+    expectError(await patchDetails(s, seeded.id, { slug: 'avatar-2009' }), 409, 'CONFLICT');
+
+    expect(storedMovie(s, seeded.id).slug).toBe('avatar');
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it('a P2002 from the audit write is a generic 500, not a slug clash', async () => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+    s.db.injectFault('auditLog', 'create', { error: uniqueConstraintError('auditLog', 'id') });
+
+    const res = await patchDetails(s, seeded.id, { slug: 'avatar-2009' });
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual(INTERNAL_BODY);
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  describe('no-op detection', () => {
+    it('every field equal to the stored value (lists, the date, nulls) is a no-op', async () => {
+      const seeded = avatar({ rating: null });
+      const s = await setup({ movies: [seeded] });
+
+      const movie = expectOk(
+        await patchDetails(s, seeded.id, {
+          title: '  Avatar ',
+          slug: 'avatar',
+          synopsis: 'Pandora.',
+          durationMinutes: 162,
+          language: 'English',
+          genres: ['Sci-Fi', 'Adventure', 'sci-fi'], // the duplicate is dropped by the schema
+          rating: null,
+          director: 'James Cameron',
+          cast: ['Sam Worthington', 'Zoe Saldaña'],
+          releaseDate: '2026-11-01',
+          trailerUrl: 'https://youtu.be/dQw4w9WgXcQ',
+        }),
+      );
+
+      expect(movie.updatedAt).toBe(SEEDED_AT);
+      expect(s.db.spies.movie.update).not.toHaveBeenCalled();
+      expect(movieAudits(s.db)).toEqual([]);
+    });
+
+    it.each<[string, object]>([
+      ['reordered genres', { genres: ['Adventure', 'Sci-Fi'] }],
+      ['a re-cased genre', { genres: ['sci-fi', 'Adventure'] }],
+      ['one cast member fewer', { cast: ['Sam Worthington'] }],
+      ['an empty list', { genres: [] }],
+      ['the next day', { releaseDate: '2026-11-02' }],
+      ['a cleared date', { releaseDate: null }],
+    ])('%s is a change', async (_name, body) => {
+      const seeded = avatar();
+      const s = await setup({ movies: [seeded] });
+
+      expectOk(await patchDetails(s, seeded.id, body));
+
+      expect(s.db.spies.movie.update).toHaveBeenCalledTimes(1);
+      expect(Object.keys(movieAudits(s.db)[0]?.details as object)).toEqual(['changes']);
+      expect(movieAudits(s.db)).toHaveLength(1);
+    });
+  });
+
+  describe('validation (400, nothing written)', () => {
+    it.each<[string, object]>([
+      ['null title', { title: null }],
+      ['null slug', { slug: null }],
+      ['null durationMinutes', { durationMinutes: null }],
+      ['null genres', { genres: null }],
+      ['null cast', { cast: null }],
+      ["'' synopsis", { synopsis: '' }],
+      ["'' language", { language: '' }],
+      ['whitespace-only title', { title: '   ' }],
+      ['a malformed slug', { slug: 'Not A Slug' }],
+      ['an impossible date', { releaseDate: '2026-02-30' }],
+      ['a non-YouTube trailer', { trailerUrl: 'https://evil.example/watch?v=dQw4w9WgXcQ' }],
+      ['a zero duration', { durationMinutes: 0 }],
+      ['status (its own endpoint)', { title: 'X', status: 'ENDED' }],
+      ['isActive (its own endpoint)', { title: 'X', isActive: false }],
+      ['posterPublicId', { posterPublicId: 'sk/posters/x' }],
+      ['bannerUrl', { bannerUrl: 'https://res.cloudinary.com/x/image/upload/b.jpg' }],
+    ])('rejects %s', async (_name, body) => {
+      const seeded = avatar();
+      const s = await setup({ movies: [seeded] });
+
+      expectError(await patchDetails(s, seeded.id, body), 400, 'VALIDATION_ERROR');
+
+      expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+      expect(movieAudits(s.db)).toEqual([]);
+      expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    });
+  });
+});
+
+describe('PATCH /api/admin/movies/:id/status', () => {
+  it.each<[Movie['status'], Movie['status']]>([
+    ['UPCOMING', 'NOW_SHOWING'],
+    ['UPCOMING', 'ENDED'],
+    ['NOW_SHOWING', 'ENDED'],
+    ['NOW_SHOWING', 'UPCOMING'],
+    ['ENDED', 'NOW_SHOWING'],
+    ['ENDED', 'UPCOMING'],
+  ])('%s -> %s is written and audited as a STATUS_CHANGE', async (from, to) => {
+    const seeded = avatar({ status: from });
+    const s = await setup({ movies: [seeded] });
+
+    const movie = expectOk(await patchStatus(s, seeded.id, { status: to }));
+
+    expect(movie.status).toBe(to);
+    expect(storedMovie(s, seeded.id).status).toBe(to);
+    expect(s.db.spies.movie.update).toHaveBeenCalledExactlyOnceWith({
+      where: { id: seeded.id, deletedAt: null },
+      data: { status: to },
+      select: adminMovieSelect,
+    });
+    const audits = movieAudits(s.db);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      action: 'STATUS_CHANGE',
+      entityId: seeded.id,
+      details: { field: 'status', from, to },
+    });
+  });
+
+  it('UPCOMING -> NOW_SHOWING moves the movie between cached public lists at once', async () => {
+    const seeded = avatar({ status: 'UPCOMING' });
+    const s = await setup({ movies: [seeded] });
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual([]);
+    expect(await publicSlugs(s, '?status=UPCOMING')).toEqual(['avatar']);
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual([]); // from the cache
+
+    expectOk(await patchStatus(s, seeded.id, { status: 'NOW_SHOWING' }));
+
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual(['avatar']);
+    expect(await publicSlugs(s, '?status=UPCOMING')).toEqual([]);
+  });
+
+  it('NOW_SHOWING -> ENDED drops it from the default public list; its page stays', async () => {
+    const seeded = avatar({ status: 'NOW_SHOWING' });
+    const s = await setup({ movies: [seeded] });
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    expect((await publicGet(s, '/avatar')).status).toBe(200);
+
+    expectOk(await patchStatus(s, seeded.id, { status: 'ENDED' }));
+
+    expect(await publicSlugs(s)).toEqual([]);
+    const detail = await publicGet(s, '/avatar');
+    expect(detail.status).toBe(200);
+    expect(publicMovieResponseSchema.parse(detail.body).movie.status).toBe('ENDED');
+  });
+
+  it.each<[string, object]>([
+    ['status=DRAFT', { status: 'DRAFT' }],
+    ['a lower-case status', { status: 'ended' }],
+    ['null', { status: null }],
+    ['another field too', { status: 'ENDED', title: 'X' }],
+    ['isActive instead', { isActive: false }],
+  ])('rejects %s (400, nothing written)', async (_name, body) => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    const error = expectError(await patchStatus(s, seeded.id, body), 400, 'VALIDATION_ERROR');
+
+    const where = (error.details as { path: (string | number)[] }[]).map((d) => d.path[0]);
+    expect(where.length).toBeGreaterThan(0);
+    expect(new Set(where)).toEqual(new Set(['body']));
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+});
+
+describe('PATCH /api/admin/movies/:id/active', () => {
+  it('hiding a cached movie removes it from the list and its page; showing brings it back', async () => {
+    const seeded = avatar({ status: 'NOW_SHOWING' });
+    const s = await setup({ movies: [seeded] });
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    expect((await publicGet(s, '/avatar')).status).toBe(200);
+
+    const hidden = expectOk(await patchActive(s, seeded.id, { isActive: false }));
+
+    expect(hidden.isActive).toBe(false);
+    expect(storedMovie(s, seeded.id).isActive).toBe(false);
+    expect(await publicSlugs(s)).toEqual([]);
+    expect(await publicSlugs(s, '?status=NOW_SHOWING')).toEqual([]);
+    expect((await publicGet(s, '/avatar')).status).toBe(404);
+
+    const shown = expectOk(await patchActive(s, seeded.id, { isActive: true }));
+
+    expect(shown.isActive).toBe(true);
+    expect(await publicSlugs(s)).toEqual(['avatar']);
+    expect((await publicGet(s, '/avatar')).status).toBe(200);
+
+    expect(movieAudits(s.db).map((row) => [row.action, row.details])).toEqual([
+      ['STATUS_CHANGE', { field: 'isActive', from: true, to: false }],
+      ['STATUS_CHANGE', { field: 'isActive', from: false, to: true }],
+    ]);
+    expect(s.db.spies.movie.update.mock.calls.map(([args]) => args.data)).toEqual([
+      { isActive: false },
+      { isActive: true },
+    ]);
+  });
+
+  it('showing an already shown movie and hiding a hidden one are no-ops', async () => {
+    const shown = avatar();
+    const hidden = testMovie({ slug: 'hidden', title: 'Hidden', isActive: false });
+    const s = await setup({ movies: [shown, hidden] });
+
+    expect(expectOk(await patchActive(s, shown.id, { isActive: true })).isActive).toBe(true);
+    expect(expectOk(await patchActive(s, hidden.id, { isActive: false })).isActive).toBe(false);
+
+    expect(s.db.spies.movie.update).not.toHaveBeenCalled();
+    expect(movieAudits(s.db)).toEqual([]);
+  });
+
+  it.each<[string, object]>([
+    ['the string "false"', { isActive: 'false' }],
+    ['the number 0', { isActive: 0 }],
+    ['null', { isActive: null }],
+    ['another field too', { isActive: false, status: 'ENDED' }],
+    ['status instead', { status: 'ENDED' }],
+  ])('rejects %s (400, nothing written)', async (_name, body) => {
+    const seeded = avatar();
+    const s = await setup({ movies: [seeded] });
+
+    expectError(await patchActive(s, seeded.id, body), 400, 'VALIDATION_ERROR');
+
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+    expect(storedMovie(s, seeded.id)).toEqual(seeded);
+    expect(movieAudits(s.db)).toEqual([]);
   });
 });

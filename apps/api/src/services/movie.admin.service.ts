@@ -4,13 +4,15 @@ import {
   type AdminMovieListQuery,
   type AdminMovieListResponse,
   type MovieCreateBody,
+  type MovieStatus,
+  type MovieUpdateBody,
 } from '@sk-cinema/shared';
 import { Prisma, type Movie, type PrismaClient } from '../generated/prisma/client.js';
 import type { MemoryCache } from '../lib/cache.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { escapeLikePattern } from '../lib/likePattern.js';
 import { firstFreeSlug, slugify } from '../lib/slug.js';
-import { writeAudit } from './audit.service.js';
+import { writeAudit, type AuditEntry } from './audit.service.js';
 import { formatDateOnly, invalidatePublicMovies } from './movie.public.service.js';
 
 const AUDIT_ENTITY = 'Movie';
@@ -18,6 +20,9 @@ const AUDIT_ENTITY = 'Movie';
 /** Transactions tried per create when an auto-generated slug keeps clashing with a concurrent insert. */
 export const AUTO_SLUG_MAX_ATTEMPTS = 3;
 
+export const MOVIE_NOT_FOUND_MESSAGE = 'Movie not found';
+/** A soft-deleted movie cannot be edited, re-statused or shown/hidden until it is restored. */
+export const MOVIE_RESTORE_FIRST_MESSAGE = 'Restore the movie first';
 export const SLUG_IN_USE_MESSAGE = 'Slug is already in use';
 export const SLUG_REQUIRED_MESSAGE =
   'A slug cannot be made from this title (it has no Latin letters or digits). ' +
@@ -99,6 +104,79 @@ export function parseDateOnly(date: string): Date {
   return new Date(`${date}T00:00:00.000Z`);
 }
 
+/** A field PATCH /api/admin/movies/:id may change. */
+export type MovieEditableField = keyof MovieUpdateBody;
+
+/**
+ * Every field of movieUpdateBodySchema, in a fixed order (the Record type makes a missing one a
+ * type error, and indexing AdminMovie with them proves each is a movie column).
+ */
+const EDITABLE_FIELDS = Object.keys({
+  title: true,
+  slug: true,
+  synopsis: true,
+  durationMinutes: true,
+  language: true,
+  genres: true,
+  rating: true,
+  director: true,
+  cast: true,
+  releaseDate: true,
+  trailerUrl: true,
+} satisfies Record<MovieEditableField, true>) as MovieEditableField[];
+
+/** An editable field's value in API form (releaseDate as YYYY-MM-DD). JSON-safe for the audit. */
+type EditableValue = AdminMovie[MovieEditableField];
+
+/** A Record, not an interface, so it is assignable to Prisma's JSON input types. */
+export type FieldChange = Record<'from' | 'to', EditableValue>;
+
+/** Only the fields that actually change; empty when the update is a no-op. */
+export type MovieDetailChanges = Partial<Record<MovieEditableField, FieldChange>>;
+
+/** Lists are equal element by element (order and case matter); everything else by `===`. */
+function sameEditableValue(a: EditableValue, b: EditableValue): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return (
+      Array.isArray(a) &&
+      Array.isArray(b) &&
+      a.length === b.length &&
+      a.every((value, i) => value === b[i])
+    );
+  }
+  return a === b;
+}
+
+/**
+ * Compares a validated update body with the stored movie, both in API form, so dates compare as
+ * YYYY-MM-DD and `null` (cleared) equals a stored NULL. Fields the body omits are ignored.
+ */
+export function movieDetailChanges(current: AdminMovie, body: MovieUpdateBody): MovieDetailChanges {
+  const changes: MovieDetailChanges = {};
+  for (const field of EDITABLE_FIELDS) {
+    const to = body[field];
+    if (to === undefined) continue;
+    const from = current[field];
+    if (!sameEditableValue(from, to)) changes[field] = { from, to };
+  }
+  return changes;
+}
+
+/** The Prisma `data` writing exactly the changed fields (releaseDate back to a DATE). */
+function detailUpdateData(changes: MovieDetailChanges): Prisma.MovieUpdateInput {
+  const data: Record<string, EditableValue | Date> = {};
+  for (const field of EDITABLE_FIELDS) {
+    const change = changes[field];
+    if (change === undefined) continue;
+    data[field] =
+      field === 'releaseDate' && typeof change.to === 'string'
+        ? parseDateOnly(change.to)
+        : change.to;
+  }
+  // Keys are EDITABLE_FIELDS (movie columns, see above); values come from the validated body.
+  return data;
+}
+
 /**
  * The `where` of the admin list: every given filter, combined with AND. `deleted` defaults to
  * 'exclude' in the query schema. The search matches title OR slug, case-insensitively, as a
@@ -150,12 +228,44 @@ export function adminMovieListOrderBy({
 const slugConflict = (message: string) =>
   new AppError(409, ERROR_CODES.CONFLICT, message, [{ path: ['body', 'slug'], message }]);
 
-/** Thrown inside a create transaction when the movie insert hit the slug's unique index. */
+/** Thrown inside a create or update transaction when the movie write hit the slug's unique index. */
 class SlugClash extends Error {
   constructor(readonly slug: string) {
     super(`Slug clash on ${slug}`);
     this.name = 'SlugClash';
   }
+}
+
+/**
+ * Thrown inside an update transaction when the conditional update matched no row (P2025): the
+ * movie was deleted or soft-deleted by a concurrent request after it was read.
+ */
+class MovieGone extends Error {
+  constructor(readonly original: unknown) {
+    super('Movie gone before the update');
+    this.name = 'MovieGone';
+  }
+}
+
+const isRecordNotFound = (error: unknown) =>
+  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025';
+
+/** A 409 for a write to a soft-deleted movie: it exists, so the admin can restore it first. */
+const restoreFirst = () => new AppError(409, ERROR_CODES.CONFLICT, MOVIE_RESTORE_FIRST_MESSAGE);
+
+/**
+ * Why a movie cannot be changed: 404 when there is no such movie, 409 when it is soft-deleted.
+ * Null when it can be changed.
+ */
+function unavailableMovieError(row: Pick<Movie, 'deletedAt'> | null): AppError | null {
+  if (row === null) return notFound(MOVIE_NOT_FOUND_MESSAGE);
+  return row.deletedAt === null ? null : restoreFirst();
+}
+
+/** What one admin write changes: the Prisma data and the audit row describing it. */
+interface PlannedChange {
+  data: Prisma.MovieUpdateInput;
+  audit: Required<Pick<AuditEntry, 'action' | 'details'>>;
 }
 
 /** Who made an admin change, for the audit row. Raw request values; writeAudit fits them. */
@@ -173,7 +283,10 @@ export interface MovieAdminServiceDeps {
   cache: Pick<MemoryCache, 'invalidatePrefix'>;
 }
 
-/** Admin movie reads and writes. Every write is audited in the same transaction. */
+/**
+ * Admin movie reads and writes. Every write that changes something is audited in the same
+ * transaction; a write that would change nothing is not made, audited or cache-invalidating.
+ */
 export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
   /**
    * One transaction: insert the movie with `slug`, then its CREATE audit row. A unique
@@ -282,6 +395,91 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     throw slugConflict(SLUG_GENERATION_FAILED_MESSAGE);
   }
 
+  /**
+   * The shared flow of every movie update, in one transaction:
+   * 1. read the movie (404 unknown, 409 soft-deleted, whatever the body);
+   * 2. `plan` compares the body with it; null means nothing would change, so the current movie
+   *    is returned with no write, no audit row and no cache invalidation;
+   * 3. a new slug is pre-checked against every movie, soft-deleted ones included (409);
+   * 4. the conditional update `where: { id, deletedAt: null }`;
+   * 5. the audit row (its failure rolls the update back and propagates as a 500);
+   * then, only after the commit, the public movie cache is dropped.
+   *
+   * Concurrency: the from-values come from step 1. Two admins changing the same field at the
+   * same moment can both be recorded as changes from the same value; the row ends up with the
+   * last committed write, as Postgres serialises the two UPDATEs on the row lock.
+   */
+  async function applyChange(
+    id: string,
+    actor: AuditActor,
+    plan: (current: AdminMovieRow) => PlannedChange | null,
+  ): Promise<AdminMovie> {
+    let outcome: { row: AdminMovieRow; changed: boolean };
+    try {
+      outcome = await db.$transaction(async (tx) => {
+        const current = await tx.movie.findUnique({ where: { id }, select: adminMovieSelect });
+        if (current === null) throw notFound(MOVIE_NOT_FOUND_MESSAGE);
+        if (current.deletedAt !== null) throw restoreFirst();
+
+        const change = plan(current);
+        if (change === null) return { row: current, changed: false };
+
+        const newSlug = typeof change.data.slug === 'string' ? change.data.slug : undefined;
+        if (newSlug !== undefined) {
+          // Only reached when the slug really changes, so any holder is another movie.
+          // Soft-deleted movies keep their slug: slugs are never reused.
+          const holder = await tx.movie.findUnique({
+            where: { slug: newSlug },
+            select: { id: true },
+          });
+          if (holder) throw slugConflict(SLUG_IN_USE_MESSAGE);
+        }
+
+        let row: AdminMovieRow;
+        try {
+          row = await tx.movie.update({
+            where: { id, deletedAt: null },
+            data: change.data,
+            select: adminMovieSelect,
+          });
+        } catch (error) {
+          // Slug-clash detection, as in insertWithAudit: ANY P2002 from this update is taken to
+          // be the slug (Movie's only unique columns are the generated `id` and `slug`, and
+          // adapter-pg's P2002 has no `meta.target`). Postgres only checks a unique index for a
+          // value the update writes, so in practice only a slug change can hit it: a concurrent
+          // request took the slug after the pre-check. Update isMovieSlugClash if Movie gains
+          // another unique field (its guard test in movie.admin.service.test.ts fails then).
+          if (isMovieSlugClash(error)) throw new SlugClash(newSlug ?? current.slug);
+          if (isRecordNotFound(error)) throw new MovieGone(error);
+          throw error;
+        }
+
+        await writeAudit(tx, {
+          ...change.audit,
+          adminId: actor.adminId,
+          entity: AUDIT_ENTITY,
+          entityId: row.id,
+          ipAddress: actor.ipAddress,
+          userAgent: actor.userAgent,
+        });
+        return { row, changed: true };
+      });
+    } catch (error) {
+      if (error instanceof SlugClash) throw slugConflict(SLUG_IN_USE_MESSAGE);
+      if (error instanceof MovieGone) {
+        // Deleted or soft-deleted between the read and the update: answer as if it had been
+        // so from the start. (The transaction is over, so this read is a new statement.)
+        const now = await db.movie.findUnique({ where: { id }, select: { deletedAt: true } });
+        throw unavailableMovieError(now) ?? error.original;
+      }
+      throw error;
+    }
+
+    // Only after the commit, so no request can re-cache the pre-update movie.
+    if (outcome.changed) invalidatePublicMovies(cache);
+    return toAdminMovie(outcome.row);
+  }
+
   return {
     /**
      * Creates a movie and its CREATE audit row atomically, then drops the cached public movie
@@ -327,8 +525,54 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     /** Any movie by id, soft-deleted or hidden ones included. 404 when there is none. */
     async getById(id: string): Promise<AdminMovie> {
       const row = await db.movie.findUnique({ where: { id }, select: adminMovieSelect });
-      if (!row) throw notFound('Movie not found');
+      if (!row) throw notFound(MOVIE_NOT_FOUND_MESSAGE);
       return toAdminMovie(row);
+    },
+
+    /**
+     * Changes the given detail fields (see applyChange). Only the fields whose value differs are
+     * written and audited (UPDATE, `{ changes: { field: { from, to } } }`). The slug changes only
+     * when the body has one: never because the title changed. 409 when a new slug is taken.
+     */
+    update(id: string, body: MovieUpdateBody, actor: AuditActor): Promise<AdminMovie> {
+      return applyChange(id, actor, (current) => {
+        const changes = movieDetailChanges(toAdminMovie(current), body);
+        if (Object.keys(changes).length === 0) return null;
+        return {
+          data: detailUpdateData(changes),
+          audit: { action: 'UPDATE', details: { changes } },
+        };
+      });
+    },
+
+    /** Moves the movie to `status` (STATUS_CHANGE, `{ field: 'status', from, to }`). */
+    setStatus(id: string, status: MovieStatus, actor: AuditActor): Promise<AdminMovie> {
+      return applyChange(id, actor, (current) =>
+        current.status === status
+          ? null
+          : {
+              data: { status },
+              audit: {
+                action: 'STATUS_CHANGE',
+                details: { field: 'status', from: current.status, to: status },
+              },
+            },
+      );
+    },
+
+    /** Shows or hides the movie (STATUS_CHANGE, `{ field: 'isActive', from, to }`). */
+    setActive(id: string, isActive: boolean, actor: AuditActor): Promise<AdminMovie> {
+      return applyChange(id, actor, (current) =>
+        current.isActive === isActive
+          ? null
+          : {
+              data: { isActive },
+              audit: {
+                action: 'STATUS_CHANGE',
+                details: { field: 'isActive', from: current.isActive, to: isActive },
+              },
+            },
+      );
     },
   };
 }
