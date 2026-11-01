@@ -12,6 +12,7 @@
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
+    "test:pg": "pnpm --filter @sk-cinema/api test:pg",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

@@ -1,4 +1,7 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
+
+/** Real-Postgres tests: opt-in, need TEST_DATABASE_URL (see src/test/pg/guard.ts). */
+const PG_TESTS = 'src/**/*.pg.test.ts';
 
 export default defineConfig({
   ssr: {
@@ -11,7 +14,6 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
     // Route tests drive the real app over loopback HTTP (Supertest, ~2,000 exchanges per run),
     // some with ~180 requests (the admin route walks, sent in batches of 10 to one shared
     // server since Phase 4 T10). Measured on a Windows dev
@@ -20,5 +22,28 @@ export default defineConfig({
     // 15 s still fails a real hang. Longer antivirus stalls (10 s+ per request) are an
     // environment problem, fixed by excluding loopback traffic from HTTP scanning, not here.
     testTimeout: 15_000,
+    // Both projects inherit the settings above (and the ssr config) via `extends: true`.
+    projects: [
+      {
+        extends: true,
+        test: {
+          // `pnpm test`: the in-memory suite, no database needed.
+          name: 'unit',
+          include: ['src/**/*.test.ts'],
+          exclude: [...configDefaults.exclude, PG_TESTS],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          // `pnpm test:pg`: against a throwaway local Postgres 18 (TEST_DATABASE_URL). The files
+          // share one database and TRUNCATE it between tests, so they must not run in parallel.
+          name: 'pg',
+          include: [PG_TESTS],
+          fileParallelism: false,
+          globalSetup: ['src/test/pg/globalSetup.ts'],
+        },
+      },
+    ],
   },
 });
