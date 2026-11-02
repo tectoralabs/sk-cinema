@@ -16,6 +16,7 @@ import { readModelUniqueness, readSchemaPrisma } from '../test/prismaSchema.js';
 import {
   inMemoryAuthDb,
   recordNotFoundError,
+  silentLogger,
   testAdmin,
   testMovie,
   uniqueConstraintError,
@@ -142,7 +143,7 @@ describe('createMovieAdminService.create', () => {
     const admin = testAdmin();
     const db = inMemoryAuthDb({ admins: [admin], movies });
     const cache = new MemoryCache();
-    const service = createMovieAdminService({ db: db.prisma, cache });
+    const service = createMovieAdminService({ db: db.prisma, cache, logger: silentLogger });
     const actor = { adminId: admin.id, ipAddress: '203.0.113.7', userAgent: 'test-agent' };
     return { db, cache, service, actor };
   };
@@ -386,7 +387,11 @@ describe('createMovieAdminService updates', () => {
   const setup = (movies: Movie[]) => {
     const admin = testAdmin();
     const db = inMemoryAuthDb({ admins: [admin], movies });
-    const service = createMovieAdminService({ db: db.prisma, cache: new MemoryCache() });
+    const service = createMovieAdminService({
+      db: db.prisma,
+      cache: new MemoryCache(),
+      logger: silentLogger,
+    });
     const actor = { adminId: admin.id, ipAddress: '203.0.113.7', userAgent: 'test-agent' };
     return { db, service, actor };
   };
@@ -534,7 +539,7 @@ describe('createMovieAdminService: softDelete, restore and hardDelete', () => {
       invalidate(prefix);
     });
 
-    const service = createMovieAdminService({ db: db.prisma, cache });
+    const service = createMovieAdminService({ db: db.prisma, cache, logger: silentLogger });
     const actor = { adminId: admin.id, ipAddress: '203.0.113.7', userAgent: 'test-agent' };
     return { db, cache, events, invalidateSpy, service, actor };
   }
@@ -622,7 +627,12 @@ describe('createMovieAdminService: softDelete, restore and hardDelete', () => {
       expect(s.db.movies).toEqual([before, after]);
       expect(s.db.auditLogs).toEqual([
         expect.objectContaining(
-          auditRow(s, movie.id, 'DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar' }),
+          auditRow(s, movie.id, 'DELETE', {
+            mode: 'hard',
+            title: 'Avatar',
+            slug: 'avatar',
+            showtimesDeleted: 0,
+          }),
         ),
       ]);
       expect(s.events).toEqual(['read', 'commit', 'invalidate']);

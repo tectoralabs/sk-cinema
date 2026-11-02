@@ -1,19 +1,31 @@
 import {
   ERROR_CODES,
+  SHOWTIME_BULK_MAX_DETAILS,
   type AdminMovie,
   type AdminMovieListQuery,
   type AdminMovieListResponse,
+  type FutureShowtimesConflictDetails,
   type MovieCreateBody,
   type MovieStatus,
   type MovieUpdateBody,
 } from '@sk-cinema/shared';
+import type { Logger } from 'pino';
 import { Prisma, type Movie, type PrismaClient } from '../generated/prisma/client.js';
 import type { MemoryCache } from '../lib/cache.js';
+import { toColomboDate, toColomboTime } from '../lib/colomboTime.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { escapeLikePattern } from '../lib/likePattern.js';
+import { lockMovie, lockScreens } from '../lib/locks.js';
+import { findShowtimeConflicts, type ShowtimeOverlap } from '../lib/showtimeOverlap.js';
 import { firstFreeSlug, isSlugOrSuffixed, slugify } from '../lib/slug.js';
 import { writeAudit, type AuditActor, type AuditEntry } from './audit.service.js';
 import { formatDateOnly, invalidatePublicMovies } from './movie.public.service.js';
+import { createSettingsService } from './settings.service.js';
+import {
+  findExistingShowtimeSlots,
+  showtimeConflictError,
+  type ShowtimeCandidate,
+} from './showtime.admin.service.js';
 
 const AUDIT_ENTITY = 'Movie';
 
@@ -29,6 +41,12 @@ export const MOVIE_ALREADY_DELETED_MESSAGE = 'Movie is already deleted';
 export const MOVIE_NOT_DELETED_MESSAGE = 'Movie is not deleted';
 /** DELETE /:id/permanent on a live movie: it must be moved to the trash (soft-deleted) first. */
 export const MOVIE_DELETE_FIRST_MESSAGE = 'Delete the movie before removing it permanently';
+/** DELETE /:id on a movie with upcoming showtimes. */
+export const MOVIE_DELETE_HAS_SHOWTIMES_MESSAGE =
+  'This movie has upcoming showtimes. Delete them before deleting the movie.';
+/** DELETE /:id/permanent on a movie with upcoming showtimes. */
+export const MOVIE_HARD_DELETE_HAS_SHOWTIMES_MESSAGE =
+  'This movie has upcoming showtimes. Delete them before removing the movie permanently.';
 /**
  * A write lost a race but the movie is back where the write needed it (e.g. soft-deleted and
  * restored by others between our read and our write). Not retried: the admin's request was
@@ -41,6 +59,21 @@ export const SLUG_REQUIRED_MESSAGE =
   'Enter a slug using lowercase letters, digits and hyphens, e.g. "my-movie".';
 export const SLUG_GENERATION_FAILED_MESSAGE =
   'Could not generate a unique slug for this title. Try again, or enter a slug.';
+
+/**
+ * PATCH /:id 409 for a longer running time. `showCount` is the distinct showtimes of this movie
+ * caught in a clash the longer length causes (both shows when two of its own clash). `clashCount`
+ * is the clashes themselves, one entry each in `details`, which keeps only the first
+ * SHOWTIME_BULK_MAX_DETAILS.
+ */
+export function movieLengthOverlapMessage(showCount: number, clashCount: number): string {
+  // One show can run into several neighbours, so the singular needs one clash as well.
+  const others = showCount === 1 && clashCount === 1 ? 'another showtime' : 'other showtimes';
+  const message = `A longer running time would make ${String(showCount)} of this movie's showtimes overlap ${others}`;
+  return clashCount > SHOWTIME_BULK_MAX_DETAILS
+    ? `${message}. Showing the first ${String(SHOWTIME_BULK_MAX_DETAILS)} of ${String(clashCount)} conflicts.`
+    : message;
+}
 
 /**
  * True when `error` is Prisma's unique-constraint violation (P2002). Only ever call it on an
@@ -272,6 +305,17 @@ interface PlannedChange {
   audit: Required<Pick<AuditEntry, 'action' | 'details'>>;
 }
 
+/** The running time `change` writes, if it writes one (it only does when the value differs). */
+const writtenDuration = (change: PlannedChange | null): number | undefined =>
+  typeof change?.data.durationMinutes === 'number' ? change.data.durationMinutes : undefined;
+
+/**
+ * One clash as an unordered pair of saved showtimes, so the same two shows compare equal in
+ * both runs of the length check whichever of them the clash was reported on.
+ */
+const overlapPairKey = ({ candidate, conflict }: ShowtimeOverlap): string =>
+  [candidate.showtimeId ?? '', conflict.showtimeId ?? ''].sort().join('|');
+
 /** Where a movie is: live (deletedAt null) or in the trash (soft-deleted). */
 type MoviePlace = 'live' | 'trash';
 
@@ -297,6 +341,12 @@ interface MovieMove<R extends AuditedMovieRow> {
   /** Where the movie must be for the move; anywhere else is a 409 with `conflictMessage`. */
   from: MoviePlace;
   conflictMessage: string;
+  /**
+   * Refuses the move by throwing. With a guard the Movie row is locked before the movie is read,
+   * so showtime writers (which lock the movie first, lib/locks.ts) wait until this move commits
+   * and then see the movie as it left it. A move without one takes no explicit lock.
+   */
+  guard?: (tx: Prisma.TransactionClient) => Promise<void>;
   /** The conditional write. `where` is `{ id, deletedAt }` repeating the `from` check. */
   write: (tx: Prisma.TransactionClient, where: Prisma.MovieWhereUniqueInput) => Promise<R>;
   /** The audit row, from the row the write returned. */
@@ -306,19 +356,129 @@ interface MovieMove<R extends AuditedMovieRow> {
 /** Re-exported for existing importers; defined with writeAudit, which all admin services use. */
 export type { AuditActor };
 
-export type MovieAdminDb = Pick<PrismaClient, 'movie' | 'auditLog' | '$transaction'>;
+export type MovieAdminDb = Pick<
+  PrismaClient,
+  'movie' | 'showtime' | 'setting' | 'auditLog' | '$transaction'
+>;
 
 export interface MovieAdminServiceDeps {
   db: MovieAdminDb;
   /** The app's one cache; public movie responses are dropped from it after each committed write. */
   cache: Pick<MemoryCache, 'invalidatePrefix'>;
+  /** For the settings read through a write's transaction: a setting key and a reason only. */
+  logger: Pick<Logger, 'warn'>;
+  /** Injectable clock for tests ("upcoming" showtimes, deletedAt). Defaults to the current time. */
+  now?: () => Date;
 }
 
 /**
  * Admin movie reads and writes. Every write that changes something is audited in the same
  * transaction; a write that would change nothing is not made, audited or cache-invalidating.
  */
-export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
+export function createMovieAdminService({
+  db,
+  cache,
+  logger,
+  now = () => new Date(),
+}: MovieAdminServiceDeps) {
+  /**
+   * 409 with `{ futureShowtimeCount }` while the movie has upcoming (startsAt after now),
+   * non-deleted showtimes. Past and soft-deleted showtimes do not count. Call it only under the
+   * Movie row lock: showtime writers lock the movie too, so none can add a show between this
+   * count and our commit.
+   */
+  async function refuseIfFutureShowtimes(
+    tx: Prisma.TransactionClient,
+    movieId: string,
+    message: string,
+  ): Promise<void> {
+    const futureShowtimeCount = await tx.showtime.count({
+      where: { movieId, deletedAt: null, startsAt: { gt: now() } },
+    });
+    if (futureShowtimeCount > 0) {
+      const details: FutureShowtimesConflictDetails = { futureShowtimeCount };
+      throw new AppError(409, ERROR_CODES.CONFLICT, message, details);
+    }
+  }
+
+  /**
+   * 409 when running `movie` for `newDuration` minutes would cause a clash that its current
+   * length does not have, under the CURRENT show gap. Clashes that exist already (the gap was
+   * raised, or anything else unrelated to the longer length) do not count: a gap change never
+   * makes an unrelated edit fail. Call it only under the Movie row lock, with `movie` read under
+   * that lock and only for an increase; a shorter or unchanged length is never checked.
+   *
+   * 1. Load the movie's future live shows. New ones cannot appear while we hold the movie lock.
+   *    A concurrent showtime delete takes no lock (see the showtime service), so a show just
+   *    deleted may still be checked: that can refuse an edit once, never let a clash through.
+   * 2. Lock their screens (sorted, after the movie: lib/locks.ts), so creates and moves on them
+   *    wait for us, then read the gap and the shows on them through the transaction.
+   * 3. Run the overlap check twice with the same saved shows, once at each length. The future
+   *    shows are candidates carrying their IDs, so each replaces its own saved slot. Caused
+   *    clashes are the pairs only the longer run has.
+   *
+   * Only FUTURE shows are candidates. A show of this movie running right now, or a past one,
+   * stays an ordinary saved show with the stored (old) duration in both runs: it has started, so
+   * it cannot be moved out of the way, and it must not block the edit.
+   */
+  async function refuseCausedOverlaps(
+    tx: Prisma.TransactionClient,
+    movie: Pick<AdminMovieRow, 'id' | 'title' | 'durationMinutes'>,
+    newDuration: number,
+  ): Promise<void> {
+    const shows = await tx.showtime.findMany({
+      where: { movieId: movie.id, deletedAt: null, startsAt: { gt: now() } },
+      orderBy: [{ startsAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, screenId: true, startsAt: true },
+    });
+    if (shows.length === 0) return;
+
+    await lockScreens(
+      tx,
+      shows.map((show) => show.screenId),
+    );
+    const gapMinutes = await createSettingsService({ db: tx, logger }).getShowGapMinutes();
+
+    const candidatesAt = (durationMinutes: number): ShowtimeCandidate[] =>
+      shows.map((show) => ({
+        showtimeId: show.id,
+        screenId: show.screenId,
+        movieTitle: movie.title,
+        startsAt: show.startsAt,
+        durationMinutes,
+        path: ['body', 'durationMinutes'],
+        requested: { date: toColomboDate(show.startsAt), time: toColomboTime(show.startsAt) },
+      }));
+    const longer = candidatesAt(newDuration);
+    // The window of the longer run contains the shorter run's, so one read serves both.
+    const existing = await findExistingShowtimeSlots(tx, longer, gapMinutes);
+
+    const known = new Set(
+      findShowtimeConflicts({
+        candidates: candidatesAt(movie.durationMinutes),
+        existing,
+        gapMinutes,
+      }).map(overlapPairKey),
+    );
+    const caused = findShowtimeConflicts({ candidates: longer, existing, gapMinutes }).filter(
+      (overlap) => !known.has(overlapPairKey(overlap)),
+    );
+    if (caused.length > 0) {
+      // A clash between two of this movie's shows is reported on the later one only, so the earlier
+      // one is counted through `conflict`.
+      const ownShows = new Set(shows.map((show) => show.id));
+      const affected = new Set(
+        caused
+          .flatMap((overlap) => [overlap.candidate.showtimeId, overlap.conflict.showtimeId])
+          .filter((id) => id !== null && ownShows.has(id)),
+      );
+      throw showtimeConflictError(caused, gapMinutes, {
+        message: movieLengthOverlapMessage(affected.size, caused.length),
+        maxDetails: SHOWTIME_BULK_MAX_DETAILS,
+      });
+    }
+  }
+
   /**
    * The answer to a conditional write that matched no row (MovieGone), from the movie re-read
    * after the rollback (the transaction is over, so this read is a new statement):
@@ -456,13 +616,17 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
    * The shared flow of every movie update, in one transaction:
    * 1. read the movie (404 unknown, 409 soft-deleted, whatever the body);
    * 2. `plan` compares the body with it; null means nothing would change, so the current movie
-   *    is returned with no write, no audit row and no cache invalidation;
+   *    is returned with no write, no audit row and no cache invalidation. A plan that changes the
+   *    running time locks the Movie row, then steps 1 and 2 run again, because the outcome
+   *    depends on the current length: a request that looked like a decrease may be an increase
+   *    by now, and the reverse. Showtime writers lock the movie too, so they wait for us;
    * 3. a new slug is pre-checked against every movie, soft-deleted ones included (409);
-   * 4. the conditional update `where: { id, deletedAt: null }`;
-   * 5. the audit row (its failure rolls the update back and propagates as a 500);
+   * 4. only for a longer running time: refuseCausedOverlaps (409);
+   * 5. the conditional update `where: { id, deletedAt: null }`;
+   * 6. the audit row (its failure rolls the update back and propagates as a 500);
    * then, only after the commit, the public movie cache is dropped.
    *
-   * A P2025 from step 4 means a concurrent request removed or soft-deleted the movie after
+   * A P2025 from step 5 means a concurrent request removed or soft-deleted the movie after
    * step 1. It never becomes a 500: lostWriteError re-reads the movie after the rollback and
    * answers 404, 409 MOVIE_RESTORE_FIRST_MESSAGE, or 409 MOVIE_CHANGED_MESSAGE when the movie
    * is live again (soft-deleted and restored in between). Any other error is a 500.
@@ -479,11 +643,20 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     let outcome: { row: AdminMovieRow; changed: boolean };
     try {
       outcome = await db.$transaction(async (tx) => {
-        const current = await tx.movie.findUnique({ where: { id }, select: adminMovieSelect });
-        if (current === null) throw notFound(MOVIE_NOT_FOUND_MESSAGE);
-        if (current.deletedAt !== null) throw restoreFirst();
+        const readLive = async (): Promise<AdminMovieRow> => {
+          const row = await tx.movie.findUnique({ where: { id }, select: adminMovieSelect });
+          if (row === null) throw notFound(MOVIE_NOT_FOUND_MESSAGE);
+          if (row.deletedAt !== null) throw restoreFirst();
+          return row;
+        };
 
-        const change = plan(current);
+        let current = await readLive();
+        let change = plan(current);
+        if (writtenDuration(change) !== undefined) {
+          await lockMovie(tx, id);
+          current = await readLive();
+          change = plan(current);
+        }
         if (change === null) return { row: current, changed: false };
 
         const newSlug = typeof change.data.slug === 'string' ? change.data.slug : undefined;
@@ -495,6 +668,11 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
             select: { id: true },
           });
           if (holder) throw slugConflict(SLUG_IN_USE_MESSAGE);
+        }
+
+        const newDuration = writtenDuration(change);
+        if (newDuration !== undefined && newDuration > current.durationMinutes) {
+          await refuseCausedOverlaps(tx, current, newDuration);
         }
 
         let row: AdminMovieRow;
@@ -542,14 +720,16 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
 
   /**
    * The shared flow of soft delete, restore and hard delete, in one transaction:
-   * 1. read the movie: 404 when unknown, 409 when it is not at `move.from`;
-   * 2. the conditional write, `where: { id, deletedAt }` repeating that check;
-   * 3. the audit row, from the row the write returned (its failure rolls the write back and
+   * 1. read the movie (under its row lock when the move has a guard): 404 when unknown, 409 when
+   *    it is not at `move.from`;
+   * 2. the guard, if any, refuses the move by throwing;
+   * 3. the conditional write, `where: { id, deletedAt }` repeating that check;
+   * 4. the audit row, from the row the write returned (its failure rolls the write back and
    *    propagates as a 500);
    * then, only after the commit, the public movie cache is dropped. There is no no-op: a move
    * always changes the movie, or is refused.
    *
-   * A P2025 from step 2 means a concurrent request moved or removed the movie after step 1 (at
+   * A P2025 from step 3 means a concurrent request moved or removed the movie after step 1 (at
    * READ COMMITTED, Postgres re-checks the WHERE on the locked row). It never becomes a 500:
    * lostWriteError re-reads the movie after the rollback and answers as if that change had come
    * first (404, or 409 `move.conflictMessage`), or 409 MOVIE_CHANGED_MESSAGE when the movie is
@@ -567,9 +747,11 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     let row: R;
     try {
       row = await db.$transaction(async (tx) => {
+        if (move.guard) await lockMovie(tx, id);
         const current = await tx.movie.findUnique({ where: { id }, select: { deletedAt: true } });
         const refused = misplacedMovieError(current, move.from, move.conflictMessage);
         if (refused) throw refused;
+        await move.guard?.(tx);
 
         let written: R;
         try {
@@ -653,7 +835,9 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     /**
      * Changes the given detail fields (see applyChange). Only the fields whose value differs are
      * written and audited (UPDATE, `{ changes: { field: { from, to } } }`). The slug changes only
-     * when the body has one: never because the title changed. 409 when a new slug is taken.
+     * when the body has one: never because the title changed. 409 when a new slug is taken, and
+     * when a longer running time would cause an overlap on a screen (see refuseCausedOverlaps);
+     * either refuses the whole PATCH.
      */
     update(id: string, body: MovieUpdateBody, actor: AuditActor): Promise<AdminMovie> {
       return applyChange(id, actor, (current) => {
@@ -666,7 +850,10 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
       });
     },
 
-    /** Moves the movie to `status` (STATUS_CHANGE, `{ field: 'status', from, to }`). */
+    /**
+     * Moves the movie to `status` (STATUS_CHANGE, `{ field: 'status', from, to }`). ENDED is
+     * allowed with upcoming showtimes: public endpoints hide them and they keep their screen.
+     */
     setStatus(id: string, status: MovieStatus, actor: AuditActor): Promise<AdminMovie> {
       return applyChange(id, actor, (current) =>
         current.status === status
@@ -681,7 +868,10 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
       );
     },
 
-    /** Shows or hides the movie (STATUS_CHANGE, `{ field: 'isActive', from, to }`). */
+    /**
+     * Shows or hides the movie (STATUS_CHANGE, `{ field: 'isActive', from, to }`). Hiding is
+     * allowed with upcoming showtimes: public endpoints hide them and they keep their screen.
+     */
     setActive(id: string, isActive: boolean, actor: AuditActor): Promise<AdminMovie> {
       return applyChange(id, actor, (current) =>
         current.isActive === isActive
@@ -699,14 +889,17 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     /**
      * Moves a live movie to the trash: sets `deletedAt` (DELETE, `{ mode: 'soft', title, slug }`).
      * It disappears from the public site but keeps its slug, isActive and status, so a restore
-     * brings it back as it was. 409 when it is already in the trash.
+     * brings it back as it was. 409 when it is already in the trash, and 409 with
+     * `{ futureShowtimeCount }` while it has upcoming showtimes: an admin clears them first
+     * (POST /api/admin/showtimes/bulk-delete). Past and soft-deleted showtimes do not block.
      */
     async softDelete(id: string, actor: AuditActor): Promise<AdminMovie> {
       const row = await moveMovie(id, actor, {
         from: 'live',
         conflictMessage: MOVIE_ALREADY_DELETED_MESSAGE,
+        guard: (tx) => refuseIfFutureShowtimes(tx, id, MOVIE_DELETE_HAS_SHOWTIMES_MESSAGE),
         write: (tx, where) =>
-          tx.movie.update({ where, data: { deletedAt: new Date() }, select: adminMovieSelect }),
+          tx.movie.update({ where, data: { deletedAt: now() }, select: adminMovieSelect }),
         audit: ({ title, slug }) => ({ action: 'DELETE', details: { mode: 'soft', title, slug } }),
       });
       return toAdminMovie(row);
@@ -716,7 +909,8 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
      * Takes a movie out of the trash: clears `deletedAt`
      * (UPDATE, `{ restored: true, title, slug }`). isActive and status are untouched. Its slug
      * cannot have been taken meanwhile, as slugs are unique across every movie, deleted ones
-     * included. 409 when it is not in the trash.
+     * included. 409 when it is not in the trash. No showtime check: its shows never left their
+     * screens.
      */
     async restore(id: string, actor: AuditActor): Promise<AdminMovie> {
       const row = await moveMovie(id, actor, {
@@ -733,20 +927,33 @@ export function createMovieAdminService({ db, cache }: MovieAdminServiceDeps) {
     },
 
     /**
-     * Removes a movie from the trash for good (DELETE, `{ mode: 'hard', title, slug }`); its slug
-     * becomes free. Only a movie already in the trash: 409 for a live one. The caller must
-     * restrict this to SUPER_ADMIN (the route does). The audit row survives the movie:
-     * AuditLog.entityId is a plain column, with no foreign key to Movie.
+     * Removes a movie from the trash for good (DELETE,
+     * `{ mode: 'hard', title, slug, showtimesDeleted }`); its slug becomes free. Only a movie
+     * already in the trash: 409 for a live one, and 409 with `{ futureShowtimeCount }` while it
+     * has upcoming showtimes. Its other showtimes, past and soft-deleted, are deleted with it and
+     * counted in `showtimesDeleted`. The caller must restrict this to SUPER_ADMIN (the route
+     * does). The audit row survives the movie: AuditLog.entityId is a plain column, with no
+     * foreign key to Movie.
      */
     async hardDelete(id: string, actor: AuditActor): Promise<void> {
       await moveMovie(id, actor, {
         from: 'trash',
         conflictMessage: MOVIE_DELETE_FIRST_MESSAGE,
-        // The movie's showtimes go with it: Showtime.movieId is ON DELETE CASCADE in Postgres.
+        guard: (tx) => refuseIfFutureShowtimes(tx, id, MOVIE_HARD_DELETE_HAS_SHOWTIMES_MESSAGE),
         // Phase 6: delete its Cloudinary images (posterPublicId, bannerPublicId) once this commits.
-        write: (tx, where) =>
-          tx.movie.delete({ where, select: { id: true, title: true, slug: true } }),
-        audit: ({ title, slug }) => ({ action: 'DELETE', details: { mode: 'hard', title, slug } }),
+        write: async (tx, where) => {
+          // Deleted explicitly, not left to ON DELETE CASCADE, to get the count for the audit row.
+          const { count } = await tx.showtime.deleteMany({ where: { movieId: id } });
+          const row = await tx.movie.delete({
+            where,
+            select: { id: true, title: true, slug: true },
+          });
+          return { ...row, showtimesDeleted: count };
+        },
+        audit: ({ title, slug, showtimesDeleted }) => ({
+          action: 'DELETE',
+          details: { mode: 'hard', title, slug, showtimesDeleted },
+        }),
       });
     },
   };

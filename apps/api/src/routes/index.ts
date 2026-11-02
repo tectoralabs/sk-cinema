@@ -61,7 +61,7 @@ export function apiRouter({ config, prisma, cache, logger }: AppDeps): Router {
       db: prisma,
       authController: createAuthController({ service: authService, config }),
       movieAdminController: createMovieAdminController(
-        createMovieAdminService({ db: prisma, cache }),
+        createMovieAdminService({ db: prisma, cache, logger }),
       ),
       screenAdminController: createScreenAdminController(
         createScreenAdminService({ db: prisma, cache }),

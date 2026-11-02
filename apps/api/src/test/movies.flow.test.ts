@@ -44,6 +44,7 @@ import {
   buildTestApp,
   inMemoryAuthDb,
   sessionFrom,
+  silentLogger,
   testAdmin,
   testMovie,
   testPasswordHash,
@@ -291,6 +292,7 @@ function registeredMovieAdminRoutes(): string[] {
   const service = createMovieAdminService({
     db: inMemoryAuthDb().prisma,
     cache: new MemoryCache(),
+    logger: silentLogger,
   });
   const router = movieAdminRoutes(createMovieAdminController(service)) as unknown as {
     stack: RouteLayerLike[];
@@ -615,7 +617,7 @@ const MUTATIONS: Mutation[] = [
     seed: trashedAvatar,
     status: 204,
     action: 'DELETE',
-    details: { mode: 'hard', title: 'Avatar', slug: 'avatar' },
+    details: { mode: 'hard', title: 'Avatar', slug: 'avatar', showtimesDeleted: 0 },
     conflict: { seed: avatar, message: MOVIE_DELETE_FIRST_MESSAGE },
   },
 ];

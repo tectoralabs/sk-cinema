@@ -16,6 +16,7 @@ import {
   normalizeShowtimeFormat,
   normalizedShowtimeFormatSchema,
   publicMovieIdParamsSchema,
+  futureShowtimesConflictDetailsSchema,
   publicShowtimeDatesResponseSchema,
   publicShowtimeListQuerySchema,
   publicShowtimeListResponseSchema,
@@ -982,6 +983,24 @@ describe('showtime conflict details', () => {
       showtimeConflictErrorSchema.safeParse({ error: { ...body.error, code: 'VALIDATION_ERROR' } })
         .success,
     ).toBe(false);
+  });
+});
+
+describe('futureShowtimesConflictDetailsSchema', () => {
+  it('accepts the count of upcoming showtimes blocking the write', () => {
+    expect(futureShowtimesConflictDetailsSchema.parse({ futureShowtimeCount: 3 })).toEqual({
+      futureShowtimeCount: 3,
+    });
+  });
+
+  it.each([
+    ['no showtimes', { futureShowtimeCount: 0 }],
+    ['a fraction', { futureShowtimeCount: 1.5 }],
+    ['text', { futureShowtimeCount: '1' }],
+    ['a missing count', {}],
+    ['an unknown key', { futureShowtimeCount: 1, foo: 1 }],
+  ])('rejects %s', (_name, details) => {
+    expect(futureShowtimesConflictDetailsSchema.safeParse(details).success).toBe(false);
   });
 });
 

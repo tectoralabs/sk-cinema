@@ -453,6 +453,17 @@ export const showtimeConflictErrorSchema = z.strictObject({
 export type ShowtimeConflictError = z.infer<typeof showtimeConflictErrorSchema>;
 
 /**
+ * `details` of the 409 CONFLICT when upcoming showtimes (of a movie or a screen) block the
+ * write: a movie soft or permanent delete, a screen hide or soft delete. Not an array, unlike
+ * the overlap details: there is no field to point at, only how many showtimes to clear first.
+ */
+export const futureShowtimesConflictDetailsSchema = z.strictObject({
+  futureShowtimeCount: z.number().int().min(1),
+});
+
+export type FutureShowtimesConflictDetails = z.infer<typeof futureShowtimesConflictDetailsSchema>;
+
+/**
  * One entry of `details` on the bulk create 400 for slots at or before the current time:
  * `path` is ["body", "times", i] (the index in `times`), `requested` the Colombo date + time.
  */

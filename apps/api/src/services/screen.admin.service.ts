@@ -3,6 +3,7 @@ import {
   type AdminScreen,
   type AdminScreenListQuery,
   type AdminScreenListResponse,
+  type FutureShowtimesConflictDetails,
   type ScreenCreateBody,
   type ScreenUpdateBody,
 } from '@sk-cinema/shared';
@@ -38,11 +39,6 @@ export const SCREEN_DEACTIVATE_HAS_SHOWTIMES_MESSAGE =
   'This screen has upcoming showtimes. Delete them or move them to another screen before hiding it.';
 export const SCREEN_DELETE_HAS_SHOWTIMES_MESSAGE =
   'This screen has upcoming showtimes. Delete them or move them to another screen before deleting it.';
-
-/** `details` of the 409 for a deactivate or soft delete refused by upcoming showtimes. */
-export interface FutureShowtimesConflictDetails {
-  futureShowtimeCount: number;
-}
 
 /**
  * True when `error` is Prisma's unique-constraint violation (P2002). Only ever call it on an

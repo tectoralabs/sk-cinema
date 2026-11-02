@@ -367,16 +367,15 @@ export interface ShowtimeCandidate extends ShowtimeSlot {
 }
 
 /**
- * Every clash of `candidates` with the saved, non-deleted showtimes on their screens (and with
- * each other). Reads inside `tx`, after the locks. Every live showtime counts, whatever its
- * movie's status, visibility or deletion. Existing shows that clash with each other under the
- * current gap are never reported: a gap change only applies to shows created or moved later.
+ * The saved, non-deleted showtimes on the screens of `candidates` that can clash with them.
+ * Reads inside `tx`, after the locks. Every live showtime counts, whatever its movie's status,
+ * visibility or deletion.
  */
-export async function findScreenConflicts<C extends ShowtimeCandidate>(
+export async function findExistingShowtimeSlots(
   tx: Prisma.TransactionClient,
-  candidates: readonly C[],
+  candidates: readonly ShowtimeSlot[],
   gapMinutes: number,
-): Promise<ShowtimeOverlap<C>[]> {
+): Promise<ShowtimeSlot[]> {
   const window = existingShowtimeWindow({ candidates, gapMinutes });
   if (window === null) return [];
   const screenIds = [...new Set(candidates.map((c) => c.screenId))];
@@ -393,13 +392,27 @@ export async function findScreenConflicts<C extends ShowtimeCandidate>(
       movie: { select: { title: true, durationMinutes: true } },
     },
   });
-  const existing: ShowtimeSlot[] = rows.map((row) => ({
+  return rows.map((row) => ({
     showtimeId: row.id,
     screenId: row.screenId,
     movieTitle: row.movie.title,
     startsAt: row.startsAt,
     durationMinutes: row.movie.durationMinutes,
   }));
+}
+
+/**
+ * Every clash of `candidates` with the saved showtimes on their screens (see
+ * findExistingShowtimeSlots) and with each other. Existing shows that clash with each other
+ * under the current gap are never reported: a gap change only applies to shows created or
+ * moved later.
+ */
+export async function findScreenConflicts<C extends ShowtimeCandidate>(
+  tx: Prisma.TransactionClient,
+  candidates: readonly C[],
+  gapMinutes: number,
+): Promise<ShowtimeOverlap<C>[]> {
+  const existing = await findExistingShowtimeSlots(tx, candidates, gapMinutes);
   return findShowtimeConflicts({ candidates, existing, gapMinutes });
 }
 

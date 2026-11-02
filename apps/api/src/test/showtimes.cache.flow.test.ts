@@ -501,6 +501,9 @@ describe('movie writes change the cached public list', () => {
 
   it('DELETE /movies/:id, soft delete: 404', async () => {
     const s = await setup();
+    // A movie with upcoming showtimes cannot be deleted: they are cleared first.
+    const cleared = await admin(s, 'post', '/showtimes/bulk-delete', { ids: [s.show1, s.show2] });
+    expect(cleared.status).toBe(200);
 
     const { after } = await afterWrite(s, () => admin(s, 'delete', `/movies/${s.movie.id}`));
 

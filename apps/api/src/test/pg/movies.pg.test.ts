@@ -39,7 +39,13 @@ import {
   type AuditActor,
 } from '../../services/movie.admin.service.js';
 import { createPublicMovieService } from '../../services/movie.public.service.js';
-import { authClient, buildTestApp, sessionFrom, testPasswordHash } from '../helpers.js';
+import {
+  authClient,
+  buildTestApp,
+  sessionFrom,
+  silentLogger,
+  testPasswordHash,
+} from '../helpers.js';
 import { describePg, disconnectTestPrisma, resetDatabase, testPrisma } from './db.js';
 
 // ---------------------------------------------------------------------------
@@ -60,7 +66,7 @@ async function seedAdmin(role: AdminRole = 'EDITOR', passwordHash = '$argon2id$p
 function services() {
   const db = testPrisma();
   return {
-    admin: createMovieAdminService({ db, cache: new MemoryCache() }),
+    admin: createMovieAdminService({ db, cache: new MemoryCache(), logger: silentLogger }),
     pub: createPublicMovieService({ db, cache: new MemoryCache() }),
   };
 }

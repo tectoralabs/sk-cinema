@@ -2564,7 +2564,7 @@ describe('DELETE /api/admin/movies/:id/permanent (hard delete)', () => {
       adminId: s.adminId,
       entity: 'Movie',
       entityId: seeded.id,
-      details: { mode: 'hard', title: 'Avatar', slug: 'avatar' },
+      details: { mode: 'hard', title: 'Avatar', slug: 'avatar', showtimesDeleted: 0 },
       userAgent: TEST_USER_AGENT,
     });
     expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
@@ -2750,7 +2750,7 @@ describe('movie lifecycle', () => {
       ['DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }],
       ['UPDATE', { restored: true, title: 'Avatar', slug: 'avatar' }],
       ['DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }],
-      ['DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar' }],
+      ['DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar', showtimesDeleted: 0 }],
     ]);
     expect(new Set(audits.map((row) => row.entityId))).toEqual(new Set([id]));
     expect(new Set(audits.map((row) => row.adminId))).toEqual(new Set([s.adminId]));
