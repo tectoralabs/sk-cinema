@@ -2,10 +2,12 @@ import { z } from 'zod';
 import {
   calendarDateSchema,
   deletedFilterSchema,
+  multiLineTextSchema,
   pageQuerySchema,
   pageSizeQuerySchema,
   queryBooleanSchema,
   querySearchSchema,
+  singleLineTextSchema,
 } from './common.js';
 
 /* -------------------------------------------------------------------------- */
@@ -118,26 +120,23 @@ function dedupeCaseInsensitive(values: string[]): string[] {
   });
 }
 
-const genresSchema = z
-  .array(z.string().trim().min(1).max(30))
-  .max(10)
-  .transform(dedupeCaseInsensitive);
+const genresSchema = z.array(singleLineTextSchema(30)).max(10).transform(dedupeCaseInsensitive);
 
-const castSchema = z.array(z.string().trim().min(1).max(100)).max(30);
+const castSchema = z.array(singleLineTextSchema(100)).max(30);
 
 /**
  * Editable movie fields shared by create and update. Optional text columns are
  * nullable: send `null` (not an empty string) to leave them blank or clear them.
  */
 const movieFields = {
-  title: z.string().trim().min(1).max(150),
+  title: singleLineTextSchema(150),
   slug: slugSchema,
-  synopsis: z.string().trim().min(1).max(5000).nullable(),
+  synopsis: multiLineTextSchema(5000).nullable(),
   durationMinutes: z.number().int().min(MOVIE_DURATION_MIN_MINUTES).max(MOVIE_DURATION_MAX_MINUTES),
-  language: z.string().trim().min(1).max(50).nullable(),
+  language: singleLineTextSchema(50).nullable(),
   genres: genresSchema,
-  rating: z.string().trim().min(1).max(20).nullable(),
-  director: z.string().trim().min(1).max(150).nullable(),
+  rating: singleLineTextSchema(20).nullable(),
+  director: singleLineTextSchema(150).nullable(),
   cast: castSchema,
   releaseDate: calendarDateSchema.nullable(),
   trailerUrl: trailerUrlSchema.nullable(),

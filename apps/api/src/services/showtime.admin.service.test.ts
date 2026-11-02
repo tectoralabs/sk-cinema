@@ -89,6 +89,8 @@ interface SetupOptions {
   /** Showtimes; `movieId` / `screenId` default to the main movie and screen. */
   showtimes?: (Partial<Showtime> & Pick<Showtime, 'startsAt'>)[];
   settings?: Setting[];
+  /** The service's clock. Default: always NOW. */
+  now?: () => Date;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -117,7 +119,7 @@ function setup(options: SetupOptions = {}) {
     settings: createSettingsService({ db: db.prisma, logger }),
     cache,
     logger,
-    now: () => NOW,
+    now: options.now ?? (() => NOW),
   });
   const actor = { adminId: admin.id, ipAddress: IP, userAgent: UA };
   return { db, cache, invalidate, logger, service, actor, movie, screen, admin };
@@ -688,6 +690,19 @@ describe('showtime admin service: create failures', () => {
 // ---------------------------------------------------------------------------
 
 describe('adminShowtimeListWhere', () => {
+  it('to=2099-12-31 ends at the Colombo midnight of 2100-01-01, no RangeError', () => {
+    const where = adminShowtimeListWhere(listQuery({ to: '2099-12-31', includePast: 'true' }), NOW);
+    expect(where.startsAt).toEqual({ lt: new Date('2099-12-31T18:30:00.000Z') });
+  });
+
+  it('from=2020-01-01 starts at the Colombo midnight of that date', () => {
+    const where = adminShowtimeListWhere(
+      listQuery({ from: '2020-01-01', includePast: 'true' }),
+      NOW,
+    );
+    expect(where.startsAt).toEqual({ gte: new Date('2019-12-31T18:30:00.000Z') });
+  });
+
   it('defaults: live, future only', () => {
     expect(adminShowtimeListWhere(listQuery(), NOW)).toEqual({
       deletedAt: null,
@@ -1039,6 +1054,18 @@ describe('expandBulkSlots', () => {
     );
   });
 
+  it('a range ending on the last allowed date, no RangeError', () => {
+    const slots = expandBulkSlots({
+      dateFrom: '2099-12-30',
+      dateTo: '2099-12-31',
+      times: ['23:59'],
+    });
+    expect(slots.map((slot) => [slot.date, slot.startsAt.toISOString()])).toEqual([
+      ['2099-12-30', '2099-12-30T18:29:00.000Z'],
+      ['2099-12-31', '2099-12-31T18:29:00.000Z'],
+    ]);
+  });
+
   it('throws RangeError for a range the body schema refuses', () => {
     expect(() =>
       expandBulkSlots({ dateFrom: '2026-11-02', dateTo: '2026-11-01', times: ['10:00'] }),
@@ -1046,6 +1073,76 @@ describe('expandBulkSlots', () => {
     expect(() =>
       expandBulkSlots({ dateFrom: '2026-12-01', dateTo: '2027-01-01', times: ['10:00'] }),
     ).toThrow(RangeError);
+  });
+});
+
+describe('showtime admin service: bulkCreate, a slot passing while it waits on the locks', () => {
+  /** Every call before the lock sees NOW; the lock moves the clock on to `after`. */
+  function setupWaiting(after: Date) {
+    let clock = NOW;
+    const s = setup({ now: () => clock });
+    s.db.injectFault('$queryRaw', 'lock', {
+      before: () => {
+        clock = after;
+      },
+    });
+    return s;
+  }
+
+  it('400 with the slots that passed, the same error as before the lock; nothing written', async () => {
+    const s = setupWaiting(colombo('2026-11-02', '10:00'));
+
+    const error = await rejection(
+      bulkCreate(s, { dateTo: '2026-11-02', times: ['18:00', '10:00', '09:59'] }),
+    );
+
+    expect(error).toMatchObject({
+      status: 400,
+      code: 'VALIDATION_ERROR',
+      message: showtimeBulkPastMessage(2),
+    });
+    expect(error.details).toEqual([
+      {
+        path: ['body', 'times', 1],
+        message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
+        requested: { date: '2026-11-02', time: '10:00' },
+      },
+      {
+        path: ['body', 'times', 2],
+        message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
+        requested: { date: '2026-11-02', time: '09:59' },
+      },
+    ]);
+    expect(s.db.spies.showtime.createMany).not.toHaveBeenCalled();
+    expect(s.db.spies.setting.findMany).not.toHaveBeenCalled();
+    expectNothingWritten(s, 0);
+  });
+
+  it('still goes through when every slot is after the moved clock', async () => {
+    const s = setupWaiting(colombo('2026-11-02', '09:59'));
+
+    const { created } = await bulkCreate(s, { dateTo: '2026-11-02', times: ['10:00'] });
+
+    expect(created).toBe(1);
+  });
+
+  it('a past slot before the lock still wins over a 404: the first check keeps the order', async () => {
+    const s = setup();
+
+    const error = await rejection(
+      s.service.bulkCreate(
+        bulkBody(s, {
+          movieId: randomUUID(),
+          dateFrom: '2026-11-01',
+          dateTo: '2026-11-01',
+          times: ['10:00'],
+        }),
+        s.actor,
+      ),
+    );
+
+    expect(error).toMatchObject({ status: 400, message: showtimeBulkPastMessage(1) });
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
   });
 });
 

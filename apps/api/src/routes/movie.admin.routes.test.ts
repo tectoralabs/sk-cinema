@@ -242,6 +242,42 @@ describe('POST /api/admin/movies', () => {
       expectNothingWritten(s.db);
     });
 
+    it.each<[string, object, (string | number)[]]>([
+      ['title', { title: 'a\u0000b' }, ['body', 'title']],
+      ['synopsis', { synopsis: 'a\u0000b' }, ['body', 'synopsis']],
+      ['director', { director: 'a\u0001b' }, ['body', 'director']],
+      ['language', { language: 'a\u0000b' }, ['body', 'language']],
+      ['rating', { rating: 'a\u0001b' }, ['body', 'rating']],
+      ['genres', { genres: ['Drama', 'a\u0000b'] }, ['body', 'genres', 1]],
+      ['cast', { cast: ['a\u0001b'] }, ['body', 'cast', 0]],
+    ])(
+      'rejects a control character in %s (400, not the 500 of a NUL)',
+      async (_name, field, path) => {
+        const s = await setup();
+
+        const error = expectError(
+          await createMovie(s, { title: 'Avatar', durationMinutes: 120, ...field }),
+          400,
+          'VALIDATION_ERROR',
+        );
+
+        expect(error.details).toEqual([expect.objectContaining({ path })]);
+        expect(s.db.spies.movie.create).not.toHaveBeenCalled();
+        expectNothingWritten(s.db);
+      },
+    );
+
+    it('keeps line breaks in a synopsis', async () => {
+      const s = await setup();
+      const synopsis = 'First line\nSecond line\r\n\tIndented line';
+
+      const movie = expectCreated(
+        await createMovie(s, { title: 'Avatar', durationMinutes: 120, synopsis }),
+      );
+
+      expect(movie.synopsis).toBe(synopsis);
+    });
+
     it('rejects query parameters', async () => {
       const s = await setup();
 
@@ -1140,6 +1176,8 @@ describe('GET /api/admin/movies', () => {
       ['sort=slug', 'sort=slug', ['query', 'sort']],
       ['order=up', 'order=up', ['query', 'order']],
       ['a search over 100 characters', `search=${'a'.repeat(101)}`, ['query', 'search']],
+      ['a search with a NUL (Postgres refuses it)', 'search=a%00', ['query', 'search']],
+      ['a search with another control character', 'search=a%01b', ['query', 'search']],
       ['an unknown key', 'include=deleted', ['query']],
       ['bracket syntax', 'search[]=avatar', ['query']],
     ])('rejects %s', async (_name, query, path) => {

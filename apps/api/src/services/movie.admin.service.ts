@@ -4,7 +4,6 @@ import {
   type AdminMovie,
   type AdminMovieListQuery,
   type AdminMovieListResponse,
-  type FutureShowtimesConflictDetails,
   type MovieCreateBody,
   type MovieStatus,
   type MovieUpdateBody,
@@ -18,6 +17,7 @@ import { escapeLikePattern } from '../lib/likePattern.js';
 import { lockMovie, lockScreens } from '../lib/locks.js';
 import { findShowtimeConflicts, type ShowtimeOverlap } from '../lib/showtimeOverlap.js';
 import { firstFreeSlug, isSlugOrSuffixed, slugify } from '../lib/slug.js';
+import { isRecordNotFound, refuseIfFutureShowtimes } from './adminGuards.js';
 import { writeAudit, type AuditActor, type AuditEntry } from './audit.service.js';
 import { formatDateOnly, invalidatePublicMovies } from './movie.public.service.js';
 import { createSettingsService } from './settings.service.js';
@@ -293,9 +293,6 @@ class MovieGone extends Error {
   }
 }
 
-const isRecordNotFound = (error: unknown) =>
-  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025';
-
 /** A 409 for a write to a soft-deleted movie: it exists, so the admin can restore it first. */
 const restoreFirst = () => new AppError(409, ERROR_CODES.CONFLICT, MOVIE_RESTORE_FIRST_MESSAGE);
 
@@ -353,9 +350,6 @@ interface MovieMove<R extends AuditedMovieRow> {
   audit: (row: R) => Required<Pick<AuditEntry, 'action' | 'details'>>;
 }
 
-/** Re-exported for existing importers; defined with writeAudit, which all admin services use. */
-export type { AuditActor };
-
 export type MovieAdminDb = Pick<
   PrismaClient,
   'movie' | 'showtime' | 'setting' | 'auditLog' | '$transaction'
@@ -381,26 +375,6 @@ export function createMovieAdminService({
   logger,
   now = () => new Date(),
 }: MovieAdminServiceDeps) {
-  /**
-   * 409 with `{ futureShowtimeCount }` while the movie has upcoming (startsAt after now),
-   * non-deleted showtimes. Past and soft-deleted showtimes do not count. Call it only under the
-   * Movie row lock: showtime writers lock the movie too, so none can add a show between this
-   * count and our commit.
-   */
-  async function refuseIfFutureShowtimes(
-    tx: Prisma.TransactionClient,
-    movieId: string,
-    message: string,
-  ): Promise<void> {
-    const futureShowtimeCount = await tx.showtime.count({
-      where: { movieId, deletedAt: null, startsAt: { gt: now() } },
-    });
-    if (futureShowtimeCount > 0) {
-      const details: FutureShowtimesConflictDetails = { futureShowtimeCount };
-      throw new AppError(409, ERROR_CODES.CONFLICT, message, details);
-    }
-  }
-
   /**
    * 409 when running `movie` for `newDuration` minutes would cause a clash that its current
    * length does not have, under the CURRENT show gap. Clashes that exist already (the gap was
@@ -897,7 +871,8 @@ export function createMovieAdminService({
       const row = await moveMovie(id, actor, {
         from: 'live',
         conflictMessage: MOVIE_ALREADY_DELETED_MESSAGE,
-        guard: (tx) => refuseIfFutureShowtimes(tx, id, MOVIE_DELETE_HAS_SHOWTIMES_MESSAGE),
+        guard: (tx) =>
+          refuseIfFutureShowtimes(tx, { movieId: id }, now(), MOVIE_DELETE_HAS_SHOWTIMES_MESSAGE),
         write: (tx, where) =>
           tx.movie.update({ where, data: { deletedAt: now() }, select: adminMovieSelect }),
         audit: ({ title, slug }) => ({ action: 'DELETE', details: { mode: 'soft', title, slug } }),
@@ -939,7 +914,13 @@ export function createMovieAdminService({
       await moveMovie(id, actor, {
         from: 'trash',
         conflictMessage: MOVIE_DELETE_FIRST_MESSAGE,
-        guard: (tx) => refuseIfFutureShowtimes(tx, id, MOVIE_HARD_DELETE_HAS_SHOWTIMES_MESSAGE),
+        guard: (tx) =>
+          refuseIfFutureShowtimes(
+            tx,
+            { movieId: id },
+            now(),
+            MOVIE_HARD_DELETE_HAS_SHOWTIMES_MESSAGE,
+          ),
         // Phase 6: delete its Cloudinary images (posterPublicId, bannerPublicId) once this commits.
         write: async (tx, where) => {
           // Deleted explicitly, not left to ON DELETE CASCADE, to get the count for the audit row.

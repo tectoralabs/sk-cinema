@@ -5,6 +5,7 @@ import {
   pageSizeQuerySchema,
   queryBooleanSchema,
   querySearchSchema,
+  singleLineTextSchema,
 } from './common.js';
 
 /* -------------------------------------------------------------------------- */
@@ -18,10 +19,10 @@ export const SCREEN_NAME_MAX_LENGTH = 50;
 export const SCREEN_CAPACITY_MAX = 2000;
 
 /**
- * Screen name, trimmed, 1–50 characters. Names are unique ignoring case; the screens
- * service enforces that (409 CONFLICT), not this schema.
+ * Screen name, trimmed, 1–50 characters, no control characters. Names are unique ignoring case;
+ * the screens service enforces that (409 CONFLICT), not this schema.
  */
-export const screenNameSchema = z.string().trim().min(1).max(SCREEN_NAME_MAX_LENGTH);
+export const screenNameSchema = singleLineTextSchema(SCREEN_NAME_MAX_LENGTH);
 
 /** Seat count: a whole number from 1 to SCREEN_CAPACITY_MAX. */
 export const screenCapacitySchema = z.number().int().min(1).max(SCREEN_CAPACITY_MAX);

@@ -322,6 +322,8 @@ describe('POST /api/admin/screens', () => {
       ['a missing name', { capacity: 10 }, ['body', 'name']],
       ['an empty name', { name: '' }, ['body', 'name']],
       ['a whitespace-only name', { name: '   ' }, ['body', 'name']],
+      ['a name with a NUL (Postgres refuses it)', { name: 'a\u0000b' }, ['body', 'name']],
+      ['a name with another control character', { name: 'a\u0001b' }, ['body', 'name']],
       ['a name over 50 characters', { name: 'a'.repeat(51) }, ['body', 'name']],
       ['a numeric name', { name: 1 }, ['body', 'name']],
       ['capacity 0', { name: 'A', capacity: 0 }, ['body', 'capacity']],
@@ -341,6 +343,11 @@ describe('POST /api/admin/screens', () => {
       expect(screenAudits(s.db)).toEqual([]);
       expect(s.db.spies.$transaction).not.toHaveBeenCalled();
       expect(invalidate).not.toHaveBeenCalled();
+    });
+
+    it('trims a line break at the end of a name instead of refusing it', async () => {
+      const s = await setup();
+      expect(expectOk(await createScreen(s, { name: 'Screen 1\r\n' }), 201).name).toBe('Screen 1');
     });
 
     it('accepts a 50-character name', async () => {
@@ -488,6 +495,9 @@ describe('GET /api/admin/screens', () => {
     ['pageSize=101', 'pageSize=101', ['query', 'pageSize']],
     ['page=0', 'page=0', ['query', 'page']],
     ['a search over 100 characters', `search=${'a'.repeat(101)}`, ['query', 'search']],
+    ['a search with a NUL (Postgres refuses it)', 'search=a%00', ['query', 'search']],
+    ['a search with another control character', 'search=a%01b', ['query', 'search']],
+    ['a search with a line break inside', 'search=a%0Ab', ['query', 'search']],
   ])('answers 400 for %s', async (_name, query, path) => {
     const s = await setup({ screens: SCREENS() });
 
@@ -660,6 +670,8 @@ describe('PATCH /api/admin/screens/:id', () => {
     ['an unknown key', { capacity: 10, isActive: false }, ['body']],
     ['an empty name', { name: '' }, ['body', 'name']],
     ['a name over 50 characters', { name: 'a'.repeat(51) }, ['body', 'name']],
+    ['a name with a NUL', { name: 'a\u0000b' }, ['body', 'name']],
+    ['a name with another control character', { name: 'a\u0001b' }, ['body', 'name']],
     ['capacity 0', { capacity: 0 }, ['body', 'capacity']],
     ['capacity 2001', { capacity: 2001 }, ['body', 'capacity']],
     ['capacity 1.5', { capacity: 1.5 }, ['body', 'capacity']],

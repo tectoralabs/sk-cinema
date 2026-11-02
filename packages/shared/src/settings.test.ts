@@ -7,8 +7,6 @@ import {
   SHOW_GAP_MINUTES_MIN,
   adminSettingsResponseSchema,
   adminSettingsSchema,
-  parseStoredBmsBaseUrl,
-  parseStoredShowGapMinutes,
   settingsUpdateBodySchema,
   showGapMinutesSchema,
   storedShowGapMinutesSchema,
@@ -164,7 +162,7 @@ describe('adminSettingsResponseSchema', () => {
   });
 });
 
-describe('storedShowGapMinutesSchema / parseStoredShowGapMinutes', () => {
+describe('storedShowGapMinutesSchema', () => {
   it.each([
     ['0', 0],
     ['15', 15],
@@ -172,21 +170,14 @@ describe('storedShowGapMinutesSchema / parseStoredShowGapMinutes', () => {
     ['015', 15],
   ])('parses %j', (stored, expected) => {
     expect(storedShowGapMinutesSchema.parse(stored)).toBe(expected);
-    expect(parseStoredShowGapMinutes(stored)).toBe(expected);
   });
 
-  it.each(['121', '-1', '1.5', '', ' 15', '15 ', '1e1', 'abc', '0x10', '1000'])(
-    'rejects %j and falls back to the default',
+  it.each(['121', '-1', '1.5', '', ' 15', '15 ', '1e1', 'abc', '0x10', '1000', null, undefined])(
+    'rejects %j',
     (stored) => {
       expect(storedShowGapMinutesSchema.safeParse(stored).success).toBe(false);
-      expect(parseStoredShowGapMinutes(stored)).toBe(DEFAULT_SHOW_GAP_MINUTES);
     },
   );
-
-  it('falls back to the default when missing', () => {
-    expect(parseStoredShowGapMinutes(null)).toBe(DEFAULT_SHOW_GAP_MINUTES);
-    expect(parseStoredShowGapMinutes(undefined)).toBe(DEFAULT_SHOW_GAP_MINUTES);
-  });
 
   it('rejects numbers (stored values are strings)', () => {
     expect(storedShowGapMinutesSchema.safeParse(15).success).toBe(false);
@@ -197,26 +188,6 @@ describe('storedShowGapMinutesSchema / parseStoredShowGapMinutes', () => {
     expect(ms).toBeLessThan(50);
     expect(result.success).toBe(false);
     expect(result.error?.issues.map((issue) => issue.code)).toEqual(['too_big']);
-  });
-});
-
-describe('parseStoredBmsBaseUrl', () => {
-  it('returns a valid stored base URL as is', () => {
-    expect(parseStoredBmsBaseUrl(OTHER_BASE)).toBe(OTHER_BASE);
-    expect(parseStoredBmsBaseUrl(DEFAULT_BMS_BASE_URL)).toBe(DEFAULT_BMS_BASE_URL);
-  });
-
-  it.each([
-    null,
-    undefined,
-    '',
-    'https://example.com/buytickets/x',
-    `${OTHER_BASE}/`,
-    ` ${OTHER_BASE}`,
-    `${OTHER_BASE}#x`,
-    `https://lk.bookmyshow.com/buytickets/${'a'.repeat(500)}`,
-  ])('falls back to the default for %j', (stored) => {
-    expect(parseStoredBmsBaseUrl(stored)).toBe(DEFAULT_BMS_BASE_URL);
   });
 });
 

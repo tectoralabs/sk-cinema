@@ -29,6 +29,12 @@ export interface BookingSettings {
   showGapMinutes: number;
 }
 
+/** See getSettingsForSave. */
+export interface SettingsForSave {
+  settings: AdminSettings;
+  invalidKeys: ReadonlySet<SettingKey>;
+}
+
 export type SettingsDb = Pick<PrismaClient, 'setting'>;
 
 export interface SettingsServiceDeps {
@@ -131,14 +137,33 @@ export function createSettingsService({ db, logger }: SettingsServiceDeps) {
     return readValues(rows);
   }
 
-  /** The booking settings plus who last changed them. One query. */
-  async function getAdminSettings(): Promise<AdminSettings> {
-    const rows = await db.setting.findMany({
+  /** One query, in key order (see lastChangeOf). */
+  function findAdminRows() {
+    return db.setting.findMany({
       where: { key: { in: [...BOOKING_SETTING_KEYS] } },
       orderBy: { key: 'asc' },
       select: { key: true, value: true, ...lastChangeSelect },
     });
+  }
+
+  /** The booking settings plus who last changed them. One query. */
+  async function getAdminSettings(): Promise<AdminSettings> {
+    const rows = await findAdminRows();
     return { ...readValues(rows), ...lastChangeOf(rows) };
+  }
+
+  /**
+   * getAdminSettings for a save, plus the keys whose stored row fails its schema: they read as
+   * their default, but a save of that same value must still replace the row. One query.
+   */
+  async function getSettingsForSave(): Promise<SettingsForSave> {
+    const rows = await findAdminRows();
+    const invalidKeys = new Set<SettingKey>();
+    for (const row of rows) {
+      const key = BOOKING_SETTING_KEYS.find((candidate) => candidate === row.key);
+      if (key !== undefined && !STORED_SETTINGS[key].parse(row.value).ok) invalidKeys.add(key);
+    }
+    return { settings: { ...readValues(rows), ...lastChangeOf(rows) }, invalidKeys };
   }
 
   /** Only who last changed the settings: reads no value, so it cannot warn. One query. */
@@ -158,11 +183,10 @@ export function createSettingsService({ db, logger }: SettingsServiceDeps) {
 
   return {
     getBookingSettings,
-    /** The `bmsBaseUrl` setting, or the default if missing or invalid. One query. */
-    getBmsBaseUrl: (): Promise<string> => readOne(SETTING_KEYS.bmsBaseUrl),
     /** The `showGapMinutes` setting, or the default if missing or invalid. One query. */
     getShowGapMinutes: (): Promise<number> => readOne(SETTING_KEYS.showGapMinutes),
     getAdminSettings,
+    getSettingsForSave,
     getLastChange,
   };
 }

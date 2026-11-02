@@ -28,6 +28,54 @@ export type EmptyQuery = z.infer<typeof emptyQuerySchema>;
  */
 export const calendarDateSchema = z.iso.date();
 
+/** A control character (Unicode category Cc: C0, DEL and C1), NUL included. Linear scan. */
+const CONTROL_CHARACTER = /\p{Cc}/u;
+
+/** The same, except tab, line feed and carriage return. */
+const CONTROL_CHARACTER_EXCEPT_LINE_BREAKS = /(?![\t\n\r])\p{Cc}/u;
+
+/** Never echoes the value. */
+const SINGLE_LINE_TEXT_MESSAGE = 'Remove tabs, line breaks and other hidden control characters';
+const MULTI_LINE_TEXT_MESSAGE = 'Remove hidden control characters (line breaks and tabs are fine)';
+
+const hasNoControlCharacter = (value: string) => !CONTROL_CHARACTER.test(value);
+
+/**
+ * Free text that reaches the database as one line, e.g. a title or a name: trimmed, 1 to `max`
+ * characters, no control characters. Postgres refuses NUL in text (a 500 otherwise), and the
+ * others have no place in a label.
+ *
+ * Trimming comes first, so tab, line feed, vertical tab, form feed and carriage return at either
+ * end are removed and the rest is accepted; inside the text they are refused. Every other control
+ * character (NUL, U+0001, DEL, U+0085, ...) is not whitespace to `trim()`, so it is refused
+ * wherever it is.
+ *
+ * abort on `max`: the scan never runs on over-long input (see the regex safety note in movies.ts).
+ */
+export function singleLineTextSchema(max: number) {
+  return z
+    .string()
+    .trim()
+    .min(1)
+    .max(max, { abort: true })
+    .refine(hasNoControlCharacter, { message: SINGLE_LINE_TEXT_MESSAGE });
+}
+
+/**
+ * Like singleLineTextSchema, for text that may span lines (a synopsis): tab, line feed and
+ * carriage return are also allowed inside it. Every other control character is refused.
+ */
+export function multiLineTextSchema(max: number) {
+  return z
+    .string()
+    .trim()
+    .min(1)
+    .max(max, { abort: true })
+    .refine((value) => !CONTROL_CHARACTER_EXCEPT_LINE_BREAKS.test(value), {
+      message: MULTI_LINE_TEXT_MESSAGE,
+    });
+}
+
 /** Whole number from a query string. Digits only (no signs, decimals, exponents or spaces). */
 export function queryIntSchema(min: number, max: number) {
   return z
@@ -40,11 +88,15 @@ export function queryIntSchema(min: number, max: number) {
 /** Boolean from a query string. Only the literal strings 'true' and 'false' are accepted. */
 export const queryBooleanSchema = z.enum(['true', 'false']).transform((value) => value === 'true');
 
-/** Free-text search from a query string, trimmed. Whitespace-only is treated as no search. */
+/**
+ * Free-text search from a query string, trimmed. Whitespace-only is treated as no search. It ends
+ * up in a query, so control characters are refused as in singleLineTextSchema.
+ */
 export const querySearchSchema = z
   .string()
   .trim()
-  .max(100)
+  .max(100, { abort: true })
+  .refine(hasNoControlCharacter, { message: SINGLE_LINE_TEXT_MESSAGE })
   .transform((value) => (value === '' ? undefined : value));
 
 /** Soft-deleted rows in admin lists: hide them (default), include them, or show only them. */

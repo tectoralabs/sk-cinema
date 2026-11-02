@@ -3,7 +3,6 @@ import {
   type AdminScreen,
   type AdminScreenListQuery,
   type AdminScreenListResponse,
-  type FutureShowtimesConflictDetails,
   type ScreenCreateBody,
   type ScreenUpdateBody,
 } from '@sk-cinema/shared';
@@ -12,6 +11,7 @@ import type { MemoryCache } from '../lib/cache.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { escapeLikePattern } from '../lib/likePattern.js';
 import { lockScreen } from '../lib/locks.js';
+import { isRecordNotFound, refuseIfFutureShowtimes } from './adminGuards.js';
 import { writeAudit, type AuditActor, type AuditEntry } from './audit.service.js';
 import { invalidatePublicMovies } from './movie.public.service.js';
 
@@ -182,9 +182,6 @@ class ScreenGone extends Error {
   }
 }
 
-const isRecordNotFound = (error: unknown) =>
-  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025';
-
 /** Where a screen is: live (deletedAt null) or soft-deleted. */
 type ScreenPlace = 'live' | 'trash';
 
@@ -270,26 +267,6 @@ export function createScreenAdminService({
         ? SCREEN_NAME_IN_USE_MESSAGE
         : SCREEN_NAME_DELETED_MESSAGE,
     );
-  }
-
-  /**
-   * 409 with `{ futureShowtimeCount }` while the screen has upcoming (startsAt after now),
-   * non-deleted showtimes. Past and soft-deleted showtimes do not count. Call it only after
-   * lockScreen: showtime writers lock the screen too, so none can add a show to it between
-   * this count and our commit.
-   */
-  async function refuseIfFutureShowtimes(
-    tx: Prisma.TransactionClient,
-    screenId: string,
-    message: string,
-  ): Promise<void> {
-    const futureShowtimeCount = await tx.showtime.count({
-      where: { screenId, deletedAt: null, startsAt: { gt: now() } },
-    });
-    if (futureShowtimeCount > 0) {
-      const details: FutureShowtimesConflictDetails = { futureShowtimeCount };
-      throw new AppError(409, ERROR_CODES.CONFLICT, message, details);
-    }
   }
 
   /**
@@ -487,7 +464,12 @@ export function createScreenAdminService({
         plan: async (tx, current) => {
           if (current.isActive === isActive) return null;
           if (!isActive) {
-            await refuseIfFutureShowtimes(tx, id, SCREEN_DEACTIVATE_HAS_SHOWTIMES_MESSAGE);
+            await refuseIfFutureShowtimes(
+              tx,
+              { screenId: id },
+              now(),
+              SCREEN_DEACTIVATE_HAS_SHOWTIMES_MESSAGE,
+            );
           }
           return {
             data: { isActive },
@@ -511,7 +493,12 @@ export function createScreenAdminService({
         from: 'live',
         conflictMessage: SCREEN_ALREADY_DELETED_MESSAGE,
         plan: async (tx, current) => {
-          await refuseIfFutureShowtimes(tx, id, SCREEN_DELETE_HAS_SHOWTIMES_MESSAGE);
+          await refuseIfFutureShowtimes(
+            tx,
+            { screenId: id },
+            now(),
+            SCREEN_DELETE_HAS_SHOWTIMES_MESSAGE,
+          );
           return {
             data: { deletedAt: now() },
             audit: { action: 'DELETE', details: { mode: 'soft', name: current.name } },

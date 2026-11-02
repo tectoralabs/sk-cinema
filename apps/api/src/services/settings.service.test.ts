@@ -267,19 +267,46 @@ describe('settings service: getAdminSettings and getLastChange', () => {
   });
 });
 
-describe('settings service: single settings', () => {
-  it('getBmsBaseUrl reads one row with one query', async () => {
+describe('settings service: getSettingsForSave', () => {
+  it('no invalid keys for valid or missing rows; the settings as getAdminSettings gives them', async () => {
     const { db, service, logger } = setup([testSetting('bmsBaseUrl', CUSTOM_BASE)]);
-    await expect(service.getBmsBaseUrl()).resolves.toBe(CUSTOM_BASE);
-    expect(db.spies.setting.findUnique).toHaveBeenCalledTimes(1);
-    expect(db.spies.setting.findUnique).toHaveBeenCalledWith({
-      where: { key: 'bmsBaseUrl' },
-      select: { value: true },
-    });
-    expect(db.spies.setting.findMany).not.toHaveBeenCalled();
+
+    const { settings, invalidKeys } = await service.getSettingsForSave();
+
+    expect(settings).toEqual(await service.getAdminSettings());
+    expect(settings.bmsBaseUrl).toBe(CUSTOM_BASE);
+    expect([...invalidKeys]).toEqual([]);
+    // One query per call, as getAdminSettings.
+    expect(db.spies.setting.findMany).toHaveBeenCalledTimes(2);
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['bmsBaseUrl', 'http://evil.example/x'],
+    ['bmsBaseUrl', ` ${CUSTOM_BASE}`],
+    ['showGapMinutes', 'abc'],
+    ['showGapMinutes', '121'],
+  ])('names %s when the stored value %j fails its schema', async (key, value) => {
+    const { service, logger } = setup([testSetting(key, value)]);
+
+    const { settings, invalidKeys } = await service.getSettingsForSave();
+
+    expect([...invalidKeys]).toEqual([key]);
+    expect(settings).toMatchObject({ bmsBaseUrl: DEFAULT_BMS_BASE_URL, showGapMinutes: 15 });
+    expectOneWarning(logger, key);
+  });
+
+  it('a stored "007" is a valid 7, and a row of another key is ignored', async () => {
+    const { service } = setup([testSetting('showGapMinutes', '007'), testSetting('other', 'x')]);
+
+    const { settings, invalidKeys } = await service.getSettingsForSave();
+
+    expect(settings.showGapMinutes).toBe(7);
+    expect([...invalidKeys]).toEqual([]);
+  });
+});
+
+describe('settings service: single settings', () => {
   it('getShowGapMinutes reads one row with one query', async () => {
     const { db, service } = setup([testSetting('showGapMinutes', '45')]);
     await expect(service.getShowGapMinutes()).resolves.toBe(45);
@@ -290,21 +317,14 @@ describe('settings service: single settings', () => {
     });
   });
 
-  it('both default silently when their rows are missing', async () => {
+  it('defaults silently when its row is missing', async () => {
     const { service, logger } = setup();
-    await expect(service.getBmsBaseUrl()).resolves.toBe(DEFAULT_BMS_BASE_URL);
     await expect(service.getShowGapMinutes()).resolves.toBe(15);
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
-  it('both default and warn with only the key and reason when their rows are invalid', async () => {
-    const { service, logger } = setup([
-      testSetting('bmsBaseUrl', 'http://evil.example/x'),
-      testSetting('showGapMinutes', '121'),
-    ]);
-    await expect(service.getBmsBaseUrl()).resolves.toBe(DEFAULT_BMS_BASE_URL);
-    expectOneWarning(logger, 'bmsBaseUrl');
-    logger.warn.mockClear();
+  it('defaults and warns with only the key and reason when its row is invalid', async () => {
+    const { service, logger } = setup([testSetting('showGapMinutes', '121')]);
 
     await expect(service.getShowGapMinutes()).resolves.toBe(15);
     expectOneWarning(logger, 'showGapMinutes');

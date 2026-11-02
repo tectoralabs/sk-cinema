@@ -615,6 +615,10 @@ describe('GET /api/admin/showtimes', () => {
     ['an unknown key', '?x=1', ['query']],
     ['includePast=yes', '?includePast=yes', ['query', 'includePast']],
     ['a bad date', '?from=2026-02-30', ['query', 'from']],
+    ['from in a two-digit-style year', '?from=0002-11-02', ['query', 'from']],
+    ['from just before the range', '?from=2019-12-31', ['query', 'from']],
+    ['to just after the range', '?to=2100-01-01', ['query', 'to']],
+    ['to at the end of the calendar', '?to=9999-12-31', ['query', 'to']],
     ['to before from', '?from=2026-11-03&to=2026-11-02', ['query', 'to']],
     ['a bad movie id', '?movieId=abc', ['query', 'movieId']],
     ['pageSize 101', '?pageSize=101', ['query', 'pageSize']],
@@ -1595,5 +1599,126 @@ describe('POST /api/admin/showtimes/bulk-delete', () => {
     const page = adminShowtimeListResponseSchema.parse((await getShowtimes(s, '')).body);
     expect(page.items).toEqual([]);
     expectOk(await createShowtime(s, validBody(s, { date: '2026-11-02', time: '19:30' })), 201);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dates: the years a showtime request may name
+// ---------------------------------------------------------------------------
+
+describe('showtime dates outside 2020 to 2099: 400, never the 500 of a failed conversion', () => {
+  const REFUSED = [
+    ['2000-06-01', '23:45'],
+    ['2005-06-01', '23:45'],
+    ['1900-01-01', '00:00'],
+    ['0026-11-02', '00:00'],
+    ['2019-12-31', '23:59'],
+    ['2100-01-01', '00:00'],
+    ['9999-12-31', '23:59'],
+  ] as const;
+
+  it.each(REFUSED)('POST with date=%s time=%s', async (date, time) => {
+    const s = await setup();
+
+    const error = expectError(
+      await createShowtime(s, validBody(s, { date, time })),
+      400,
+      'VALIDATION_ERROR',
+    );
+
+    expect(error.details).toEqual([expect.objectContaining({ path: ['body', 'date'] })]);
+    expect(JSON.stringify(error)).not.toContain(date);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it.each(REFUSED)('PATCH with date=%s time=%s', async (date, time) => {
+    const s = await setupWithShow();
+
+    const error = expectError(
+      await patchShowtime(s, s.show.id, { date, time }),
+      400,
+      'VALIDATION_ERROR',
+    );
+
+    expect(error.details).toEqual([expect.objectContaining({ path: ['body', 'date'] })]);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['2019-12-31', '2020-01-02', 'dateFrom'],
+    ['2099-12-31', '2100-01-01', 'dateTo'],
+  ])('bulk POST from %s to %s points at %s', async (dateFrom, dateTo, field) => {
+    const s = await setup();
+
+    const error = expectError(
+      await bulkCreate(s, validBulkBody(s, { dateFrom, dateTo, times: ['23:45'] })),
+      400,
+      'VALIDATION_ERROR',
+    );
+
+    expect(error.details).toEqual([expect.objectContaining({ path: ['body', field] })]);
+    expect(s.db.spies.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('POST: the last minute of the range is created, with its Colombo date link', async () => {
+    const s = await setup();
+
+    const showtime = expectOk(
+      await createShowtime(s, validBody(s, { date: '2099-12-31', time: '23:59' })),
+      201,
+    );
+
+    expect(showtime).toMatchObject({
+      startsAt: '2099-12-31T18:29:00.000Z',
+      colomboDate: '2099-12-31',
+      time: '23:59',
+      bookingUrl: `${DEFAULT_BMS_BASE_URL}/20991231`,
+    });
+  });
+
+  it('POST: the first day of the range is valid but past: the ordinary 400 on the time', async () => {
+    const s = await setup();
+
+    const error = expectError(
+      await createShowtime(s, validBody(s, { date: '2020-01-01', time: '00:00' })),
+      400,
+      'VALIDATION_ERROR',
+    );
+
+    expect(error.message).toBe(SHOWTIME_IN_PAST_MESSAGE);
+    expect(error.details).toEqual([expect.objectContaining({ path: ['body', 'time'] })]);
+  });
+
+  it('bulk POST: a range ending on the last day of the range is created', async () => {
+    const s = await setup();
+
+    const { created, items } = expectBulkOk(
+      await bulkCreate(
+        s,
+        validBulkBody(s, { dateFrom: '2099-12-30', dateTo: '2099-12-31', times: ['23:59'] }),
+      ),
+    );
+
+    expect(created).toBe(2);
+    expect(items.map((item) => item.colomboDate)).toEqual(['2099-12-30', '2099-12-31']);
+  });
+
+  it('GET: to=2099-12-31 works, computing 2100-01-01 inside, and finds a show on that day', async () => {
+    const s = await setup({ showtimes: [{ startsAt: colombo('2099-12-31', '23:59') }] });
+
+    const res = await getShowtimes(s, '?from=2020-01-01&to=2099-12-31');
+
+    expect(res.status).toBe(200);
+    const { items } = adminShowtimeListResponseSchema.parse(res.body);
+    expect(items.map((item) => item.colomboDate)).toEqual(['2099-12-31']);
+  });
+
+  it('GET /api/movies/:id/showtimes still takes any real date: it is only compared', async () => {
+    const s = await setup();
+
+    const res = await request(s.app).get(`/api/movies/${s.movie.id}/showtimes?date=1900-01-01`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ date: '1900-01-01', items: [] });
   });
 });

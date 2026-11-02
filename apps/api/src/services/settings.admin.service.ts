@@ -6,6 +6,7 @@ import type { SettingKey } from '../lib/settings.js';
 import {
   existingShowtimeWindow,
   findShowtimeConflicts,
+  isUsableDuration,
   type ShowtimeSlot,
 } from '../lib/showtimeOverlap.js';
 import { writeAuditMany, type AuditActor } from './audit.service.js';
@@ -28,6 +29,9 @@ import {
  */
 
 const AUDIT_ENTITY = 'Setting';
+
+/** `reason` logged when the gap count skips shows whose movie has an unusable running time. */
+export const UNUSABLE_DURATION_REASON = 'unusable_stored_duration';
 
 const gapSlotSelect = {
   id: true,
@@ -53,6 +57,11 @@ const toSlot = (row: GapSlotRow): ShowtimeSlot => ({
  * close, count 2. A show running at `now` counts as an earlier neighbour. Every non-deleted
  * showtime occupies its screen, whatever its movie's or screen's state.
  *
+ * The count is information for the admin, so it must never block the settings screen: a show
+ * whose movie has an unusable running time (possible only through manual SQL) is left out, as a
+ * candidate and as a neighbour, with one warning per call giving the number of such shows, one
+ * showtime ID to start looking from, and the reason. Showtime writes still refuse such a movie.
+ *
  * Cost: one query for the future shows and, only when there are any, one for the shows started
  * within the longest possible run plus the gap before the earliest of them (both can use the
  * Showtime `startsAt` index), then a sort-and-sweep per screen. Admin-only and read-only.
@@ -61,28 +70,49 @@ export async function countFutureShowtimesBelowGap(
   db: Pick<Prisma.TransactionClient, 'showtime'>,
   gapMinutes: number,
   now: Date,
+  logger: Pick<Logger, 'warn'>,
 ): Promise<number> {
+  const skipped: string[] = [];
+  const usableSlots = (rows: readonly GapSlotRow[]): ShowtimeSlot[] =>
+    rows.flatMap((row) => {
+      if (isUsableDuration(row.movie.durationMinutes)) return [toSlot(row)];
+      skipped.push(row.id);
+      return [];
+    });
+
   const future = await db.showtime.findMany({
     where: { deletedAt: null, startsAt: { gt: now } },
     select: gapSlotSelect,
   });
-  const candidates = future.map(toSlot);
+  const candidates = usableSlots(future);
 
+  let belowGap = 0;
   const window = existingShowtimeWindow({ candidates, gapMinutes });
-  if (window === null) return 0;
+  if (window !== null) {
+    // Up to `now` only: everything after it is already a candidate.
+    const started = await db.showtime.findMany({
+      where: { deletedAt: null, startsAt: { gte: window.from, lte: now } },
+      select: gapSlotSelect,
+    });
+    const overlaps = findShowtimeConflicts({
+      candidates,
+      existing: usableSlots(started),
+      gapMinutes,
+    });
+    belowGap = new Set(overlaps.map((overlap) => overlap.candidateIndex)).size;
+  }
 
-  // Up to `now` only: everything after it is already a candidate.
-  const started = await db.showtime.findMany({
-    where: { deletedAt: null, startsAt: { gte: window.from, lte: now } },
-    select: gapSlotSelect,
-  });
-
-  const overlaps = findShowtimeConflicts({
-    candidates,
-    existing: started.map(toSlot),
-    gapMinutes,
-  });
-  return new Set(overlaps.map((overlap) => overlap.candidateIndex)).size;
+  if (skipped.length > 0) {
+    logger.warn(
+      {
+        showtimeId: skipped[0],
+        skippedCount: skipped.length,
+        reason: UNUSABLE_DURATION_REASON,
+      },
+      'Left showtimes out of the gap count: their movie has an unusable running time',
+    );
+  }
+  return belowGap;
 }
 
 /** A setting whose effective value would change. */
@@ -95,15 +125,22 @@ interface SettingChange {
 /**
  * Compares a validated body with the effective values (a missing or invalid row reads as its
  * default), so `from` is always a valid typed value, never a stored raw one. Empty: a no-op.
+ *
+ * A key in `invalidKeys` holds an invalid stored row, which is never a no-op: sending the value
+ * it reads as (its default) replaces the row, so it stops warning on every read. `from` is then
+ * equal to `to`.
  */
 export function settingChanges(
   current: BookingSettings,
   body: SettingsUpdateBody,
+  invalidKeys: ReadonlySet<SettingKey> = new Set(),
 ): SettingChange[] {
   const changes: SettingChange[] = [];
   for (const key of BOOKING_SETTING_KEYS) {
     const to = body[key];
-    if (to !== undefined && to !== current[key]) changes.push({ key, from: current[key], to });
+    if (to !== undefined && (to !== current[key] || invalidKeys.has(key))) {
+      changes.push({ key, from: current[key], to });
+    }
   }
   return changes;
 }
@@ -140,6 +177,7 @@ export function createSettingsAdminService({
         db,
         settings.showGapMinutes,
         now(),
+        logger,
       );
       return { settings, futureShowtimesBelowGap };
     },
@@ -149,13 +187,14 @@ export function createSettingsAdminService({
      * and write one UPDATE audit row per key (`{ from, to }`, effective typed values); count
      * under the gap now in force. Then, only after the commit and only if something changed,
      * the public cache is dropped. A no-op writes, audits and invalidates nothing and answers
-     * the same shape. Base URL changes leave showtime overrides alone.
+     * the same shape; a key holding an invalid stored row is never a no-op (see settingChanges).
+     * Base URL changes leave showtime overrides alone.
      */
     async update(body: SettingsUpdateBody, actor: AuditActor): Promise<AdminSettingsResponse> {
       const outcome = await db.$transaction(async (tx) => {
         const reader = createSettingsService({ db: tx, logger });
-        const current = await reader.getAdminSettings();
-        const changes = settingChanges(current, body);
+        const { settings: current, invalidKeys } = await reader.getSettingsForSave();
+        const changes = settingChanges(current, body, invalidKeys);
 
         let settings: AdminSettings = current;
         if (changes.length > 0) {
@@ -194,6 +233,7 @@ export function createSettingsAdminService({
           tx,
           settings.showGapMinutes,
           now(),
+          logger,
         );
         return { response: { settings, futureShowtimesBelowGap }, changed: changes.length > 0 };
       });

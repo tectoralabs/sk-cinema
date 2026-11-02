@@ -24,6 +24,32 @@ import { movieStatusSchema } from './movies.js';
 /* Building blocks                                                            */
 /* -------------------------------------------------------------------------- */
 
+/** The first and last year a showtime can be scheduled in, or an admin list can ask for. */
+export const SHOWTIME_DATE_MIN_YEAR = 2020;
+export const SHOWTIME_DATE_MAX_YEAR = 2099;
+
+const SHOWTIME_DATE_MESSAGE = `Use a date from ${String(SHOWTIME_DATE_MIN_YEAR)} to ${String(SHOWTIME_DATE_MAX_YEAR)}, as YYYY-MM-DD`;
+
+/**
+ * A Colombo date in an admin showtime request: a real `YYYY-MM-DD` from SHOWTIME_DATE_MIN_YEAR to
+ * SHOWTIME_DATE_MAX_YEAR. The API turns these into instants at a fixed +05:30, exact from 2006
+ * onward (lib/colomboTime.ts), and computes the day after `to`, so the years are bounded here.
+ * Not for `releaseDate` or dates in responses (calendarDateSchema), nor the public `?date=`, which
+ * is only compared with the dates of upcoming shows. The message never echoes the value.
+ *
+ * abort: the year is only read from a well-formed date, and the anchored pattern of z.iso.date()
+ * fails within a few characters on over-long input.
+ */
+export const showtimeDateSchema = z.iso
+  .date({ abort: true, message: SHOWTIME_DATE_MESSAGE })
+  .refine(
+    (date) => {
+      const year = Number(date.slice(0, 4));
+      return year >= SHOWTIME_DATE_MIN_YEAR && year <= SHOWTIME_DATE_MAX_YEAR;
+    },
+    { message: SHOWTIME_DATE_MESSAGE },
+  );
+
 /** Matches `Showtime.format VarChar(20)`. */
 export const SHOWTIME_FORMAT_MAX_LENGTH = 20;
 
@@ -192,7 +218,7 @@ export type PublicMovieIdParams = z.infer<typeof publicMovieIdParamsSchema>;
 export const showtimeCreateBodySchema = z.strictObject({
   movieId: z.uuid(),
   screenId: z.uuid(),
-  date: calendarDateSchema,
+  date: showtimeDateSchema,
   time: clockTimeSchema,
   format: showtimeFormatSchema.optional(),
   bookingUrlOverride: bookingUrlOverrideSchema.nullable().optional(),
@@ -210,8 +236,8 @@ export const showtimeBulkCreateBodySchema = z
   .strictObject({
     movieId: z.uuid(),
     screenId: z.uuid(),
-    dateFrom: calendarDateSchema,
-    dateTo: calendarDateSchema,
+    dateFrom: showtimeDateSchema,
+    dateTo: showtimeDateSchema,
     times: bulkTimesSchema,
     format: showtimeFormatSchema.optional(),
   })
@@ -245,7 +271,7 @@ export type ShowtimeBulkCreateBodyInput = z.input<typeof showtimeBulkCreateBodyS
 export const showtimeUpdateBodySchema = z
   .strictObject({
     screenId: z.uuid().optional(),
-    date: calendarDateSchema.optional(),
+    date: showtimeDateSchema.optional(),
     time: clockTimeSchema.optional(),
     format: showtimeFormatSchema.optional(),
     bookingUrlOverride: bookingUrlOverrideSchema.nullable().optional(),
@@ -294,8 +320,8 @@ export const adminShowtimeListQuerySchema = z
   .strictObject({
     movieId: z.uuid().optional(),
     screenId: z.uuid().optional(),
-    from: calendarDateSchema.optional(),
-    to: calendarDateSchema.optional(),
+    from: showtimeDateSchema.optional(),
+    to: showtimeDateSchema.optional(),
     /** Only the literal strings 'true' and 'false' are accepted. */
     includePast: queryBooleanSchema.default(false),
     /** Soft-deleted showtimes: hide them (default), include them, or show only them. */

@@ -338,6 +338,20 @@ describe('GET /api/admin/settings', () => {
     expect(JSON.stringify(settings)).not.toContain('evil');
   });
 
+  it('answers with a movie of 0 minutes and a future show, the count ignoring it', async () => {
+    const broken = testMovie({ slug: 'broken', durationMinutes: 0 });
+    const s = await setup({
+      movies: [broken],
+      showtimes: [
+        { startsAt: colombo(DAY, '09:00'), movieId: broken.id },
+        { startsAt: colombo(DAY, '10:00') },
+        { startsAt: colombo(DAY, '12:00') },
+      ],
+    });
+
+    expect(expectOk(await getSettings(s)).futureShowtimesBelowGap).toBe(1);
+  });
+
   it('counts future shows below the stored gap', async () => {
     const s = await setup({
       settings: [testSetting('showGapMinutes', '30')],
@@ -472,6 +486,54 @@ describe('PATCH /api/admin/settings', () => {
     expectOk(await patchSettings(s, { bmsBaseUrl: NEW_BASE }));
 
     expect(s.db.showtimes).toEqual(before);
+  });
+
+  it('saves with a movie of 0 minutes and a future show, the count ignoring it', async () => {
+    const broken = testMovie({ slug: 'broken', durationMinutes: 0 });
+    const s = await setup({
+      movies: [broken],
+      showtimes: [
+        { startsAt: colombo(DAY, '09:00'), movieId: broken.id },
+        { startsAt: colombo(DAY, '10:00') },
+        { startsAt: colombo(DAY, '12:00') },
+      ],
+    });
+
+    const res = expectOk(await patchSettings(s, { showGapMinutes: 20 }));
+
+    expect(res.settings.showGapMinutes).toBe(20);
+    expect(res.futureShowtimesBelowGap).toBe(1);
+    expect(storedValues(s.db)).toEqual({ showGapMinutes: '20' });
+  });
+
+  describe('an invalid stored row is never a no-op', () => {
+    it.each([
+      ['showGapMinutes', 'not-a-gap', 15, '15'],
+      ['bmsBaseUrl', 'https://evil.example/stored', DEFAULT_BMS_BASE_URL, DEFAULT_BMS_BASE_URL],
+    ] as const)(
+      'sending the default for %s overwrites the row: audit, invalidation, no more warnings',
+      async (key, raw, effective, written) => {
+        const s = await setup({ settings: [testSetting(key, raw)] });
+
+        const res = expectOk(await patchSettings(s, { [key]: effective }));
+
+        expect(res.settings).toMatchObject({
+          [key]: effective,
+          updatedBy: { id: s.adminId, name: s.adminName },
+        });
+        expect(storedValues(s.db)).toEqual({ [key]: written });
+        expect(settingAudits(s.db)).toEqual([
+          expect.objectContaining({
+            action: 'UPDATE',
+            adminId: s.adminId,
+            entityId: key,
+            details: { from: effective, to: effective },
+          }),
+        ]);
+        expectInvalidatedOnceAfterAudit(s);
+        expect(JSON.stringify([settingAudits(s.db), res])).not.toContain(raw);
+      },
+    );
   });
 
   describe('no-ops', () => {

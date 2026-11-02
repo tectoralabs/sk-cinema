@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import { DEFAULT_BMS_BASE_URL } from './bms.js';
+import { calendarDateSchema } from './common.js';
 import { publicMovieSchema } from './movies.js';
 import {
   SHOWTIME_BULK_DELETE_MAX_IDS,
   SHOWTIME_BULK_MAX_DAYS,
   SHOWTIME_BULK_MAX_DETAILS,
   SHOWTIME_BULK_MAX_TIMES,
+  SHOWTIME_DATE_MAX_YEAR,
+  SHOWTIME_DATE_MIN_YEAR,
   SHOWTIME_FORMAT_MAX_LENGTH,
   adminShowtimeListQuerySchema,
   adminShowtimeListResponseSchema,
@@ -29,6 +32,7 @@ import {
   showtimeConflictDetailsSchema,
   showtimeConflictErrorSchema,
   showtimeCreateBodySchema,
+  showtimeDateSchema,
   showtimeFormatSchema,
   showtimeIdParamsSchema,
   showtimePastSlotDetailSchema,
@@ -114,6 +118,97 @@ describe('constants', () => {
     expect(SHOWTIME_BULK_MAX_DAYS).toBe(31);
     expect(SHOWTIME_BULK_MAX_TIMES).toBe(12);
     expect(SHOWTIME_BULK_DELETE_MAX_IDS).toBe(200);
+  });
+});
+
+describe('showtimeDateSchema', () => {
+  const OUT_OF_RANGE = [
+    '2019-12-31',
+    '2100-01-01',
+    '2000-06-01',
+    '2005-06-01',
+    '1900-01-01',
+    '0026-11-02',
+    '0002-11-02',
+    '0000-01-01',
+    '9999-12-31',
+  ];
+  const MESSAGE = 'Use a date from 2020 to 2099, as YYYY-MM-DD';
+
+  it('exports the bounds', () => {
+    expect([SHOWTIME_DATE_MIN_YEAR, SHOWTIME_DATE_MAX_YEAR]).toEqual([2020, 2099]);
+  });
+
+  it.each(['2020-01-01', '2026-11-02', '2028-02-29', '2099-12-31'])('accepts %s', (date) => {
+    expect(showtimeDateSchema.parse(date)).toBe(date);
+  });
+
+  it.each([...OUT_OF_RANGE, ...INVALID_DATES])('rejects %j with one friendly message', (date) => {
+    const result = showtimeDateSchema.safeParse(date);
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.message)).toEqual([MESSAGE]);
+  });
+
+  it('rejects non-strings', () => {
+    expect(showtimeDateSchema.safeParse(20261102).success).toBe(false);
+    expect(showtimeDateSchema.safeParse(null).success).toBe(false);
+  });
+
+  it('leaves calendarDateSchema (releaseDate) unbounded', () => {
+    for (const date of OUT_OF_RANGE) {
+      expect(calendarDateSchema.safeParse(date).success).toBe(true);
+    }
+  });
+
+  it('rejects a ~100 KB string quickly with one issue that does not echo it', () => {
+    const { result, ms } = timeSafeParse(showtimeDateSchema, `2026-11-01${'1'.repeat(HUGE)}`);
+    expect(ms).toBeLessThan(50);
+    expect(result.error?.issues.map((issue) => issue.message)).toEqual([MESSAGE]);
+    expect(JSON.stringify(result.error?.issues)).not.toContain('2026-11-01');
+  });
+
+  describe.each(OUT_OF_RANGE)('%s in a request', (date) => {
+    const expectRefused = (schema: z.ZodType, input: unknown, path: string) => {
+      const result = schema.safeParse(input);
+      expect(result.success).toBe(false);
+      expect(result.error?.issues).toEqual(
+        expect.arrayContaining([expect.objectContaining({ path: [path], message: MESSAGE })]),
+      );
+    };
+
+    it('is refused on every field', () => {
+      expectRefused(showtimeCreateBodySchema, { ...validCreate, date }, 'date');
+      expectRefused(showtimeBulkCreateBodySchema, { ...validBulk, dateFrom: date }, 'dateFrom');
+      expectRefused(showtimeBulkCreateBodySchema, { ...validBulk, dateTo: date }, 'dateTo');
+      expectRefused(showtimeUpdateBodySchema, { date, time: '23:45' }, 'date');
+      expectRefused(adminShowtimeListQuerySchema, { from: date }, 'from');
+      expectRefused(adminShowtimeListQuerySchema, { to: date }, 'to');
+    });
+
+    it('stays valid for the public ?date=, only ever compared as a string', () => {
+      expect(publicShowtimeListQuerySchema.safeParse({ date }).success).toBe(true);
+    });
+  });
+
+  it('accepts the edges of the range in requests', () => {
+    const { movieId, screenId } = validCreate;
+    expect(
+      showtimeCreateBodySchema.safeParse({ movieId, screenId, date: '2099-12-31', time: '23:59' })
+        .success,
+    ).toBe(true);
+    expect(
+      showtimeBulkCreateBodySchema.safeParse({
+        ...validBulk,
+        dateFrom: '2099-12-01',
+        dateTo: '2099-12-31',
+      }).success,
+    ).toBe(true);
+    expect(showtimeUpdateBodySchema.safeParse({ date: '2020-01-01', time: '00:00' }).success).toBe(
+      true,
+    );
+    expect(
+      adminShowtimeListQuerySchema.safeParse({ from: '2020-01-01', to: '2099-12-31' }).success,
+    ).toBe(true);
   });
 });
 

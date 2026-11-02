@@ -4,6 +4,7 @@ import { addDays, fromColomboDateTime } from './colomboTime.js';
 import {
   existingShowtimeWindow,
   findShowtimeConflicts,
+  isUsableDuration,
   toShowtimeConflict,
   type ShowtimeOverlap,
   type ShowtimeSlot,
@@ -325,6 +326,17 @@ describe('findShowtimeConflicts: programmer errors', () => {
   it('accepts the bounds: gap 0 and 120, duration 1', () => {
     expect(conflictsOf([requested('10:00', 1)], [], 0)).toEqual([]);
     expect(conflictsOf([requested('10:00', 1)], [], 120)).toEqual([]);
+  });
+});
+
+describe('isUsableDuration', () => {
+  it('is true for a positive whole number only', () => {
+    for (const minutes of [1, 120, MOVIE_DURATION_MAX_MINUTES]) {
+      expect(isUsableDuration(minutes)).toBe(true);
+    }
+    for (const minutes of [0, -1, 1.5, Number.NaN, Infinity]) {
+      expect(isUsableDuration(minutes)).toBe(false);
+    }
   });
 });
 

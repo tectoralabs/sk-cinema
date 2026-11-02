@@ -1,5 +1,5 @@
 import { DEFAULT_BMS_BASE_URL } from '@sk-cinema/shared';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { Movie, Screen, Setting, Showtime } from '../generated/prisma/client.js';
 import { MemoryCache } from '../lib/cache.js';
 import {
@@ -12,6 +12,7 @@ import {
 } from '../test/helpers.js';
 import { PUBLIC_MOVIES_CACHE_PREFIX } from './movie.public.service.js';
 import {
+  UNUSABLE_DURATION_REASON,
   countFutureShowtimesBelowGap,
   createSettingsAdminService,
   settingChanges,
@@ -43,13 +44,16 @@ function dbWith(seeds: Seed[], extra: { movies?: Movie[]; screens?: Screen[] } =
   });
 }
 
+/** For the counts that must not warn; the tests that look at warnings use their own. */
+const LOGGER = { warn: () => undefined };
+
 const count = (seeds: Seed[], gap = 15) =>
-  countFutureShowtimesBelowGap(dbWith(seeds).prisma, gap, NOW);
+  countFutureShowtimesBelowGap(dbWith(seeds).prisma, gap, NOW, LOGGER);
 
 describe('countFutureShowtimesBelowGap', () => {
   it('is 0 with no shows, with one query', async () => {
     const db = dbWith([]);
-    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW)).resolves.toBe(0);
+    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, LOGGER)).resolves.toBe(0);
     expect(db.spies.showtime.findMany).toHaveBeenCalledTimes(1);
   });
 
@@ -152,7 +156,7 @@ describe('countFutureShowtimesBelowGap', () => {
       ],
       { screens: [other] },
     );
-    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW)).resolves.toBe(0);
+    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, LOGGER)).resolves.toBe(0);
   });
 
   it('counts shows of hidden or deleted movies and screens: they still occupy the screen', async () => {
@@ -173,7 +177,7 @@ describe('countFutureShowtimesBelowGap', () => {
       ],
       { movies: [hiddenMovie, deletedMovie], screens: [hiddenScreen, deletedScreen] },
     );
-    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW)).resolves.toBe(4);
+    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, LOGGER)).resolves.toBe(4);
   });
 
   it('uses each movie its own running time', async () => {
@@ -182,8 +186,8 @@ describe('countFutureShowtimesBelowGap', () => {
       [{ startsAt: colombo(DAY, '10:00'), movieId: short.id }, { startsAt: colombo(DAY, '10:45') }],
       { movies: [short] },
     );
-    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW)).resolves.toBe(0);
-    await expect(countFutureShowtimesBelowGap(db.prisma, 16, NOW)).resolves.toBe(1);
+    await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, LOGGER)).resolves.toBe(0);
+    await expect(countFutureShowtimesBelowGap(db.prisma, 16, NOW, LOGGER)).resolves.toBe(1);
   });
 
   it('a gap of 0 still counts real overlaps, and allows touching', async () => {
@@ -195,9 +199,87 @@ describe('countFutureShowtimesBelowGap', () => {
     ).resolves.toBe(1);
   });
 
+  describe('a movie with an unusable running time (manual SQL)', () => {
+    const broken = (durationMinutes: number) =>
+      testMovie({ slug: `broken-${String(durationMinutes)}`, durationMinutes });
+
+    it.each([0, -5])('skips its future shows, with one warning: duration %i', async (minutes) => {
+      const bad = broken(minutes);
+      const logger = { warn: vi.fn() };
+      const db = dbWith(
+        [
+          { startsAt: colombo(DAY, '10:00'), movieId: bad.id },
+          { startsAt: colombo(DAY, '10:05'), movieId: bad.id },
+          { startsAt: colombo(DAY, '10:10') },
+          { startsAt: colombo(DAY, '12:00') },
+        ],
+        { movies: [bad] },
+      );
+      const firstBad = db.showtimes[0]?.id;
+
+      // The two usable shows clash with each other; the skipped ones do not count at all.
+      await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, logger)).resolves.toBe(1);
+
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith(
+        { showtimeId: firstBad, skippedCount: 2, reason: UNUSABLE_DURATION_REASON },
+        expect.any(String),
+      );
+    });
+
+    it('skips a started show of it as a neighbour too, in the same one warning', async () => {
+      const bad = broken(0);
+      const logger = { warn: vi.fn() };
+      const db = dbWith(
+        [
+          { startsAt: new Date('2026-11-01T09:59:00.000Z'), movieId: bad.id },
+          { startsAt: new Date('2026-11-01T10:30:00.000Z') },
+          { startsAt: new Date('2026-11-01T10:31:00.000Z'), movieId: bad.id },
+        ],
+        { movies: [bad] },
+      );
+
+      await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, logger)).resolves.toBe(0);
+
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn.mock.calls[0]?.[0]).toMatchObject({ skippedCount: 2 });
+    });
+
+    it('is 0 with one query when it is the only one with future shows', async () => {
+      const bad = broken(0);
+      const logger = { warn: vi.fn() };
+      const db = dbWith([{ startsAt: colombo(DAY, '10:00'), movieId: bad.id }], { movies: [bad] });
+
+      await expect(countFutureShowtimesBelowGap(db.prisma, 15, NOW, logger)).resolves.toBe(0);
+
+      expect(db.spies.showtime.findMany).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs only the showtime ID, the count and the reason, not the title or the duration', async () => {
+      const bad = testMovie({ slug: 'x', title: 'A very secret title', durationMinutes: 0 });
+      const logger = { warn: vi.fn() };
+      const db = dbWith([{ startsAt: colombo(DAY, '10:00'), movieId: bad.id }], { movies: [bad] });
+
+      await countFutureShowtimesBelowGap(db.prisma, 15, NOW, logger);
+
+      const [fields] = logger.warn.mock.calls[0] as [Record<string, unknown>];
+      expect(Object.keys(fields).sort()).toEqual(['reason', 'showtimeId', 'skippedCount']);
+      expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('secret');
+    });
+
+    it('does not warn without such a movie', async () => {
+      const logger = { warn: vi.fn() };
+      const db = dbWith([{ startsAt: colombo(DAY, '10:00') }]);
+
+      await countFutureShowtimesBelowGap(db.prisma, 15, NOW, logger);
+
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
   it('with future shows it runs exactly two read-only queries, the second bounded by the window', async () => {
     const db = dbWith([{ startsAt: colombo(DAY, '10:00') }]);
-    await countFutureShowtimesBelowGap(db.prisma, 15, NOW);
+    await countFutureShowtimesBelowGap(db.prisma, 15, NOW, LOGGER);
 
     expect(db.spies.showtime.findMany).toHaveBeenCalledTimes(2);
     const calls = db.spies.showtime.findMany.mock.calls as unknown as [{ where: object }][];
@@ -230,6 +312,19 @@ describe('settingChanges', () => {
     expect(settingChanges(current, { showGapMinutes: 0 })).toEqual([
       { key: 'showGapMinutes', from: 15, to: 0 },
     ]);
+  });
+
+  it('a key with an invalid stored row is a change even when the value is the same', () => {
+    expect(settingChanges(current, { showGapMinutes: 15 }, new Set(['showGapMinutes']))).toEqual([
+      { key: 'showGapMinutes', from: 15, to: 15 },
+    ]);
+    expect(
+      settingChanges(current, { bmsBaseUrl: DEFAULT_BMS_BASE_URL }, new Set(['bmsBaseUrl'])),
+    ).toEqual([{ key: 'bmsBaseUrl', from: DEFAULT_BMS_BASE_URL, to: DEFAULT_BMS_BASE_URL }]);
+  });
+
+  it('an invalid row of a key the body does not send is not a change', () => {
+    expect(settingChanges(current, { showGapMinutes: 15 }, new Set(['bmsBaseUrl']))).toEqual([]);
   });
 });
 
@@ -354,7 +449,77 @@ describe('settings admin service', () => {
   });
 
   it.each([
-    ['an invalid row whose default is sent', 'showGapMinutes', 'abc', { showGapMinutes: 15 }],
+    ['showGapMinutes', 'not-a-gap', { showGapMinutes: 15 }, 15, '15'],
+    ['showGapMinutes', '1.5', { showGapMinutes: 15 }, 15, '15'],
+    [
+      'bmsBaseUrl',
+      'http://evil.example/x',
+      { bmsBaseUrl: DEFAULT_BMS_BASE_URL },
+      DEFAULT_BMS_BASE_URL,
+      DEFAULT_BMS_BASE_URL,
+    ],
+    [
+      'bmsBaseUrl',
+      ` ${DEFAULT_BMS_BASE_URL}`,
+      { bmsBaseUrl: DEFAULT_BMS_BASE_URL },
+      DEFAULT_BMS_BASE_URL,
+      DEFAULT_BMS_BASE_URL,
+    ],
+  ] as const)(
+    'update: saving the default over the invalid %s row %j repairs it',
+    async (key, raw, body, effective, written) => {
+      // A fixed clock: the check below searches timestamps too, and a real one such as
+      // "...:11.577Z" contains the row "1.5".
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(NOW);
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      const { db, invalidate, logger, service } = setup([testSetting(key, raw)]);
+
+      const response = await service.update(body, actor);
+
+      expect(db.settings.map((row) => [row.key, row.value, row.updatedById])).toEqual([
+        [key, written, owner.id],
+      ]);
+      expect(db.auditLogs).toEqual([
+        expect.objectContaining({
+          action: 'UPDATE',
+          adminId: owner.id,
+          entity: 'Setting',
+          entityId: key,
+          details: { from: effective, to: effective },
+        }),
+      ]);
+      expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+      expect(response.settings).toMatchObject({ [key]: effective });
+      expect(response.settings.updatedBy).toEqual({ id: owner.id, name: 'Owner' });
+      const everything = JSON.stringify([db.auditLogs, logger.warn.mock.calls, response]);
+      expect(everything).not.toContain(raw);
+
+      // The warning from this save's own read is the last one: the row is good now.
+      logger.warn.mockClear();
+      await service.get();
+      expect(logger.warn).not.toHaveBeenCalled();
+    },
+  );
+
+  it('update: a second save of the same value after a repair is a no-op', async () => {
+    const { db, invalidate, service } = setup([testSetting('showGapMinutes', 'abc')]);
+
+    await service.update({ showGapMinutes: 15 }, actor);
+    invalidate.mockClear();
+    db.spies.setting.upsert.mockClear();
+    const audits = db.auditLogs.length;
+
+    await service.update({ showGapMinutes: 15 }, actor);
+
+    expect(db.spies.setting.upsert).not.toHaveBeenCalled();
+    expect(db.auditLogs).toHaveLength(audits);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['a missing row whose default is sent', 'other', 'x', { showGapMinutes: 15 }],
     ['the same stored value', 'showGapMinutes', '20', { showGapMinutes: 20 }],
     ['a stored "007" and the number 7', 'showGapMinutes', '007', { showGapMinutes: 7 }],
@@ -385,6 +550,51 @@ describe('settings admin service', () => {
         updatedBy: { id: owner.id, name: 'Owner' },
       },
       futureShowtimesBelowGap: 1,
+    });
+  });
+
+  describe('a movie with a running time of 0 and a future show', () => {
+    const broken = testMovie({ slug: 'broken', durationMinutes: 0 });
+
+    function setupBroken() {
+      const db = inMemoryAuthDb({
+        admins: [owner],
+        movies: [movie, broken],
+        screens: [screen],
+        showtimes: [
+          showOf({ startsAt: colombo(DAY, '10:00'), movieId: broken.id }),
+          showOf({ startsAt: colombo(DAY, '12:00') }),
+          showOf({ startsAt: colombo(DAY, '12:30') }),
+        ],
+      });
+      const logger = { warn: vi.fn() };
+      const service = createSettingsAdminService({
+        db: db.prisma,
+        cache: new MemoryCache(),
+        logger,
+        now: () => NOW,
+      });
+      return { db, logger, service };
+    }
+
+    it('get: answers, the count ignoring it, with one warning', async () => {
+      const { logger, service } = setupBroken();
+
+      await expect(service.get()).resolves.toMatchObject({ futureShowtimesBelowGap: 1 });
+
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('update: saves, the count ignoring it, with one warning', async () => {
+      const { db, logger, service } = setupBroken();
+
+      await expect(service.update({ showGapMinutes: 30 }, actor)).resolves.toMatchObject({
+        settings: { showGapMinutes: 30 },
+        futureShowtimesBelowGap: 1,
+      });
+
+      expect(db.settings.map((row) => row.value)).toEqual(['30']);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -32,11 +32,11 @@ import { afterAll, afterEach, beforeEach, expect, it } from 'vitest';
 import { Prisma, type AdminRole } from '../../generated/prisma/client.js';
 import { MemoryCache } from '../../lib/cache.js';
 import { AppError } from '../../lib/errors.js';
+import type { AuditActor } from '../../services/audit.service.js';
 import {
   SLUG_IN_USE_MESSAGE,
   createMovieAdminService,
   isMovieSlugClash,
-  type AuditActor,
 } from '../../services/movie.admin.service.js';
 import { createPublicMovieService } from '../../services/movie.public.service.js';
 import {

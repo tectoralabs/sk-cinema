@@ -92,9 +92,17 @@ function assertGap(gapMinutes: number): void {
   }
 }
 
+/**
+ * True for a running time this module accepts: a positive whole number. The API never stores
+ * anything else, but the database has no CHECK on it, so manual SQL could.
+ */
+export function isUsableDuration(durationMinutes: number): boolean {
+  return Number.isSafeInteger(durationMinutes) && durationMinutes >= 1;
+}
+
 /** Throws unless the slot has a valid start and a positive whole-minute duration. */
 function assertSlot(slot: Pick<ShowtimeSlot, 'startsAt' | 'durationMinutes'>, label: string): void {
-  if (!Number.isSafeInteger(slot.durationMinutes) || slot.durationMinutes < 1) {
+  if (!isUsableDuration(slot.durationMinutes)) {
     throw new RangeError(
       `${label}: durationMinutes must be a positive whole number, got ${String(slot.durationMinutes)}`,
     );

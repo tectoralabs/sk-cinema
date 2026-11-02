@@ -30,6 +30,7 @@ import {
   type ShowtimeOverlap,
   type ShowtimeSlot,
 } from '../lib/showtimeOverlap.js';
+import { isRecordNotFound } from './adminGuards.js';
 import { writeAudit, writeAuditMany, type AuditActor } from './audit.service.js';
 import { resolveBookingUrl } from './bmsLink.js';
 import { invalidatePublicMovies } from './movie.public.service.js';
@@ -456,9 +457,6 @@ export function showtimeConflictError(
 const isForeignKeyError = (error: unknown) =>
   error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2003';
 
-const isRecordNotFound = (error: unknown) =>
-  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025';
-
 /** Thrown inside a create / update transaction when the write hit a foreign key (see message). */
 class TargetGone extends Error {
   constructor() {
@@ -605,8 +603,10 @@ export function expandBulkSlots({
   );
 }
 
-/** The bulk create 400 for slots at or before now: all counted, the first 50 listed. */
-function bulkPastError(past: readonly BulkSlot[]): AppError {
+/** The bulk create 400 for slots at or before `now`: all counted, the first 50 listed. */
+function refusePastSlots(slots: readonly BulkSlot[], now: Date): void {
+  const past = slots.filter((slot) => slot.startsAt.getTime() <= now.getTime());
+  if (past.length === 0) return;
   const details: ShowtimePastSlotDetail[] = past
     .slice(0, SHOWTIME_BULK_MAX_DETAILS)
     .map((slot) => ({
@@ -614,7 +614,7 @@ function bulkPastError(past: readonly BulkSlot[]): AppError {
       message: SHOWTIME_SLOT_IN_PAST_MESSAGE,
       requested: { date: slot.date, time: slot.time },
     }));
-  return new AppError(
+  throw new AppError(
     400,
     ERROR_CODES.VALIDATION_ERROR,
     showtimeBulkPastMessage(past.length),
@@ -767,9 +767,11 @@ export function createShowtimeAdminService({
     /**
      * Creates one showtime per Colombo date in [dateFrom, dateTo] at each of `times`, all or
      * nothing:
-     * 1. any slot at or before now: 400 listing the past slots (nothing read or written);
+     * 1. any slot at or before now: 400 listing the past slots (nothing read or written), so a
+     *    past request gets this 400 even for an unknown movie or screen;
      * 2. in one transaction: lock and check the movie, then the screen (checkScheduleTargets);
-     *    read the booking settings; check every slot against the live showtimes on the screen
+     *    the same past check again with a fresh clock, as a slot can pass while the locks are
+     *    awaited; read the booking settings; check every slot against the live showtimes on the screen
      *    and against the other slots (409 listing the clashes, nothing written);
      * 3. one multi-row insert, then the inserted rows read back (below), then one CREATE audit
      *    row per showtime sharing a `batchId`, in one multi-row insert;
@@ -787,14 +789,13 @@ export function createShowtimeAdminService({
       actor: AuditActor,
     ): Promise<ShowtimeBulkCreateResponse> {
       const slots = expandBulkSlots(input);
-      const nowMs = now().getTime();
-      const past = slots.filter((slot) => slot.startsAt.getTime() <= nowMs);
-      if (past.length > 0) throw bulkPastError(past);
+      refusePastSlots(slots, now());
 
       let outcome: { rows: AdminShowtimeRow[]; baseUrl: string };
       try {
         outcome = await db.$transaction(async (tx) => {
           const { movie, screen } = await checkScheduleTargets(tx, input.movieId, input.screenId);
+          refusePastSlots(slots, now());
           const booking = await settingsIn(tx).getBookingSettings();
 
           const candidates: ShowtimeCandidate[] = slots.map((slot) => ({
