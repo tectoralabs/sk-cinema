@@ -23,9 +23,12 @@ export default async function setup(): Promise<void> {
       return;
     }
 
+    // Before anything is written: the URL says "_test", the server must agree.
+    await assertConnectedToTestDatabase(url);
+
     console.info(`[pg] Applying migrations to ${redactDatabaseUrl(url)}`);
     migrateDeploy(url);
-    await assertMigratedTestDatabase(url);
+    await assertMigrationsApplied(url);
   } catch (error) {
     throw withPlainStack(error);
   }
@@ -61,18 +64,32 @@ function migrateDeploy(url: string): void {
   }
 }
 
-/** Second line of defence: confirm the database just migrated really is a *_test database. */
-async function assertMigratedTestDatabase(url: string): Promise<void> {
+/**
+ * Second line of defence, after the URL checks in guard.ts: ask the server which database this
+ * connection really reached, before migrating it. Reads no table, so it works on a fresh database,
+ * where `_prisma_migrations` does not exist yet. A database that does not exist fails here too:
+ * create it first (the Docker and CI containers do, with POSTGRES_DB).
+ */
+async function assertConnectedToTestDatabase(url: string): Promise<void> {
   const prisma = createPrismaClient(url);
   try {
-    const [row] = await prisma.$queryRaw<{ db: string; migrations: bigint }[]>`
-      SELECT current_database() AS db,
-             (SELECT count(*) FROM "_prisma_migrations" WHERE finished_at IS NOT NULL) AS migrations`;
+    const [row] = await prisma.$queryRaw<{ db: string }[]>`SELECT current_database() AS db`;
     if (!row?.db.endsWith('_test')) {
       throw new Error(`[pg] Connected to "${row?.db ?? '?'}", which does not end in "_test".`);
     }
-    if (row.migrations === 0n) {
-      throw new Error(`[pg] No migrations were recorded in "${row.db}" after migrate deploy.`);
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+/** After migrate deploy: the database holds finished migrations. */
+async function assertMigrationsApplied(url: string): Promise<void> {
+  const prisma = createPrismaClient(url);
+  try {
+    const [row] = await prisma.$queryRaw<{ migrations: bigint }[]>`
+      SELECT count(*) AS migrations FROM "_prisma_migrations" WHERE finished_at IS NOT NULL`;
+    if (row === undefined || row.migrations === 0n) {
+      throw new Error('[pg] No migrations were recorded after migrate deploy.');
     }
   } finally {
     await prisma.$disconnect();

@@ -124,11 +124,12 @@ async function bounded<T>(promise: Promise<T>, what: string): Promise<T> {
 
 /** Runs `check` until it returns a value, failing after WAIT_BOUND_MS. */
 async function pollUntil<T>(what: string, check: () => Promise<T | undefined>): Promise<T> {
-  const deadline = Date.now() + WAIT_BOUND_MS;
+  // Not Date.now(): a test may have frozen Date to drive the app's clock.
+  const deadline = performance.now() + WAIT_BOUND_MS;
   for (;;) {
     const result = await check();
     if (result !== undefined) return result;
-    if (Date.now() >= deadline) {
+    if (performance.now() >= deadline) {
       throw new Error(`Timed out after ${String(WAIT_BOUND_MS)} ms waiting for ${what}`);
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
@@ -136,16 +137,48 @@ async function pollUntil<T>(what: string, check: () => Promise<T | undefined>): 
 }
 
 /**
- * The SQL of every backend of this database now waiting on a lock. The pg project runs its files
- * one at a time, so these all belong to the running test.
+ * The SQL of every client connection to this database now waiting on a lock. The pg project runs
+ * its files one at a time, so these all belong to the running test. Only client backends: an
+ * autovacuum worker is not part of the test, and can wait on a lock at any moment.
  */
 export async function lockWaiters(): Promise<string[]> {
   const rows = await testPrisma().$queryRaw<{ query: string }[]>`
     SELECT query FROM pg_stat_activity
     WHERE datname = current_database()
       AND pid <> pg_backend_pid()
+      AND backend_type = 'client backend'
       AND wait_event_type = 'Lock'`;
   return rows.map((row) => row.query);
+}
+
+/** Resolves with the SQL of a client seen waiting on a lock, once one matches `query`. */
+export function untilLockWaiter(query: RegExp): Promise<string> {
+  return pollUntil(`a request to wait on a lock matching ${String(query)}`, async () =>
+    (await lockWaiters()).find((waiter) => query.test(waiter)),
+  );
+}
+
+export interface HeldLock {
+  /** Commits the transaction holding the lock. */
+  release: () => Promise<void>;
+}
+
+/** Row-locks a screen from its own open transaction, as a competing writer would. */
+export async function holdScreenLock(screenId: string): Promise<HeldLock> {
+  const locked = deferred();
+  const released = deferred();
+  const holder = testPrisma().$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "Screen" WHERE "id" = ${screenId}::uuid FOR UPDATE`;
+    locked.resolve();
+    await released.promise;
+  });
+  await bounded(Promise.race([locked.promise, holder]), 'the screen lock');
+  return {
+    release: async () => {
+      released.resolve();
+      await holder;
+    },
+  };
 }
 
 /** Resolves once `parties` callers have arrived; fails after WAIT_BOUND_MS. */
