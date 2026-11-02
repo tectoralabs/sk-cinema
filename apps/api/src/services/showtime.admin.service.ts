@@ -22,6 +22,7 @@ import type { MemoryCache } from '../lib/cache.js';
 import { addDays, fromColomboDateTime, toColomboDate, toColomboTime } from '../lib/colomboTime.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { lockMovieAndScreens, type MovieAndScreenLocks } from '../lib/locks.js';
+import { formatForResponse } from '../lib/showtimeFormat.js';
 import {
   existingShowtimeWindow,
   findShowtimeConflicts,
@@ -132,9 +133,6 @@ export function showtimeBulkDeleteAlreadyDeletedMessage(count: number): string {
     : `${String(count)} of the selected showtimes are already deleted. Reload and try again.`;
 }
 
-/** `reason` logged when a stored format cannot be normalised (the value is never logged). */
-export const UNNORMALISABLE_FORMAT = 'unnormalisable_format';
-
 const MS_PER_MINUTE = 60_000;
 
 // ---------------------------------------------------------------------------
@@ -155,26 +153,6 @@ export const adminShowtimeSelect = {
 } as const satisfies Prisma.ShowtimeSelect;
 
 export type AdminShowtimeRow = Prisma.ShowtimeGetPayload<{ select: typeof adminShowtimeSelect }>;
-
-/**
- * A stored format for a response: normalised (trimmed, uppercased) or `null` when it cannot be
- * (e.g. a manually inserted "2D/3D"). A `null` logs one warning with only the showtime ID and
- * the reason, never the stored value.
- */
-export function formatForResponse(
-  showtimeId: string,
-  stored: string,
-  logger: Pick<Logger, 'warn'>,
-): string | null {
-  const format = normalizeShowtimeFormat(stored);
-  if (format === null) {
-    logger.warn(
-      { showtimeId, reason: UNNORMALISABLE_FORMAT },
-      'Stored showtime format could not be normalised; returning no format',
-    );
-  }
-  return format;
-}
 
 /**
  * A row (adminShowtimeSelect) as the admin response. `baseUrl` is the `bmsBaseUrl` setting,

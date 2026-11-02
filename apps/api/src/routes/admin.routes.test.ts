@@ -255,7 +255,7 @@ interface KnownGuard {
 const KNOWN_GUARDS: KnownGuard[] = [
   {
     // Only sets Cache-Control: no-store and calls next(); it never answers a request.
-    // Not exported from admin.routes.ts, so it is recognised by its (inferred) function name.
+    // Recognised by its (inferred) function name, from middleware/noStore.ts.
     name: 'noStore',
     path: ADMIN_API_PATH,
     matches: (handle) => typeof handle === 'function' && handle.name === 'noStore',

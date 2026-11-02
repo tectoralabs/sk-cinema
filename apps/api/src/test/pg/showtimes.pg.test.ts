@@ -15,6 +15,10 @@
  *      row as it was; a valid move commits with its UPDATE audit row;
  *   7. a bulk delete soft-deletes every row with one conditional updateMany and writes one
  *      DELETE audit row each, sharing a batchId.
+ * T13 public listing:
+ *   8. the relation filters return exactly the right rows, and a 00:30 Colombo show groups under
+ *      its Colombo date, whatever the database session's time zone;
+ *   9. hidden and deleted movies are a 404, an ENDED movie has no shows.
  */
 import {
   adminShowtimeListQuerySchema,
@@ -36,6 +40,7 @@ import {
   SHOWTIME_OVERLAP_MESSAGE,
   createShowtimeAdminService,
 } from '../../services/showtime.admin.service.js';
+import { createPublicShowtimeService } from '../../services/showtime.public.service.js';
 import { silentLogger } from '../helpers.js';
 import { describePg, disconnectTestPrisma, resetDatabase, testPrisma } from './db.js';
 
@@ -298,5 +303,106 @@ describePg('admin showtimes on real Postgres', () => {
       .catch((e: unknown) => e);
     expect(again).toMatchObject({ status: 409 });
     expect(await testPrisma().auditLog.count({ where: { action: 'DELETE' } })).toBe(3);
+  });
+});
+
+describePg('public showtimes on real Postgres', () => {
+  beforeEach(resetDatabase);
+  afterAll(disconnectTestPrisma);
+
+  const publicService = () =>
+    createPublicShowtimeService({
+      db: testPrisma(),
+      settings: createSettingsService({ db: testPrisma(), logger: silentLogger }),
+      cache: new MemoryCache(),
+      logger: silentLogger,
+      now: () => NOW,
+    });
+
+  const colombo = (date: string, time: string) => new Date(`${date}T${time}:00+05:30`);
+
+  it('the relation filters return the right rows; a 00:30 show groups under its Colombo date', async () => {
+    const prisma = testPrisma();
+    const { movie, screen } = await fixtures();
+    const other = await prisma.movie.create({
+      data: { slug: 'other', title: 'Other', durationMinutes: 90, status: 'NOW_SHOWING' },
+    });
+    const hidden = await prisma.screen.create({ data: { name: 'Hidden', isActive: false } });
+    const deleted = await prisma.screen.create({ data: { name: 'Deleted', deletedAt: NOW } });
+
+    const shows = { movieId: movie.id, screenId: screen.id };
+    const late = await prisma.showtime.create({
+      data: { ...shows, startsAt: new Date('2026-11-01T19:00:00.000Z'), format: '2d' },
+    });
+    const evening = await prisma.showtime.create({
+      data: { ...shows, startsAt: colombo('2026-11-02', '19:00') },
+    });
+    const lastDay = await prisma.showtime.create({
+      data: { ...shows, startsAt: colombo('2026-12-31', '23:59') },
+    });
+    await prisma.showtime.createMany({
+      data: [
+        { ...shows, startsAt: colombo('2026-11-01', '09:00') }, // past
+        { ...shows, startsAt: NOW }, // starting now
+        { ...shows, startsAt: colombo('2026-11-03', '19:00'), deletedAt: NOW },
+        { ...shows, startsAt: colombo('2027-01-01', '00:00') }, // beyond the 60 days
+        { ...shows, screenId: hidden.id, startsAt: colombo('2026-11-04', '19:00') },
+        { ...shows, screenId: deleted.id, startsAt: colombo('2026-11-05', '19:00') },
+        { ...shows, movieId: other.id, startsAt: colombo('2026-11-06', '19:00') },
+      ],
+    });
+
+    const service = publicService();
+
+    expect(await service.listDates(movie.id)).toEqual(['2026-11-02', '2026-12-31']);
+    expect(await service.listForDate(movie.id, '2026-11-01')).toEqual([]);
+    const items = await service.listForDate(movie.id, '2026-11-02');
+    expect(items.map((item) => item.id)).toEqual([late.id, evening.id]);
+    expect(items[0]).toEqual({
+      id: late.id,
+      startsAt: '2026-11-01T19:00:00.000Z',
+      time: '00:30',
+      format: '2D',
+      screen: { name: 'Screen 1' },
+      bookingUrl:
+        'https://lk.bookmyshow.com/buytickets/sk-cinema-matara/cinema-snlk-SKCM-MT/20261102',
+    });
+    expect((await service.listForDate(movie.id, '2026-12-31')).map((item) => item.id)).toEqual([
+      lastDay.id,
+    ]);
+  });
+
+  it('hidden and deleted movies are a 404; an ENDED movie has no shows', async () => {
+    const prisma = testPrisma();
+    const { movie, screen } = await fixtures();
+    await prisma.showtime.create({
+      data: { movieId: movie.id, screenId: screen.id, startsAt: colombo('2026-11-02', '19:00') },
+    });
+    const expectDates = async (expected: string[]) => {
+      expect(await publicService().listDates(movie.id)).toEqual(expected);
+    };
+    const expect404 = async () => {
+      await expect(publicService().listDates(movie.id)).rejects.toMatchObject({ status: 404 });
+    };
+
+    await expectDates(['2026-11-02']);
+
+    await prisma.movie.update({ where: { id: movie.id }, data: { isActive: false } });
+    await expect404();
+
+    await prisma.movie.update({
+      where: { id: movie.id },
+      data: { isActive: true, deletedAt: NOW },
+    });
+    await expect404();
+
+    await prisma.movie.update({
+      where: { id: movie.id },
+      data: { deletedAt: null, status: 'ENDED' },
+    });
+    await expectDates([]);
+
+    await prisma.movie.update({ where: { id: movie.id }, data: { status: 'UPCOMING' } });
+    await expectDates(['2026-11-02']);
   });
 });

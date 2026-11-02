@@ -43,8 +43,17 @@ const publicMovieSelect = {
 
 type PublicMovieRow = Pick<Movie, keyof typeof publicMovieSelect>;
 
-/** What the public may ever see: active and not soft-deleted. Applied to every query here. */
-const visible = { isActive: true, deletedAt: null } as const satisfies Prisma.MovieWhereInput;
+/**
+ * What the public may ever see: active and not soft-deleted. Applied to every public movie
+ * query, here and in showtime.public.service.ts.
+ */
+export const VISIBLE_MOVIE_WHERE = {
+  isActive: true,
+  deletedAt: null,
+} as const satisfies Prisma.MovieWhereInput;
+
+/** The 404 for an unknown, inactive or soft-deleted movie, on every public endpoint. */
+export const PUBLIC_MOVIE_NOT_FOUND_MESSAGE = 'Movie not found';
 
 /**
  * Per-status list order. NOW_SHOWING: newest release first. UPCOMING: soonest release first.
@@ -98,7 +107,7 @@ export interface PublicMovieServiceDeps {
 export function createPublicMovieService({ db, cache }: PublicMovieServiceDeps) {
   async function findByStatus(status: PublicMovieStatus): Promise<PublicMovie[]> {
     const rows = await db.movie.findMany({
-      where: { ...visible, status },
+      where: { ...VISIBLE_MOVIE_WHERE, status },
       orderBy: [...LIST_ORDER[status]],
       take: PUBLIC_MOVIE_LIST_LIMIT,
       select: publicMovieSelect,
@@ -131,10 +140,10 @@ export function createPublicMovieService({ db, cache }: PublicMovieServiceDeps) 
     getBySlug(slug: string): Promise<PublicMovie> {
       return cache.getOrSet(slugCacheKey(slug), PUBLIC_MOVIES_TTL_MS, async () => {
         const row = await db.movie.findUnique({
-          where: { slug, ...visible },
+          where: { slug, ...VISIBLE_MOVIE_WHERE },
           select: publicMovieSelect,
         });
-        if (!row) throw notFound('Movie not found');
+        if (!row) throw notFound(PUBLIC_MOVIE_NOT_FOUND_MESSAGE);
         return toPublicMovie(row);
       });
     },

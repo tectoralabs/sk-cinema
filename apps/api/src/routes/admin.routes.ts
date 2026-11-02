@@ -1,4 +1,4 @@
-import { Router, type RequestHandler } from 'express';
+import { Router } from 'express';
 import type { Config } from '../config/env.js';
 import type { AuthController } from '../controllers/auth.controller.js';
 import type { MovieAdminController } from '../controllers/movie.admin.controller.js';
@@ -7,6 +7,7 @@ import type { ShowtimeAdminController } from '../controllers/showtime.admin.cont
 import { ADMIN_AUTH_PREFIX } from '../lib/apiPaths.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { csrfProtection } from '../middleware/csrf.js';
+import { noStore } from '../middleware/noStore.js';
 import type { AuthDb } from '../services/auth.service.js';
 import { authRoutes } from './auth.routes.js';
 import { movieAdminRoutes } from './movie.admin.routes.js';
@@ -26,15 +27,10 @@ export interface AdminRoutesDeps {
   showtimeAdminController: ShowtimeAdminController;
 }
 
-/** Admin responses are per-user and may be sensitive: never cache them anywhere. */
-const noStore: RequestHandler = (_req, res, next) => {
-  res.set('Cache-Control', 'no-store');
-  next();
-};
-
 /**
  * Everything under /api/admin. Order matters:
- * 1. no-store first, so errors get it too;
+ * 1. no-store first, so errors get it too (admin responses are per-user and may be sensitive:
+ *    never cache them anywhere);
  * 2. CSRF for every unsafe method, including unknown routes;
  * 3. /auth/* (csrf, login, refresh, logout): the only routes that work without a session;
  * 4. `authenticated` for everything after it. Auth is the default, not opt-in: any route or

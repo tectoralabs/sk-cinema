@@ -24,6 +24,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Movie, Screen, Setting, Showtime } from '../generated/prisma/client.js';
 import { MemoryCache } from '../lib/cache.js';
 import { AppError } from '../lib/errors.js';
+import { UNNORMALISABLE_FORMAT } from '../lib/showtimeFormat.js';
 import {
   foreignKeyError,
   inMemoryAuthDb,
@@ -69,7 +70,6 @@ import {
   SHOWTIME_STARTED_MESSAGE,
   SHOWTIME_TARGET_CHANGED_MESSAGE,
   toAdminShowtime,
-  UNNORMALISABLE_FORMAT,
 } from './showtime.admin.service.js';
 
 /** The injected clock: 2026-11-01 15:30 in Colombo. */
