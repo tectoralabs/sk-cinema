@@ -5,6 +5,7 @@ import { createHealthController } from '../controllers/health.controller.js';
 import { createMovieAdminController } from '../controllers/movie.admin.controller.js';
 import { createPublicMovieController } from '../controllers/movie.public.controller.js';
 import { createScreenAdminController } from '../controllers/screen.admin.controller.js';
+import { createSettingsAdminController } from '../controllers/settings.admin.controller.js';
 import { createShowtimeAdminController } from '../controllers/showtime.admin.controller.js';
 import { createPublicShowtimeController } from '../controllers/showtime.public.controller.js';
 import { ADMIN_PREFIX, PUBLIC_MOVIES_PREFIX } from '../lib/apiPaths.js';
@@ -13,6 +14,7 @@ import { createHealthService } from '../services/health.service.js';
 import { createMovieAdminService } from '../services/movie.admin.service.js';
 import { createPublicMovieService } from '../services/movie.public.service.js';
 import { createScreenAdminService } from '../services/screen.admin.service.js';
+import { createSettingsAdminService } from '../services/settings.admin.service.js';
 import { createSettingsService } from '../services/settings.service.js';
 import { createShowtimeAdminService } from '../services/showtime.admin.service.js';
 import { createPublicShowtimeService } from '../services/showtime.public.service.js';
@@ -66,6 +68,9 @@ export function apiRouter({ config, prisma, cache, logger }: AppDeps): Router {
       ),
       showtimeAdminController: createShowtimeAdminController(
         createShowtimeAdminService({ db: prisma, settings: settingsService, cache, logger }),
+      ),
+      settingsAdminController: createSettingsAdminController(
+        createSettingsAdminService({ db: prisma, cache, logger }),
       ),
     }),
   );

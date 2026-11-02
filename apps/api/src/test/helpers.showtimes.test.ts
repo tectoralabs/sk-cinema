@@ -981,6 +981,29 @@ describe('inMemoryAuthDb: settings', () => {
     ).rejects.toMatchObject({ code: 'P2025' });
   });
 
+  it('select follows updatedBy (nested select), null when no admin saved the row', async () => {
+    const editor = testAdmin({ name: 'Owner' });
+    const db = inMemoryAuthDb({
+      admins: [editor],
+      settings: [
+        testSetting('bmsBaseUrl', BASE),
+        testSetting('showGapMinutes', '15', { updatedById: editor.id }),
+      ],
+    });
+    await expect(
+      db.spies.setting.findMany({
+        orderBy: { key: 'asc' },
+        select: { key: true, updatedBy: { select: { id: true, name: true } } },
+      }),
+    ).resolves.toEqual([
+      { key: 'bmsBaseUrl', updatedBy: null },
+      { key: 'showGapMinutes', updatedBy: { id: editor.id, name: 'Owner' } },
+    ]);
+    await expect(
+      db.spies.setting.findMany({ where: { updatedBy: { name: 'Owner' } } }),
+    ).rejects.toThrow(/no relation filters/);
+  });
+
   it('accepts only key as a unique where, and upsert validates create like create', async () => {
     const db = inMemoryAuthDb({ settings: [testSetting('showGapMinutes', '15')] });
     await expect(db.spies.setting.findUnique({ where: { value: '15' } })).rejects.toThrow(

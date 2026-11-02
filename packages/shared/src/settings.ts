@@ -46,8 +46,9 @@ export type SettingsUpdateBodyInput = z.input<typeof settingsUpdateBodySchema>;
 
 /**
  * Settings as returned by GET/PATCH /api/admin/settings. No secrets live in Settings.
- * `updatedAt` / `updatedBy` describe the most recent change to any setting, or are `null`
- * while every setting still has its default.
+ * `updatedAt` / `updatedBy` come from the most recently updated setting row. Both are `null`
+ * while no row exists (every setting has its default); `updatedBy` alone is `null` for a row
+ * no admin has saved (a seeded one) or whose admin was deleted.
  */
 export const adminSettingsSchema = z.strictObject({
   bmsBaseUrl: z.string().refine(isBmsBookingUrl, { message: 'Must be a BookMyShow booking link' }),
@@ -66,6 +67,13 @@ export type AdminSettings = z.infer<typeof adminSettingsSchema>;
 /** Response of GET and PATCH /api/admin/settings. */
 export const adminSettingsResponseSchema = z.strictObject({
   settings: adminSettingsSchema,
+  /**
+   * How many future showtimes start too soon after an earlier show on their screen under the
+   * current `showGapMinutes`: the later show of each clashing pair, counted once, which is what
+   * an admin would need to move. A gap change only applies to shows created or moved after it,
+   * so this is information for the admin, never a reason a save is refused.
+   */
+  futureShowtimesBelowGap: z.number().int().min(0),
 });
 
 export type AdminSettingsResponse = z.infer<typeof adminSettingsResponseSchema>;

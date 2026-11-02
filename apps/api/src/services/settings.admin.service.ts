@@ -1,0 +1,208 @@
+import type { AdminSettings, AdminSettingsResponse, SettingsUpdateBody } from '@sk-cinema/shared';
+import type { Logger } from 'pino';
+import type { Prisma, PrismaClient } from '../generated/prisma/client.js';
+import type { MemoryCache } from '../lib/cache.js';
+import type { SettingKey } from '../lib/settings.js';
+import {
+  existingShowtimeWindow,
+  findShowtimeConflicts,
+  type ShowtimeSlot,
+} from '../lib/showtimeOverlap.js';
+import { writeAuditMany, type AuditActor } from './audit.service.js';
+import { invalidatePublicMovies } from './movie.public.service.js';
+import {
+  BOOKING_SETTING_KEYS,
+  createSettingsService,
+  type BookingSettings,
+} from './settings.service.js';
+
+/*
+ * Admin read and update of the site settings (SUPER_ADMIN only, see routes/admin.routes.ts).
+ *
+ * A show gap change applies ONLY to showtimes created or moved afterwards. Saving a larger gap
+ * is never refused because saved shows are closer than it, and changes or deletes no showtime;
+ * futureShowtimesBelowGap only tells the admin how many shows are now too close.
+ *
+ * No lock against showtime writers: a create or move running at the same moment reads the gap
+ * in its own transaction and uses the old or the new one, whichever committed first.
+ */
+
+const AUDIT_ENTITY = 'Setting';
+
+const gapSlotSelect = {
+  id: true,
+  screenId: true,
+  startsAt: true,
+  movie: { select: { title: true, durationMinutes: true } },
+} as const satisfies Prisma.ShowtimeSelect;
+
+type GapSlotRow = Prisma.ShowtimeGetPayload<{ select: typeof gapSlotSelect }>;
+
+const toSlot = (row: GapSlotRow): ShowtimeSlot => ({
+  showtimeId: row.id,
+  screenId: row.screenId,
+  movieTitle: row.movie.title,
+  startsAt: row.startsAt,
+  durationMinutes: row.movie.durationMinutes,
+});
+
+/**
+ * How many distinct future non-deleted showtimes start too soon after an earlier non-deleted
+ * show on the same screen under `gapMinutes` (see lib/showtimeOverlap.ts): the later show of
+ * each clashing pair, the shows an admin would need to move. Three shows in a row, all too
+ * close, count 2. A show running at `now` counts as an earlier neighbour. Every non-deleted
+ * showtime occupies its screen, whatever its movie's or screen's state.
+ *
+ * Cost: one query for the future shows and, only when there are any, one for the shows started
+ * within the longest possible run plus the gap before the earliest of them (both can use the
+ * Showtime `startsAt` index), then a sort-and-sweep per screen. Admin-only and read-only.
+ */
+export async function countFutureShowtimesBelowGap(
+  db: Pick<Prisma.TransactionClient, 'showtime'>,
+  gapMinutes: number,
+  now: Date,
+): Promise<number> {
+  const future = await db.showtime.findMany({
+    where: { deletedAt: null, startsAt: { gt: now } },
+    select: gapSlotSelect,
+  });
+  const candidates = future.map(toSlot);
+
+  const window = existingShowtimeWindow({ candidates, gapMinutes });
+  if (window === null) return 0;
+
+  // Up to `now` only: everything after it is already a candidate.
+  const started = await db.showtime.findMany({
+    where: { deletedAt: null, startsAt: { gte: window.from, lte: now } },
+    select: gapSlotSelect,
+  });
+
+  const overlaps = findShowtimeConflicts({
+    candidates,
+    existing: started.map(toSlot),
+    gapMinutes,
+  });
+  return new Set(overlaps.map((overlap) => overlap.candidateIndex)).size;
+}
+
+/** A setting whose effective value would change. */
+interface SettingChange {
+  key: SettingKey;
+  from: BookingSettings[SettingKey];
+  to: BookingSettings[SettingKey];
+}
+
+/**
+ * Compares a validated body with the effective values (a missing or invalid row reads as its
+ * default), so `from` is always a valid typed value, never a stored raw one. Empty: a no-op.
+ */
+export function settingChanges(
+  current: BookingSettings,
+  body: SettingsUpdateBody,
+): SettingChange[] {
+  const changes: SettingChange[] = [];
+  for (const key of BOOKING_SETTING_KEYS) {
+    const to = body[key];
+    if (to !== undefined && to !== current[key]) changes.push({ key, from: current[key], to });
+  }
+  return changes;
+}
+
+export type SettingsAdminDb = Pick<
+  PrismaClient,
+  'setting' | 'showtime' | 'auditLog' | '$transaction'
+>;
+
+export interface SettingsAdminServiceDeps {
+  db: SettingsAdminDb;
+  /**
+   * The app's one cache. Public showtime responses hold booking links built from the base URL
+   * and are cached under the public movies prefix, so a committed change drops them.
+   */
+  cache: Pick<MemoryCache, 'invalidatePrefix'>;
+  /** Warnings only: a setting key and a reason, never a stored value (see settings.service). */
+  logger: Pick<Logger, 'warn'>;
+  /** Injectable clock for tests (the "future" boundary). Defaults to the current time. */
+  now?: () => Date;
+}
+
+export function createSettingsAdminService({
+  db,
+  cache,
+  logger,
+  now = () => new Date(),
+}: SettingsAdminServiceDeps) {
+  return {
+    /** The settings and the count under the stored gap. Three queries at most, never cached. */
+    async get(): Promise<AdminSettingsResponse> {
+      const settings = await createSettingsService({ db, logger }).getAdminSettings();
+      const futureShowtimesBelowGap = await countFutureShowtimesBelowGap(
+        db,
+        settings.showGapMinutes,
+        now(),
+      );
+      return { settings, futureShowtimesBelowGap };
+    },
+
+    /**
+     * In one transaction: read the effective values and compare; upsert only the changed keys
+     * and write one UPDATE audit row per key (`{ from, to }`, effective typed values); count
+     * under the gap now in force. Then, only after the commit and only if something changed,
+     * the public cache is dropped. A no-op writes, audits and invalidates nothing and answers
+     * the same shape. Base URL changes leave showtime overrides alone.
+     */
+    async update(body: SettingsUpdateBody, actor: AuditActor): Promise<AdminSettingsResponse> {
+      const outcome = await db.$transaction(async (tx) => {
+        const reader = createSettingsService({ db: tx, logger });
+        const current = await reader.getAdminSettings();
+        const changes = settingChanges(current, body);
+
+        let settings: AdminSettings = current;
+        if (changes.length > 0) {
+          for (const { key, to } of changes) {
+            const value = String(to);
+            const written = { value, updatedById: actor.adminId };
+            await tx.setting.upsert({
+              where: { key },
+              create: { key, ...written },
+              update: written,
+              // No nested read: with one Prisma sends two statements instead of its atomic
+              // ON CONFLICT upsert, and two concurrent first saves would hit P2002.
+              select: { key: true },
+            });
+          }
+          await writeAuditMany(
+            tx,
+            changes.map(({ key, from, to }) => ({
+              action: 'UPDATE' as const,
+              adminId: actor.adminId,
+              entity: AUDIT_ENTITY,
+              entityId: key,
+              details: { from, to },
+              ipAddress: actor.ipAddress,
+              userAgent: actor.userAgent,
+            })),
+          );
+          settings = {
+            bmsBaseUrl: body.bmsBaseUrl ?? current.bmsBaseUrl,
+            showGapMinutes: body.showGapMinutes ?? current.showGapMinutes,
+            ...(await reader.getLastChange()),
+          };
+        }
+
+        const futureShowtimesBelowGap = await countFutureShowtimesBelowGap(
+          tx,
+          settings.showGapMinutes,
+          now(),
+        );
+        return { response: { settings, futureShowtimesBelowGap }, changed: changes.length > 0 };
+      });
+
+      // Only after the commit, so no request can re-cache links built from the old base URL.
+      if (outcome.changed) invalidatePublicMovies(cache);
+      return outcome.response;
+    },
+  };
+}
+
+export type SettingsAdminService = ReturnType<typeof createSettingsAdminService>;

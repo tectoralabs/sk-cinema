@@ -3,6 +3,7 @@ import type { Config } from '../config/env.js';
 import type { AuthController } from '../controllers/auth.controller.js';
 import type { MovieAdminController } from '../controllers/movie.admin.controller.js';
 import type { ScreenAdminController } from '../controllers/screen.admin.controller.js';
+import type { SettingsAdminController } from '../controllers/settings.admin.controller.js';
 import type { ShowtimeAdminController } from '../controllers/showtime.admin.controller.js';
 import { ADMIN_AUTH_PREFIX } from '../lib/apiPaths.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
@@ -12,6 +13,7 @@ import type { AuthDb } from '../services/auth.service.js';
 import { authRoutes } from './auth.routes.js';
 import { movieAdminRoutes } from './movie.admin.routes.js';
 import { screenAdminRoutes } from './screen.admin.routes.js';
+import { settingsAdminRoutes } from './settings.admin.routes.js';
 import { showtimeAdminRoutes } from './showtime.admin.routes.js';
 
 export interface AdminRoutesDeps {
@@ -25,6 +27,8 @@ export interface AdminRoutesDeps {
   screenAdminController: ScreenAdminController;
   /** Built in routes/index.ts with the same shared cache and the settings service. */
   showtimeAdminController: ShowtimeAdminController;
+  /** Built in routes/index.ts with the same shared cache. */
+  settingsAdminController: SettingsAdminController;
 }
 
 /**
@@ -50,6 +54,7 @@ export function adminRoutes({
   movieAdminController,
   screenAdminController,
   showtimeAdminController,
+  settingsAdminController,
 }: AdminRoutesDeps): Router {
   const router = Router();
   const authenticated = requireAuth({ db, config });
@@ -80,6 +85,7 @@ export function adminRoutes({
     requireRole('SUPER_ADMIN', 'EDITOR'),
     showtimeAdminRoutes(showtimeAdminController),
   );
+  router.use('/settings', requireRole('SUPER_ADMIN'), settingsAdminRoutes(settingsAdminController));
 
   return router;
 }

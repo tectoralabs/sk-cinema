@@ -111,11 +111,13 @@ describe('settingsUpdateBodySchema', () => {
 
 describe('adminSettingsSchema', () => {
   it('accepts settings, and null audit fields while every value is the default', () => {
-    expect(adminSettingsResponseSchema.parse({ settings: validSettings })).toEqual({
-      settings: validSettings,
-    });
     const defaults = { ...validSettings, updatedAt: null, updatedBy: null };
     expect(adminSettingsSchema.safeParse(defaults).success).toBe(true);
+  });
+
+  it('accepts a row no admin has saved: updatedAt without updatedBy', () => {
+    const seeded = { ...validSettings, updatedBy: null };
+    expect(adminSettingsSchema.safeParse(seeded).success).toBe(true);
   });
 
   it('rejects a non-BMS base URL and an out-of-range gap', () => {
@@ -132,6 +134,33 @@ describe('adminSettingsSchema', () => {
     expect(adminSettingsSchema.safeParse({ ...validSettings, secret: 'x' }).success).toBe(false);
     const updatedBy = { ...validSettings.updatedBy, email: 'owner@example.com' };
     expect(adminSettingsSchema.safeParse({ ...validSettings, updatedBy }).success).toBe(false);
+  });
+});
+
+describe('adminSettingsResponseSchema', () => {
+  it.each([0, 1, 250])('accepts futureShowtimesBelowGap %d beside settings', (count) => {
+    const body = { settings: validSettings, futureShowtimesBelowGap: count };
+    expect(adminSettingsResponseSchema.parse(body)).toEqual(body);
+  });
+
+  it('requires futureShowtimesBelowGap', () => {
+    expect(adminSettingsResponseSchema.safeParse({ settings: validSettings }).success).toBe(false);
+  });
+
+  it.each([-1, 1.5, '1', null, Number.NaN])('rejects futureShowtimesBelowGap %j', (count) => {
+    const body = { settings: validSettings, futureShowtimesBelowGap: count };
+    expect(adminSettingsResponseSchema.safeParse(body).success).toBe(false);
+  });
+
+  it('rejects unknown keys, and the count nested inside settings', () => {
+    const base = { settings: validSettings, futureShowtimesBelowGap: 0 };
+    expect(adminSettingsResponseSchema.safeParse({ ...base, extra: 1 }).success).toBe(false);
+    expect(
+      adminSettingsResponseSchema.safeParse({
+        settings: { ...validSettings, futureShowtimesBelowGap: 0 },
+        futureShowtimesBelowGap: 0,
+      }).success,
+    ).toBe(false);
   });
 });
 

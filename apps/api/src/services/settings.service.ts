@@ -3,9 +3,10 @@ import {
   DEFAULT_BMS_BASE_URL,
   DEFAULT_SHOW_GAP_MINUTES,
   storedShowGapMinutesSchema,
+  type AdminSettings,
 } from '@sk-cinema/shared';
 import type { Logger } from 'pino';
-import type { PrismaClient } from '../generated/prisma/client.js';
+import type { Prisma, PrismaClient } from '../generated/prisma/client.js';
 import { SETTING_KEYS, type SettingKey } from '../lib/settings.js';
 
 /*
@@ -62,10 +63,37 @@ const STORED_SETTINGS: { [K in SettingKey]: StoredSetting<BookingSettings[K]> } 
   },
 };
 
-const BOOKING_SETTING_KEYS = [
+/** In a fixed order, so concurrent writers of several settings take the row locks alike. */
+export const BOOKING_SETTING_KEYS = [
   SETTING_KEYS.bmsBaseUrl,
   SETTING_KEYS.showGapMinutes,
 ] as const satisfies readonly SettingKey[];
+
+/** When a setting row was last written and by whom (null: seeded, or the admin was deleted). */
+const lastChangeSelect = {
+  updatedAt: true,
+  updatedBy: { select: { id: true, name: true } },
+} as const satisfies Prisma.SettingSelect;
+
+type LastChangeRow = Prisma.SettingGetPayload<{ select: typeof lastChangeSelect }>;
+
+/** `updatedAt` / `updatedBy` of the settings response. */
+export type SettingsLastChange = Pick<AdminSettings, 'updatedAt' | 'updatedBy'>;
+
+/**
+ * From the most recently updated row; on a tie the first one given wins, so callers read the
+ * rows in a fixed order. Null while no row exists; a row no admin saved has `updatedBy` null.
+ */
+function lastChangeOf(rows: readonly LastChangeRow[]): SettingsLastChange {
+  let latest: LastChangeRow | undefined;
+  for (const row of rows) {
+    if (!latest || row.updatedAt.getTime() > latest.updatedAt.getTime()) latest = row;
+  }
+  return {
+    updatedAt: latest?.updatedAt.toISOString() ?? null,
+    updatedBy: latest?.updatedBy ?? null,
+  };
+}
 
 export function createSettingsService({ db, logger }: SettingsServiceDeps) {
   function readValue<K extends SettingKey>(key: K, stored: string | undefined): BookingSettings[K] {
@@ -82,12 +110,8 @@ export function createSettingsService({ db, logger }: SettingsServiceDeps) {
     return setting.defaultValue;
   }
 
-  /** One query for every booking setting; each falls back to its default on its own. */
-  async function getBookingSettings(): Promise<BookingSettings> {
-    const rows = await db.setting.findMany({
-      where: { key: { in: [...BOOKING_SETTING_KEYS] } },
-      select: { key: true, value: true },
-    });
+  /** Every booking setting from its row; each falls back to its default on its own. */
+  function readValues(rows: readonly { key: string; value: string }[]): BookingSettings {
     const stored = new Map(rows.map((row) => [row.key, row.value]));
     return {
       bmsBaseUrl: readValue(SETTING_KEYS.bmsBaseUrl, stored.get(SETTING_KEYS.bmsBaseUrl)),
@@ -96,6 +120,35 @@ export function createSettingsService({ db, logger }: SettingsServiceDeps) {
         stored.get(SETTING_KEYS.showGapMinutes),
       ),
     };
+  }
+
+  /** One query for every booking setting. */
+  async function getBookingSettings(): Promise<BookingSettings> {
+    const rows = await db.setting.findMany({
+      where: { key: { in: [...BOOKING_SETTING_KEYS] } },
+      select: { key: true, value: true },
+    });
+    return readValues(rows);
+  }
+
+  /** The booking settings plus who last changed them. One query. */
+  async function getAdminSettings(): Promise<AdminSettings> {
+    const rows = await db.setting.findMany({
+      where: { key: { in: [...BOOKING_SETTING_KEYS] } },
+      orderBy: { key: 'asc' },
+      select: { key: true, value: true, ...lastChangeSelect },
+    });
+    return { ...readValues(rows), ...lastChangeOf(rows) };
+  }
+
+  /** Only who last changed the settings: reads no value, so it cannot warn. One query. */
+  async function getLastChange(): Promise<SettingsLastChange> {
+    const rows = await db.setting.findMany({
+      where: { key: { in: [...BOOKING_SETTING_KEYS] } },
+      orderBy: { key: 'asc' },
+      select: lastChangeSelect,
+    });
+    return lastChangeOf(rows);
   }
 
   async function readOne<K extends SettingKey>(key: K): Promise<BookingSettings[K]> {
@@ -109,7 +162,8 @@ export function createSettingsService({ db, logger }: SettingsServiceDeps) {
     getBmsBaseUrl: (): Promise<string> => readOne(SETTING_KEYS.bmsBaseUrl),
     /** The `showGapMinutes` setting, or the default if missing or invalid. One query. */
     getShowGapMinutes: (): Promise<number> => readOne(SETTING_KEYS.showGapMinutes),
-    // T14 adds the admin read (with updatedAt / updatedBy) and updateSettings here.
+    getAdminSettings,
+    getLastChange,
   };
 }
 

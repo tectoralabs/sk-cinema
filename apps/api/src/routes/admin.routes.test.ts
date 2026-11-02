@@ -431,6 +431,16 @@ describe('admin router: authentication by default', () => {
     );
   });
 
+  it('sees every /settings route (Phase 5 T14), so the 401 walk below probes each one', () => {
+    const { app, mounts } = setup();
+    const settings = `${ADMIN_API_PATH}/settings`;
+    const settingsEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
+      isUnder(e.split(' ')[1] ?? '', settings),
+    );
+
+    expect(settingsEndpoints.sort()).toEqual([`GET ${settings}`, `PATCH ${settings}`].sort());
+  });
+
   it('exposes only csrf, login, refresh and logout under /auth', () => {
     const { app, mounts } = setup();
     const authEndpoints = walkApp(app, mounts).endpoints.filter((e) =>

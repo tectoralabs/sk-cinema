@@ -11,6 +11,7 @@
  * (showtime.findMany would not do: admin writes use it too, and an ENDED movie skips it.)
  */
 import {
+  DEFAULT_BMS_BASE_URL,
   publicShowtimeDatesResponseSchema,
   publicShowtimeListResponseSchema,
   type PublicShowtime,
@@ -46,6 +47,7 @@ import {
 const EMAIL = 'admin@skcinema.lk';
 const PASSWORD = 'correct horse battery staple';
 const OVERRIDE = 'https://lk.bookmyshow.com/buytickets/sk-cinema-matara/special-premiere/20261102';
+const NEW_BMS_BASE = 'https://lk.bookmyshow.com/buytickets/sk-cinema-matara/cinema-snlk-SKCM-NEW';
 
 /** The app's clock (only Date is faked): 2026-11-01 15:30 in Colombo. */
 const NOW = new Date('2026-11-01T10:00:00.000Z');
@@ -511,9 +513,47 @@ describe('movie writes change the cached public list', () => {
 // ---------------------------------------------------------------------------
 
 describe('settings writes change the cached public list', () => {
-  // T14: add `afterWrite` tests here when the settings endpoint exists: a bmsBaseUrl change must
-  // change every generated bookingUrl in a cached list (and leave overrides alone).
-  it.todo('T14 settings bmsBaseUrl change: every generated booking link changes');
+  it('T14 settings bmsBaseUrl change: every generated booking link changes', async () => {
+    const s = await setup();
+    const withOverride = s.db.addShowtime({
+      movieId: s.movie.id,
+      screenId: s.screen.id,
+      startsAt: colombo(DAY_3, '19:00'),
+      bookingUrlOverride: OVERRIDE,
+    });
+
+    const { before, after } = await afterWrite(s, () =>
+      admin(s, 'patch', '/settings', { bmsBaseUrl: NEW_BMS_BASE }),
+    );
+
+    expect(visible(before).days[DAY_1]?.[0]?.bookingUrl).toBe(`${DEFAULT_BMS_BASE_URL}/20261102`);
+    expect(visible(before).days[DAY_2]?.[0]?.bookingUrl).toBe(`${DEFAULT_BMS_BASE_URL}/20261103`);
+    expect(visible(after).days[DAY_1]?.[0]?.bookingUrl).toBe(`${NEW_BMS_BASE}/20261102`);
+    expect(visible(after).days[DAY_2]?.[0]?.bookingUrl).toBe(`${NEW_BMS_BASE}/20261103`);
+
+    // The override is the show's own link: untouched, in the response and in the row.
+    expect(visible(before).days[DAY_3]?.[0]).toMatchObject({
+      id: withOverride.id,
+      bookingUrl: OVERRIDE,
+    });
+    expect(visible(after).days[DAY_3]?.[0]).toMatchObject({
+      id: withOverride.id,
+      bookingUrl: OVERRIDE,
+    });
+    expect(s.db.showtimes.find((row) => row.id === withOverride.id)?.bookingUrlOverride).toBe(
+      OVERRIDE,
+    );
+  });
+
+  it('T14 settings showGapMinutes change: the entry is dropped, the list is the same', async () => {
+    const s = await setup();
+
+    const { before, after } = await afterWrite(s, () =>
+      admin(s, 'patch', '/settings', { showGapMinutes: 30 }),
+    );
+
+    expect(after).toEqual(before);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -652,6 +692,48 @@ describe('a failed write leaves the cached entry in place', () => {
         return admin(s, 'patch', `/movies/${s.movie.id}/status`, { status: 'ENDED' });
       },
       500,
+    );
+  });
+
+  it('400 for a settings base URL that is not a BookMyShow link', async () => {
+    const s = await setup();
+    await afterFailedWrite(
+      s,
+      () => admin(s, 'patch', '/settings', { bmsBaseUrl: 'https://evil.example/buytickets/x' }),
+      400,
+    );
+  });
+
+  it('a fault in a settings upsert rolls back', async () => {
+    const s = await setup();
+    await afterFailedWrite(
+      s,
+      () => {
+        s.db.injectFault('setting', 'upsert', { error: new Error('settings table unavailable') });
+        return admin(s, 'patch', '/settings', { bmsBaseUrl: NEW_BMS_BASE });
+      },
+      500,
+    );
+  });
+
+  it('a fault in a settings audit row rolls back', async () => {
+    const s = await setup();
+    await afterFailedWrite(
+      s,
+      () => {
+        s.db.injectFault('auditLog', 'createMany', { error: AUDIT_DOWN() });
+        return admin(s, 'patch', '/settings', { bmsBaseUrl: NEW_BMS_BASE });
+      },
+      500,
+    );
+  });
+
+  it('a no-op settings PATCH changes nothing and keeps the entry', async () => {
+    const s = await setup();
+    await afterFailedWrite(
+      s,
+      () => admin(s, 'patch', '/settings', { bmsBaseUrl: DEFAULT_BMS_BASE_URL }),
+      200,
     );
   });
 

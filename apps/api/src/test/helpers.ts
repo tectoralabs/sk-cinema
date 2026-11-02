@@ -445,7 +445,7 @@ const MODELS: Record<ModelName, ModelSpec> = {
     json: new Set(),
     lists: new Set(),
     enums: {},
-    relations: {},
+    relations: { updatedBy: { model: 'admin', column: 'updatedById' } },
     relationFilters: false,
     foreignKeys: [{ model: 'admin', column: 'updatedById' }],
     operators: { '*': new Set(['in']) },
@@ -1427,7 +1427,8 @@ const includeOption = (model: ModelName): string[] =>
  * - showtime: findUnique, findFirst, findMany, count, create, createMany, update, updateMany,
  *   deleteMany; `select` / `include` of `movie` and `screen` (nested select too); where with
  *   AND / OR / NOT and `movie` / `screen` relation filters.
- * - setting: findUnique, findMany, upsert, update (updatedAt bumps on every write).
+ * - setting: findUnique, findMany, upsert, update (updatedAt bumps on every write); `select` of
+ *   `updatedBy` (nested select too), null when the column is.
  * - auditLog: create, createMany. admin / refreshToken: what the auth services use.
  * Text ordering is the "C" collation's (see compareValues); ties keep insertion order, which
  * Postgres does not promise, so services must add a unique tie-breaker (e.g. id) for stable

@@ -1,7 +1,7 @@
 import { DEFAULT_BMS_BASE_URL } from '@sk-cinema/shared';
 import { describe, expect, it, vi } from 'vitest';
 import type { Setting } from '../generated/prisma/client.js';
-import { inMemoryAuthDb, testSetting } from '../test/helpers.js';
+import { inMemoryAuthDb, testAdmin, testSetting } from '../test/helpers.js';
 import { INVALID_STORED_SETTING, createSettingsService } from './settings.service.js';
 
 const CUSTOM_BASE = 'https://lk.bookmyshow.com/buytickets/sk-cinema-matara/cinema-snlk-SKCM-MT2';
@@ -160,6 +160,110 @@ describe('settings service: getBookingSettings', () => {
     db.spies.setting.findMany.mockRejectedValueOnce(failure);
     await expect(service.getBookingSettings()).rejects.toBe(failure);
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('settings service: getAdminSettings and getLastChange', () => {
+  const OLDER = new Date('2026-10-01T00:00:00.000Z');
+  const NEWER = new Date('2026-10-02T00:00:00.000Z');
+  const owner = testAdmin({ name: 'Owner' });
+  const editor = testAdmin({ email: 'editor@skcinema.lk', name: 'Editor' });
+
+  const setupRows = (settings: Setting[]) => {
+    const db = inMemoryAuthDb({ admins: [owner, editor], settings });
+    const logger = { warn: vi.fn() };
+    return { db, logger, service: createSettingsService({ db: db.prisma, logger }) };
+  };
+
+  it('reports defaults and nulls when no rows exist', async () => {
+    const { service, logger } = setupRows([]);
+    await expect(service.getAdminSettings()).resolves.toEqual({
+      bmsBaseUrl: DEFAULT_BMS_BASE_URL,
+      showGapMinutes: 15,
+      updatedAt: null,
+      updatedBy: null,
+    });
+    await expect(service.getLastChange()).resolves.toEqual({ updatedAt: null, updatedBy: null });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('reports a seeded row with updatedAt but updatedBy null', async () => {
+    const { service } = setupRows([testSetting('bmsBaseUrl', CUSTOM_BASE, { updatedAt: OLDER })]);
+    await expect(service.getAdminSettings()).resolves.toEqual({
+      bmsBaseUrl: CUSTOM_BASE,
+      showGapMinutes: 15,
+      updatedAt: OLDER.toISOString(),
+      updatedBy: null,
+    });
+  });
+
+  it.each([
+    ['bmsBaseUrl is newer', NEWER, OLDER, 'Owner'],
+    ['showGapMinutes is newer', OLDER, NEWER, 'Editor'],
+  ])('takes both fields from the newer row when %s', async (_c, baseAt, gapAt, name) => {
+    const { service } = setupRows([
+      testSetting('bmsBaseUrl', CUSTOM_BASE, { updatedAt: baseAt, updatedById: owner.id }),
+      testSetting('showGapMinutes', '30', { updatedAt: gapAt, updatedById: editor.id }),
+    ]);
+    const lastChange = await service.getLastChange();
+    expect(lastChange.updatedAt).toBe(NEWER.toISOString());
+    expect(lastChange.updatedBy?.name).toBe(name);
+    await expect(service.getAdminSettings()).resolves.toEqual({
+      bmsBaseUrl: CUSTOM_BASE,
+      showGapMinutes: 30,
+      ...lastChange,
+    });
+  });
+
+  it('a newer seeded row beats an older saved one: updatedBy is null, not the older admin', async () => {
+    const { service } = setupRows([
+      testSetting('bmsBaseUrl', CUSTOM_BASE, { updatedAt: OLDER, updatedById: owner.id }),
+      testSetting('showGapMinutes', '30', { updatedAt: NEWER }),
+    ]);
+    await expect(service.getLastChange()).resolves.toEqual({
+      updatedAt: NEWER.toISOString(),
+      updatedBy: null,
+    });
+  });
+
+  it('a tie goes to the first key, whatever order the rows were inserted in', async () => {
+    const { service } = setupRows([
+      testSetting('showGapMinutes', '30', { updatedAt: OLDER, updatedById: editor.id }),
+      testSetting('bmsBaseUrl', CUSTOM_BASE, { updatedAt: OLDER, updatedById: owner.id }),
+    ]);
+    await expect(service.getLastChange()).resolves.toMatchObject({
+      updatedBy: { id: owner.id, name: 'Owner' },
+    });
+  });
+
+  it('exposes only the admin id and name, with exactly one query each', async () => {
+    const { db, service } = setupRows([
+      testSetting('showGapMinutes', '30', { updatedAt: OLDER, updatedById: owner.id }),
+    ]);
+    const settings = await service.getAdminSettings();
+    expect(settings.updatedBy).toEqual({ id: owner.id, name: 'Owner' });
+    expect(db.spies.setting.findMany).toHaveBeenCalledTimes(1);
+
+    await service.getLastChange();
+    expect(db.spies.setting.findMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('an invalid stored value reads as the default with one warning; getLastChange never warns', async () => {
+    const { service, logger } = setupRows([
+      testSetting('showGapMinutes', 'abc', { updatedAt: OLDER, updatedById: owner.id }),
+    ]);
+    await expect(service.getLastChange()).resolves.toMatchObject({
+      updatedAt: OLDER.toISOString(),
+    });
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    await expect(service.getAdminSettings()).resolves.toMatchObject({
+      showGapMinutes: 15,
+      updatedAt: OLDER.toISOString(),
+      updatedBy: { id: owner.id, name: 'Owner' },
+    });
+    expectOneWarning(logger, 'showGapMinutes');
+    expect(loggedText(logger)).not.toContain('abc');
   });
 });
 
