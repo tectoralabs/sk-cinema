@@ -255,7 +255,7 @@ interface KnownGuard {
 const KNOWN_GUARDS: KnownGuard[] = [
   {
     // Only sets Cache-Control: no-store and calls next(); it never answers a request.
-    // Not exported from admin.routes.ts, so it is recognised by its (inferred) function name.
+    // Recognised by its (inferred) function name, from middleware/noStore.ts.
     name: 'noStore',
     path: ADMIN_API_PATH,
     matches: (handle) => typeof handle === 'function' && handle.name === 'noStore',
@@ -389,6 +389,56 @@ describe('admin router: authentication by default', () => {
     expect(endpoints).toContain('GET /api/health');
     expect(endpoints).toContain(`GET ${ADMIN_API_PATH}/me`);
     expect(endpoints).toEqual(expect.arrayContaining(PUBLIC_AUTH_ENDPOINTS));
+  });
+
+  it('sees every /screens route (Phase 5 T9), so the 401 walk below probes each one', () => {
+    const { app, mounts } = setup();
+    const screens = `${ADMIN_API_PATH}/screens`;
+    const screenEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
+      isUnder(e.split(' ')[1] ?? '', screens),
+    );
+
+    expect(screenEndpoints.sort()).toEqual(
+      [
+        `GET ${screens}`,
+        `POST ${screens}`,
+        `GET ${screens}/:id`,
+        `PATCH ${screens}/:id`,
+        `PATCH ${screens}/:id/active`,
+        `DELETE ${screens}/:id`,
+        `POST ${screens}/:id/restore`,
+      ].sort(),
+    );
+  });
+
+  it('sees every /showtimes route (Phase 5 T10-T12), so the 401 walk below probes each one', () => {
+    const { app, mounts } = setup();
+    const showtimes = `${ADMIN_API_PATH}/showtimes`;
+    const showtimeEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
+      isUnder(e.split(' ')[1] ?? '', showtimes),
+    );
+
+    expect(showtimeEndpoints.sort()).toEqual(
+      [
+        `GET ${showtimes}`,
+        `POST ${showtimes}`,
+        `POST ${showtimes}/bulk`,
+        `POST ${showtimes}/bulk-delete`,
+        `GET ${showtimes}/:id`,
+        `PATCH ${showtimes}/:id`,
+        `DELETE ${showtimes}/:id`,
+      ].sort(),
+    );
+  });
+
+  it('sees every /settings route (Phase 5 T14), so the 401 walk below probes each one', () => {
+    const { app, mounts } = setup();
+    const settings = `${ADMIN_API_PATH}/settings`;
+    const settingsEndpoints = walkApp(app, mounts).endpoints.filter((e) =>
+      isUnder(e.split(' ')[1] ?? '', settings),
+    );
+
+    expect(settingsEndpoints.sort()).toEqual([`GET ${settings}`, `PATCH ${settings}`].sort());
   });
 
   it('exposes only csrf, login, refresh and logout under /auth', () => {

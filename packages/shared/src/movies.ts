@@ -1,8 +1,41 @@
 import { z } from 'zod';
+import {
+  calendarDateSchema,
+  deletedFilterSchema,
+  multiLineTextSchema,
+  pageQuerySchema,
+  pageSizeQuerySchema,
+  queryBooleanSchema,
+  querySearchSchema,
+  singleLineTextSchema,
+} from './common.js';
 
 /* -------------------------------------------------------------------------- */
 /* Building blocks                                                            */
 /* -------------------------------------------------------------------------- */
+
+/** The first and last year of a `releaseDate` in a request (Postgres `date` refuses year 0). */
+export const RELEASE_DATE_MIN_YEAR = 1900;
+export const RELEASE_DATE_MAX_YEAR = 2099;
+
+const RELEASE_DATE_MESSAGE = `Use a date from ${String(RELEASE_DATE_MIN_YEAR)} to ${String(RELEASE_DATE_MAX_YEAR)}, as YYYY-MM-DD`;
+
+/**
+ * A `releaseDate` in a create or update request: a real `YYYY-MM-DD` from RELEASE_DATE_MIN_YEAR to
+ * RELEASE_DATE_MAX_YEAR. Requests only: responses and the public `?date=` keep
+ * calendarDateSchema, so a stored row outside the range still reads back. The message never
+ * echoes the value.
+ *
+ * abort: the year is only read from a well-formed date, and the anchored pattern of z.iso.date()
+ * fails within a few characters on over-long input.
+ */
+export const releaseDateSchema = z.iso.date({ abort: true, message: RELEASE_DATE_MESSAGE }).refine(
+  (date) => {
+    const year = Number(date.slice(0, 4));
+    return year >= RELEASE_DATE_MIN_YEAR && year <= RELEASE_DATE_MAX_YEAR;
+  },
+  { message: RELEASE_DATE_MESSAGE },
+);
 
 /** Movie lifecycle status. Mirrors the `MovieStatus` enum in the Prisma schema. */
 export const movieStatusSchema = z.enum(['UPCOMING', 'NOW_SHOWING', 'ENDED']);
@@ -28,9 +61,6 @@ export const slugSchema = z
   // abort: the pattern below never runs on over-long input.
   .max(SLUG_MAX_LENGTH, { abort: true })
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase letters, digits and single hyphens');
-
-/** Calendar date as `YYYY-MM-DD`. Rejects impossible dates such as 2026-02-30. */
-const calendarDateSchema = z.iso.date();
 
 const TRAILER_URL_MAX_LENGTH = 500;
 
@@ -92,6 +122,16 @@ export const trailerUrlSchema = z
     message: 'Must be an https YouTube link (youtube.com/watch?v=... or youtu.be/...)',
   });
 
+/** Shortest accepted movie running time, in minutes. */
+export const MOVIE_DURATION_MIN_MINUTES = 1;
+
+/**
+ * Longest accepted movie running time, in minutes. The API also relies on it to bound the
+ * showtime overlap query (a show can start at most this long, plus the show gap, before a
+ * clashing one), so raising it widens that query window.
+ */
+export const MOVIE_DURATION_MAX_MINUTES = 600;
+
 /** Removes case-insensitive duplicates, keeping the first spelling. */
 function dedupeCaseInsensitive(values: string[]): string[] {
   const seen = new Set<string>();
@@ -103,28 +143,25 @@ function dedupeCaseInsensitive(values: string[]): string[] {
   });
 }
 
-const genresSchema = z
-  .array(z.string().trim().min(1).max(30))
-  .max(10)
-  .transform(dedupeCaseInsensitive);
+const genresSchema = z.array(singleLineTextSchema(30)).max(10).transform(dedupeCaseInsensitive);
 
-const castSchema = z.array(z.string().trim().min(1).max(100)).max(30);
+const castSchema = z.array(singleLineTextSchema(100)).max(30);
 
 /**
  * Editable movie fields shared by create and update. Optional text columns are
  * nullable: send `null` (not an empty string) to leave them blank or clear them.
  */
 const movieFields = {
-  title: z.string().trim().min(1).max(150),
+  title: singleLineTextSchema(150),
   slug: slugSchema,
-  synopsis: z.string().trim().min(1).max(5000).nullable(),
-  durationMinutes: z.number().int().min(1).max(600),
-  language: z.string().trim().min(1).max(50).nullable(),
+  synopsis: multiLineTextSchema(5000).nullable(),
+  durationMinutes: z.number().int().min(MOVIE_DURATION_MIN_MINUTES).max(MOVIE_DURATION_MAX_MINUTES),
+  language: singleLineTextSchema(50).nullable(),
   genres: genresSchema,
-  rating: z.string().trim().min(1).max(20).nullable(),
-  director: z.string().trim().min(1).max(150).nullable(),
+  rating: singleLineTextSchema(20).nullable(),
+  director: singleLineTextSchema(150).nullable(),
   cast: castSchema,
-  releaseDate: calendarDateSchema.nullable(),
+  releaseDate: releaseDateSchema.nullable(),
   trailerUrl: trailerUrlSchema.nullable(),
 };
 
@@ -217,36 +254,19 @@ export type MovieActiveBody = z.infer<typeof movieActiveBodySchema>;
 /* Query strings                                                              */
 /* -------------------------------------------------------------------------- */
 
-/** Positive integer from a query string. Digits only (no signs, decimals or exponents). */
-function queryInt(min: number, max: number) {
-  return z
-    .string()
-    .regex(/^\d{1,6}$/, 'Must be a whole number')
-    .transform(Number)
-    .pipe(z.number().int().min(min).max(max));
-}
-
 export const ADMIN_MOVIE_SORT_FIELDS = ['updatedAt', 'createdAt', 'title', 'releaseDate'] as const;
 
 /** Query of GET /api/admin/movies. All values arrive as strings and are converted here. */
 export const adminMovieListQuerySchema = z.strictObject({
   /** Free-text search. Whitespace-only is treated as no search. */
-  search: z
-    .string()
-    .trim()
-    .max(100)
-    .transform((value) => (value === '' ? undefined : value))
-    .optional(),
+  search: querySearchSchema.optional(),
   status: movieStatusSchema.optional(),
   /** Only the literal strings 'true' and 'false' are accepted. */
-  isActive: z
-    .enum(['true', 'false'])
-    .transform((value) => value === 'true')
-    .optional(),
+  isActive: queryBooleanSchema.optional(),
   /** Soft-deleted movies: hide them (default), include them, or show only them. */
-  deleted: z.enum(['exclude', 'include', 'only']).default('exclude'),
-  page: queryInt(1, 999_999).default(1),
-  pageSize: queryInt(1, 100).default(20),
+  deleted: deletedFilterSchema.default('exclude'),
+  page: pageQuerySchema,
+  pageSize: pageSizeQuerySchema,
   sort: z.enum(ADMIN_MOVIE_SORT_FIELDS).default('updatedAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
 });

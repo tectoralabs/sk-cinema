@@ -142,7 +142,7 @@ describe('inMemoryAuthDb: unsupported Prisma features fail loudly', () => {
     [
       'findUnique with include',
       (db: InMemoryAuthDb, id: string) =>
-        db.spies.admin.findUnique({ where: { id }, include: { refreshTokens: true } } as never),
+        db.spies.admin.findUnique({ where: { id }, include: { refreshTokens: true } }),
     ],
     [
       'findUnique with omit',
@@ -166,7 +166,7 @@ describe('inMemoryAuthDb: unsupported Prisma features fail loudly', () => {
     [
       'update with include',
       (db: InMemoryAuthDb, id: string) =>
-        db.spies.admin.update({ where: { id }, data: { name: 'x' }, include: {} } as never),
+        db.spies.admin.update({ where: { id }, data: { name: 'x' }, include: {} }),
     ],
     [
       'create with skip',
@@ -1009,6 +1009,62 @@ describe('inMemoryAuthDb: movie where operators', () => {
     expect(await where(db, { title: { contains: '\\Z' } })).toEqual(['zorro']);
   });
 
+  // Real Postgres (movies.pg.test.ts, C.UTF-8): ILIKE lower-cases both sides one character at
+  // a time, folding case but not accents, unlike JavaScript's /iu case folding.
+  describe('mode: insensitive lower-cases per character, like Postgres ILIKE', () => {
+    const titled = (titles: string[]) =>
+      inMemoryAuthDb({
+        movies: titles.map((title, i) => testMovie({ slug: `m-${String(i)}`, title })),
+      });
+    const search = async (db: InMemoryAuthDb, term: string) =>
+      (
+        await db.spies.movie.findMany({
+          where: { title: { contains: term, mode: 'insensitive' } },
+          select: { title: true },
+        })
+      ).map((row) => row['title']);
+
+    it.each(['élan', 'ÉLAN', 'Élan', 'éLaN'])(
+      'search %j matches "Élan" and "élan vital"',
+      async (term) => {
+        const db = titled(['Élan', 'élan vital', 'Elan Drive', 'Other']);
+        expect(await search(db, term)).toEqual(['Élan', 'élan vital']);
+      },
+    );
+
+    it('search "elan" does not match accented titles (case folds, accents do not)', async () => {
+      const db = titled(['Élan', 'élan vital', 'Elan Drive', 'Other']);
+      expect(await search(db, 'elan')).toEqual(['Elan Drive']);
+    });
+
+    it('long s (ſ) does not match "s": lower(ſ) is ſ', async () => {
+      const db = titled(['Caſe Study']);
+      expect(await search(db, 'case')).toEqual([]);
+      expect(await search(db, 'CAſE')).toEqual(['Caſe Study']);
+    });
+
+    it('dotted capital I (İ) matches "i": lower(İ) is i', async () => {
+      const db = titled(['İzmir Nights']);
+      expect(await search(db, 'izmir')).toEqual(['İzmir Nights']);
+    });
+
+    it('final sigma (ς) does not match capital sigma: lower(Σ) is σ', async () => {
+      const db = titled(['οδυσσευς']);
+      expect(await search(db, 'ΕΥΣ')).toEqual([]);
+      expect(await search(db, 'ΕΥ')).toEqual(['οδυσσευς']);
+    });
+
+    it('startsWith insensitive uses the same lowering, and % / _ stay wildcards', async () => {
+      const db = inMemoryAuthDb({ movies: [testMovie({ slug: 'İzmir', title: 'x' })] });
+      await expect(
+        db.spies.movie.findMany({
+          where: { slug: { startsWith: 'i_m', mode: 'insensitive' } },
+          select: { slug: true },
+        }),
+      ).resolves.toEqual([{ slug: 'İzmir' }]);
+    });
+  });
+
   it('ORs the branches of OR, ANDs top-level keys with it, and an empty OR matches nothing', async () => {
     const { db } = catalogue();
     const search = (term: string): Where => ({
@@ -1046,6 +1102,25 @@ describe('inMemoryAuthDb: movie orderBy, skip, take, select and count', () => {
       'bad-boys',
       'ape-100-percent',
     ]);
+  });
+
+  it('orders by code point like C.UTF-8: Banana, apple, cherry; an emoji after U+FB00', async () => {
+    const titled = (titles: string[]) =>
+      inMemoryAuthDb({
+        movies: titles.map((title, i) => testMovie({ slug: `m-${String(i)}`, title })),
+      });
+    const titles = async (db: InMemoryAuthDb, order: 'asc' | 'desc') =>
+      (await db.spies.movie.findMany({ orderBy: { title: order }, select: { title: true } })).map(
+        (row) => row['title'],
+      );
+
+    const fruit = titled(['cherry', 'apple', 'Banana']);
+    expect(await titles(fruit, 'asc')).toEqual(['Banana', 'apple', 'cherry']);
+    expect(await titles(fruit, 'desc')).toEqual(['cherry', 'apple', 'Banana']);
+
+    // UTF-16 code units would put the emoji's surrogate pair (0xD83D...) before U+FB00.
+    const wide = titled(['\u{1F600} Smile', 'ﬀ Ligature', 'Élan', 'Zed']);
+    expect(await titles(wide, 'asc')).toEqual(['Zed', 'Élan', 'ﬀ Ligature', '\u{1F600} Smile']);
   });
 
   it('orders enums by declaration order and applies keys in array order', async () => {
@@ -1460,7 +1535,7 @@ describe('inMemoryAuthDb: movie fault injection', () => {
     db.injectFault('movie', 'create', { error: uniqueConstraintError('movie', 'slug') });
 
     await expect(
-      db.spies.movie.create({ data, include: { showtimes: true } } as never),
+      db.spies.movie.create({ data, include: { showtimes: true } }),
     ).rejects.toBeInstanceOf(UnsupportedByFakeError);
     await expect(db.spies.movie.create({ data })).rejects.toMatchObject({ code: 'P2002' });
   });
@@ -1592,7 +1667,7 @@ describe('inMemoryAuthDb: unsupported movie queries fail loudly', () => {
         db.spies.movie.findUnique({
           where: { slug: 'zorro' },
           include: { showtimes: true },
-        } as never),
+        }),
     ],
     [
       'delete with include',

@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import {
+  MOVIE_DURATION_MAX_MINUTES,
+  MOVIE_DURATION_MIN_MINUTES,
+  RELEASE_DATE_MAX_YEAR,
+  RELEASE_DATE_MIN_YEAR,
   adminMovieListQuerySchema,
   adminMovieListResponseSchema,
   adminMovieResponseSchema,
@@ -16,6 +20,7 @@ import {
   publicMovieListResponseSchema,
   publicMovieResponseSchema,
   publicMovieSchema,
+  releaseDateSchema,
   slugSchema,
   trailerUrlSchema,
 } from './movies.js';
@@ -288,6 +293,11 @@ describe('movieCreateBodySchema', () => {
     }
   });
 
+  it('exports the durationMinutes bounds the API uses for its overlap query window', () => {
+    expect(MOVIE_DURATION_MIN_MINUTES).toBe(1);
+    expect(MOVIE_DURATION_MAX_MINUTES).toBe(600);
+  });
+
   it('enforces text length limits', () => {
     const cases: [string, number][] = [
       ['synopsis', 5000],
@@ -358,6 +368,44 @@ describe('movieCreateBodySchema', () => {
     '',
   ])('rejects release date %s', (releaseDate) => {
     expect(movieCreateBodySchema.safeParse({ ...minimalCreate, releaseDate }).success).toBe(false);
+  });
+
+  it.each([
+    ['1899-12-31', false],
+    ['1900-01-01', true],
+    ['2099-12-31', true],
+    ['2100-01-01', false],
+    ['0000-01-01', false],
+    ['9999-12-31', false],
+  ])('release date %s in a create or update request: accepted=%s', (releaseDate, accepted) => {
+    expect(movieCreateBodySchema.safeParse({ ...minimalCreate, releaseDate }).success).toBe(
+      accepted,
+    );
+    expect(movieUpdateBodySchema.safeParse({ releaseDate }).success).toBe(accepted);
+    expect(releaseDateSchema.safeParse(releaseDate).success).toBe(accepted);
+  });
+
+  it('refuses an out-of-range release date with one friendly message that does not echo it', () => {
+    const message = `Use a date from ${String(RELEASE_DATE_MIN_YEAR)} to ${String(RELEASE_DATE_MAX_YEAR)}, as YYYY-MM-DD`;
+    for (const date of ['0000-01-01', '2100-01-01', 'not-a-date']) {
+      const result = releaseDateSchema.safeParse(date);
+      expect(result.error?.issues.map((issue) => issue.message)).toEqual([message]);
+    }
+  });
+
+  it('still reads a stored release date outside the range in responses', () => {
+    expect(
+      publicMovieSchema.safeParse({ ...validPublicMovie, releaseDate: '0999-01-05' }).success,
+    ).toBe(true);
+    expect(
+      adminMovieSchema.safeParse({ ...validAdminMovie, releaseDate: '2150-01-05' }).success,
+    ).toBe(true);
+  });
+
+  it('rejects a ~100 KB release date quickly', () => {
+    const { result, ms } = timeSafeParse(releaseDateSchema, `2026-11-01${'1'.repeat(100_000)}`);
+    expect(result.success).toBe(false);
+    expect(ms).toBeLessThan(50);
   });
 
   it('rejects a non-YouTube trailer URL', () => {

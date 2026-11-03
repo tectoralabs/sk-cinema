@@ -1,13 +1,20 @@
-import { Router, type RequestHandler } from 'express';
+import { Router } from 'express';
 import type { Config } from '../config/env.js';
 import type { AuthController } from '../controllers/auth.controller.js';
 import type { MovieAdminController } from '../controllers/movie.admin.controller.js';
+import type { ScreenAdminController } from '../controllers/screen.admin.controller.js';
+import type { SettingsAdminController } from '../controllers/settings.admin.controller.js';
+import type { ShowtimeAdminController } from '../controllers/showtime.admin.controller.js';
 import { ADMIN_AUTH_PREFIX } from '../lib/apiPaths.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { csrfProtection } from '../middleware/csrf.js';
+import { noStore } from '../middleware/noStore.js';
 import type { AuthDb } from '../services/auth.service.js';
 import { authRoutes } from './auth.routes.js';
 import { movieAdminRoutes } from './movie.admin.routes.js';
+import { screenAdminRoutes } from './screen.admin.routes.js';
+import { settingsAdminRoutes } from './settings.admin.routes.js';
+import { showtimeAdminRoutes } from './showtime.admin.routes.js';
 
 export interface AdminRoutesDeps {
   config: Pick<Config, 'auth' | 'adminOrigins'>;
@@ -16,17 +23,18 @@ export interface AdminRoutesDeps {
   authController: AuthController;
   /** Built in routes/index.ts with the app's shared cache, so writes can invalidate it. */
   movieAdminController: MovieAdminController;
+  /** Built in routes/index.ts with the same shared cache. */
+  screenAdminController: ScreenAdminController;
+  /** Built in routes/index.ts with the same shared cache and the settings service. */
+  showtimeAdminController: ShowtimeAdminController;
+  /** Built in routes/index.ts with the same shared cache. */
+  settingsAdminController: SettingsAdminController;
 }
-
-/** Admin responses are per-user and may be sensitive: never cache them anywhere. */
-const noStore: RequestHandler = (_req, res, next) => {
-  res.set('Cache-Control', 'no-store');
-  next();
-};
 
 /**
  * Everything under /api/admin. Order matters:
- * 1. no-store first, so errors get it too;
+ * 1. no-store first, so errors get it too (admin responses are per-user and may be sensitive:
+ *    never cache them anywhere);
  * 2. CSRF for every unsafe method, including unknown routes;
  * 3. /auth/* (csrf, login, refresh, logout): the only routes that work without a session;
  * 4. `authenticated` for everything after it. Auth is the default, not opt-in: any route or
@@ -44,6 +52,9 @@ export function adminRoutes({
   db,
   authController,
   movieAdminController,
+  screenAdminController,
+  showtimeAdminController,
+  settingsAdminController,
 }: AdminRoutesDeps): Router {
   const router = Router();
   const authenticated = requireAuth({ db, config });
@@ -64,6 +75,17 @@ export function adminRoutes({
     requireRole('SUPER_ADMIN', 'EDITOR'),
     movieAdminRoutes(movieAdminController),
   );
+  router.use(
+    '/screens',
+    requireRole('SUPER_ADMIN', 'EDITOR'),
+    screenAdminRoutes(screenAdminController),
+  );
+  router.use(
+    '/showtimes',
+    requireRole('SUPER_ADMIN', 'EDITOR'),
+    showtimeAdminRoutes(showtimeAdminController),
+  );
+  router.use('/settings', requireRole('SUPER_ADMIN'), settingsAdminRoutes(settingsAdminController));
 
   return router;
 }

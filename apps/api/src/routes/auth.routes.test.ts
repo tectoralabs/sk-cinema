@@ -311,6 +311,26 @@ describe('POST /api/admin/auth/login', () => {
   });
 
   describe('refused credentials', () => {
+    it('answers 400 for a control character in the email, before any database read', async () => {
+      const { app, db } = setup();
+      const res = await (
+        await authClient(app)
+      ).post('/auth/login', { body: { email: 'a\u0000b@skcinema.lk', password: PASSWORD } });
+
+      expect(res.status).toBe(400);
+      expect(db.spies.admin.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('answers a NUL in the password as a wrong password, never a 500', async () => {
+      const { app } = setup();
+      const res = await (
+        await authClient(app)
+      ).post('/auth/login', { body: { email: EMAIL, password: 'wrong\u0000password' } });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual(INVALID_CREDENTIALS_BODY);
+    });
+
     it('answers a wrong password with 401 INVALID_CREDENTIALS and no auth cookies', async () => {
       const { app, admin, db } = setup();
       const res = await (

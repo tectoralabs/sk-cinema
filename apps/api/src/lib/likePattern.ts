@@ -9,8 +9,11 @@
  * backslash makes it match only itself. The backslash is escaped too (and first, in the same
  * pass), so a term ending in `\` cannot escape the closing `%` Prisma appends.
  *
- * Only for values passed to contains / startsWith / endsWith. Never use it for `equals` or
- * other filters, which compare literally: the added backslashes would then be searched for.
+ * Use it for values passed to contains / startsWith / endsWith, and to `equals` WITH
+ * `mode: 'insensitive'`: on Postgres Prisma sends that as `ILIKE $1`, unescaped too (see the
+ * screen name check in services/screen.admin.service.ts, proven in test/pg/screens.pg.test.ts).
+ * Never use it for a case-sensitive `equals` or other filters, which compare literally: the
+ * added backslashes would then be searched for.
  */
 export function escapeLikePattern(term: string): string {
   return term.replace(/[\\%_]/g, '\\$&');

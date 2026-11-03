@@ -24,6 +24,13 @@ describe('hashPassword', () => {
 });
 
 describe('verifyPassword', () => {
+  it('handles a NUL in a password as part of it: never cut short, never an error', async () => {
+    const hash = await hashPassword('pass\u0000word');
+    await expect(verifyPassword(hash, 'pass\u0000word')).resolves.toBe(true);
+    await expect(verifyPassword(hash, 'pass\u0000other')).resolves.toBe(false);
+    await expect(verifyPassword(hash, 'pass')).resolves.toBe(false);
+  });
+
   it('accepts the correct password and rejects a wrong one', async () => {
     const hash = await hashPassword('correct horse battery staple');
     await expect(verifyPassword(hash, 'correct horse battery staple')).resolves.toBe(true);

@@ -222,6 +222,10 @@ describe('POST /api/admin/movies', () => {
       ],
       ['a malformed slug', { title: 'Avatar', durationMinutes: 120, slug: 'Not A Slug' }],
       ['an impossible release date', { title: 'A', durationMinutes: 1, releaseDate: '2026-02-30' }],
+      // Postgres `date` refuses year 0: a 400 here, never a 500.
+      ['a year-0000 release date', { title: 'A', durationMinutes: 1, releaseDate: '0000-01-01' }],
+      ['a release date before 1900', { title: 'A', durationMinutes: 1, releaseDate: '1899-12-31' }],
+      ['a release date after 2099', { title: 'A', durationMinutes: 1, releaseDate: '2100-01-01' }],
       ['a non-YouTube trailer', { title: 'A', durationMinutes: 1, trailerUrl: 'https://evil.com' }],
       ['a JSON array body', '[]'],
     ];
@@ -240,6 +244,42 @@ describe('POST /api/admin/movies', () => {
       expectError(res, 400, 'VALIDATION_ERROR');
       expect(s.db.spies.movie.create).not.toHaveBeenCalled();
       expectNothingWritten(s.db);
+    });
+
+    it.each<[string, object, (string | number)[]]>([
+      ['title', { title: 'a\u0000b' }, ['body', 'title']],
+      ['synopsis', { synopsis: 'a\u0000b' }, ['body', 'synopsis']],
+      ['director', { director: 'a\u0001b' }, ['body', 'director']],
+      ['language', { language: 'a\u0000b' }, ['body', 'language']],
+      ['rating', { rating: 'a\u0001b' }, ['body', 'rating']],
+      ['genres', { genres: ['Drama', 'a\u0000b'] }, ['body', 'genres', 1]],
+      ['cast', { cast: ['a\u0001b'] }, ['body', 'cast', 0]],
+    ])(
+      'rejects a control character in %s (400, not the 500 of a NUL)',
+      async (_name, field, path) => {
+        const s = await setup();
+
+        const error = expectError(
+          await createMovie(s, { title: 'Avatar', durationMinutes: 120, ...field }),
+          400,
+          'VALIDATION_ERROR',
+        );
+
+        expect(error.details).toEqual([expect.objectContaining({ path })]);
+        expect(s.db.spies.movie.create).not.toHaveBeenCalled();
+        expectNothingWritten(s.db);
+      },
+    );
+
+    it('keeps line breaks in a synopsis', async () => {
+      const s = await setup();
+      const synopsis = 'First line\nSecond line\r\n\tIndented line';
+
+      const movie = expectCreated(
+        await createMovie(s, { title: 'Avatar', durationMinutes: 120, synopsis }),
+      );
+
+      expect(movie.synopsis).toBe(synopsis);
     });
 
     it('rejects query parameters', async () => {
@@ -1140,6 +1180,8 @@ describe('GET /api/admin/movies', () => {
       ['sort=slug', 'sort=slug', ['query', 'sort']],
       ['order=up', 'order=up', ['query', 'order']],
       ['a search over 100 characters', `search=${'a'.repeat(101)}`, ['query', 'search']],
+      ['a search with a NUL (Postgres refuses it)', 'search=a%00', ['query', 'search']],
+      ['a search with another control character', 'search=a%01b', ['query', 'search']],
       ['an unknown key', 'include=deleted', ['query']],
       ['bracket syntax', 'search[]=avatar', ['query']],
     ])('rejects %s', async (_name, query, path) => {
@@ -1801,6 +1843,9 @@ describe('PATCH /api/admin/movies/:id (details)', () => {
       ['whitespace-only title', { title: '   ' }],
       ['a malformed slug', { slug: 'Not A Slug' }],
       ['an impossible date', { releaseDate: '2026-02-30' }],
+      ['a year-0000 date', { releaseDate: '0000-01-01' }],
+      ['a date before 1900', { releaseDate: '1899-12-31' }],
+      ['a date after 2099', { releaseDate: '2100-01-01' }],
       ['a non-YouTube trailer', { trailerUrl: 'https://evil.example/watch?v=dQw4w9WgXcQ' }],
       ['a zero duration', { durationMinutes: 0 }],
       ['status (its own endpoint)', { title: 'X', status: 'ENDED' }],
@@ -2564,7 +2609,7 @@ describe('DELETE /api/admin/movies/:id/permanent (hard delete)', () => {
       adminId: s.adminId,
       entity: 'Movie',
       entityId: seeded.id,
-      details: { mode: 'hard', title: 'Avatar', slug: 'avatar' },
+      details: { mode: 'hard', title: 'Avatar', slug: 'avatar', showtimesDeleted: 0 },
       userAgent: TEST_USER_AGENT,
     });
     expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
@@ -2750,7 +2795,7 @@ describe('movie lifecycle', () => {
       ['DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }],
       ['UPDATE', { restored: true, title: 'Avatar', slug: 'avatar' }],
       ['DELETE', { mode: 'soft', title: 'Avatar', slug: 'avatar' }],
-      ['DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar' }],
+      ['DELETE', { mode: 'hard', title: 'Avatar', slug: 'avatar', showtimesDeleted: 0 }],
     ]);
     expect(new Set(audits.map((row) => row.entityId))).toEqual(new Set([id]));
     expect(new Set(audits.map((row) => row.adminId))).toEqual(new Set([s.adminId]));

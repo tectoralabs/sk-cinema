@@ -16,8 +16,11 @@ export const CONNECT_TIMEOUT_MS = 15_000;
  * - `timeout` bounds the transaction's own work and only starts once BEGIN succeeded, so a cold
  *   start never counts against it. Our transactions are a few short queries (well under 1 s on
  *   a warm database), so they are unaffected; 10 s leaves headroom for a just-woken compute
- *   with a cold cache while still releasing the connection and row locks of a stuck
- *   transaction quickly.
+ *   with a cold cache. It does NOT bound a statement blocked on a row lock: the client gives
+ *   up at the timeout, but the blocked statement keeps its pooled connection until Postgres
+ *   finishes it. Lock waits are bounded in the database instead: lib/locks.ts runs
+ *   `SET LOCAL lock_timeout` (5 s) before the first lock of each transaction, so a blocked
+ *   `FOR UPDATE` fails (SQLSTATE 55P03, a 409 for the client) well inside this timeout.
  */
 export const TRANSACTION_OPTIONS = {
   maxWait: CONNECT_TIMEOUT_MS + 5_000,
