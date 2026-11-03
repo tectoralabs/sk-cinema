@@ -678,6 +678,87 @@ describe.each(DRIVERS)('through the $driver', ({ start }) => {
       expect(h.db.locks).toEqual([{ table: 'Movie', id: movie.id }]);
     });
 
+    describe('a stored running time of 0 (manual SQL) can be repaired', () => {
+      const broken = () => mainMovie({ durationMinutes: 0 });
+
+      it('to a length that clashes with nothing: 200, audited, cache dropped', async () => {
+        const movie = broken();
+        const other = otherMovie();
+        const screen = testScreen();
+        const h = await begin(start, {
+          movies: [movie, other],
+          screens: [screen],
+          showtimes: [show(movie, screen, '10:00'), show(other, screen, '12:30')],
+          settings: gap(15),
+        });
+
+        expect((await h.patch(movie.id, { durationMinutes: 120 })).status).toBe(200);
+
+        expect(storedMovie(h.db, movie.id)?.durationMinutes).toBe(120);
+        expect(movieAudits(h.db)).toEqual([
+          expect.objectContaining({
+            action: 'UPDATE',
+            details: { changes: { durationMinutes: { from: 0, to: 120 } } },
+          }),
+        ]);
+        expect(h.cache.get(CACHED_KEY)).toBeUndefined();
+      });
+
+      it('to a length that clashes: the usual 409, nothing changed', async () => {
+        const movie = broken();
+        const other = otherMovie();
+        const screen = testScreen();
+        const neighbour = show(other, screen, '11:00');
+        const h = await begin(start, {
+          movies: [movie, other],
+          screens: [screen],
+          showtimes: [show(movie, screen, '10:00'), neighbour],
+          settings: gap(15),
+        });
+        const before = snapshot(h.db);
+
+        const outcome = await h.patch(movie.id, { durationMinutes: 120 });
+
+        expect(overlapDetails(outcome)).toHaveLength(1);
+        expect(outcome.error?.message).toBe(movieLengthOverlapMessage(1, 1));
+        expectNothingChanged(h, before);
+      });
+
+      it('to a short length that fits next to the neighbour: 200', async () => {
+        const movie = broken();
+        const other = otherMovie();
+        const screen = testScreen();
+        const h = await begin(start, {
+          movies: [movie, other],
+          screens: [screen],
+          // 10:00 + 45 + 15 = 11:00.
+          showtimes: [show(movie, screen, '10:00'), show(other, screen, '11:00')],
+          settings: gap(15),
+        });
+
+        expect((await h.patch(movie.id, { durationMinutes: 45 })).status).toBe(200);
+        expect(storedMovie(h.db, movie.id)?.durationMinutes).toBe(45);
+      });
+    });
+
+    it('a stored running time of 0 with an earlier started show of it: still repairable', async () => {
+      const movie = mainMovie({ durationMinutes: 0 });
+      const screen = testScreen();
+      const h = await begin(start, {
+        movies: [movie],
+        screens: [screen],
+        showtimes: [
+          // Started at 14:00 today (the clock says 15:30): a saved slot with the unusable length.
+          show(movie, screen, '14:00', {}, TODAY),
+          show(movie, screen, '10:00'),
+        ],
+        settings: gap(15),
+      });
+
+      expect((await h.patch(movie.id, { durationMinutes: 120 })).status).toBe(200);
+      expect(storedMovie(h.db, movie.id)?.durationMinutes).toBe(120);
+    });
+
     describe('clashes that exist already never block', () => {
       it('length unchanged, with a clash: 200, and no lock', async () => {
         const movie = mainMovie();

@@ -184,9 +184,9 @@ export function createSettingsAdminService({
 
     /**
      * In one transaction: read the effective values and compare; upsert only the changed keys
-     * and write one UPDATE audit row per key (`{ from, to }`, effective typed values); count
-     * under the gap now in force. Then, only after the commit and only if something changed,
-     * the public cache is dropped. A no-op writes, audits and invalidates nothing and answers
+     * and write one UPDATE audit row per key (`{ from, to }`, effective typed values). Then,
+     * only after the commit and only if something changed, the public cache is dropped, and
+     * last the count under the gap now in force is read (outside the transaction). A no-op writes, audits and invalidates nothing and answers
      * the same shape; a key holding an invalid stored row is never a no-op (see settingChanges).
      * Base URL changes leave showtime overrides alone.
      */
@@ -229,18 +229,24 @@ export function createSettingsAdminService({
           };
         }
 
-        const futureShowtimesBelowGap = await countFutureShowtimesBelowGap(
-          tx,
-          settings.showGapMinutes,
-          now(),
-          logger,
-        );
-        return { response: { settings, futureShowtimesBelowGap }, changed: changes.length > 0 };
+        return { settings, changed: changes.length > 0 };
       });
 
       // Only after the commit, so no request can re-cache links built from the old base URL.
       if (outcome.changed) invalidatePublicMovies(cache);
-      return outcome.response;
+
+      // Counted after the commit, through the root client: the count loads every future show, so
+      // inside the transaction a huge schedule could exhaust its 10 s timeout and fail a save
+      // that is otherwise instant. If the count throws, the save is already committed, audited
+      // and the cache dropped; the error propagates as a generic 500 (a fallback number would
+      // mislead) and the admin reads the result with a GET.
+      const futureShowtimesBelowGap = await countFutureShowtimesBelowGap(
+        db,
+        outcome.settings.showGapMinutes,
+        now(),
+        logger,
+      );
+      return { settings: outcome.settings, futureShowtimesBelowGap };
     },
   };
 }

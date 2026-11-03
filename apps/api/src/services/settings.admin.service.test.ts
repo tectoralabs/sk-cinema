@@ -598,6 +598,49 @@ describe('settings admin service', () => {
     });
   });
 
+  it('update: counts after the commit and after the cache is dropped, not inside the transaction', async () => {
+    const { db, invalidate, service } = setup(
+      [],
+      [{ startsAt: colombo(DAY, '10:00') }, { startsAt: colombo(DAY, '12:00') }],
+    );
+
+    const response = await service.update({ showGapMinutes: 30 }, actor);
+
+    // The same shape and the count under the gap just saved (120 + 30 > 120 minutes apart).
+    expect(response.settings.showGapMinutes).toBe(30);
+    expect(response.futureShowtimesBelowGap).toBe(1);
+    const auditOrder = db.spies.auditLog.createMany.mock.invocationCallOrder.at(-1) ?? Infinity;
+    const countOrder = db.spies.showtime.findMany.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(countOrder).toBeGreaterThan(auditOrder);
+    expect(countOrder).toBeGreaterThan(invalidate.mock.invocationCallOrder[0] ?? Infinity);
+    // The transaction had ended when the count ran: the settled transaction promise came first.
+    expect(db.spies.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('update: a failing count after the commit leaves the save in place and answers an error', async () => {
+    const { db, invalidate, service } = setup();
+    const failure = new Error('connection lost');
+    db.injectFault('showtime', 'findMany', { error: failure });
+
+    await expect(service.update({ showGapMinutes: 30 }, actor)).rejects.toBe(failure);
+
+    // Committed: saved, audited, and the cache dropped. The admin reads the result with a GET.
+    expect(db.settings.map((row) => [row.key, row.value])).toEqual([['showGapMinutes', '30']]);
+    expect(db.auditLogs).toHaveLength(1);
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+  });
+
+  it('update: a no-op whose count fails still reports the error, with nothing written', async () => {
+    const { db, invalidate, service } = setup();
+    db.injectFault('showtime', 'findMany', { error: new Error('connection lost') });
+
+    await expect(service.update({ showGapMinutes: 15 }, actor)).rejects.toThrow('connection lost');
+
+    expect(db.settings).toEqual([]);
+    expect(db.auditLogs).toEqual([]);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
   it('update: lets a read failure through with nothing written or invalidated', async () => {
     const { db, invalidate, service } = setup();
     const failure = new Error('connection lost');

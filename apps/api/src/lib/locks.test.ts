@@ -2,12 +2,22 @@ import { describe, expect, it } from 'vitest';
 import type { Prisma } from '../generated/prisma/client.js';
 import {
   LOCK_SQL,
+  LOCK_TIMEOUT_SQL,
   UnsupportedByFakeError,
   inMemoryAuthDb,
+  lockTimeoutError,
   testMovie,
   testScreen,
 } from '../test/helpers.js';
-import { lockMovie, lockMovieAndScreens, lockScreen, lockScreens } from './locks.js';
+import { AppError } from './errors.js';
+import {
+  LOCK_BUSY_MESSAGE,
+  LOCK_TIMEOUT,
+  lockMovie,
+  lockMovieAndScreens,
+  lockScreen,
+  lockScreens,
+} from './locks.js';
 
 const MISSING_ID = '00000000-0000-7000-8000-000000000999';
 // Fixed IDs so the expected lock order does not depend on generation order.
@@ -164,5 +174,80 @@ describe('lockMovieAndScreens', () => {
     const result = await inTx((tx) => lockMovieAndScreens(tx, MISSING_ID, [MISSING_ID]));
     expect(result).toEqual({ movieFound: false, screensFound: new Set() });
     expect(db.locks.map((lock) => lock.table)).toEqual(['Movie', 'Screen']);
+  });
+});
+
+describe('the lock wait limit', () => {
+  it('is set once per transaction, before the first lock, with a parameter-free statement', async () => {
+    const { db, movie, inTx } = cinema();
+    await inTx(async (tx) => {
+      await lockMovie(tx, movie.id);
+      await lockScreens(tx, [SCREEN_A, SCREEN_C]);
+    });
+
+    expect(db.lockTimeouts).toEqual([{ locksBefore: 0 }]);
+    expect(db.locks).toHaveLength(3);
+    const [strings, ...values] = db.spies.$executeRaw.mock.calls[0] as unknown as [
+      TemplateStringsArray,
+      ...unknown[],
+    ];
+    expect(strings.join('$1').trim()).toBe(LOCK_TIMEOUT_SQL);
+    expect(LOCK_TIMEOUT_SQL).toContain(`'${LOCK_TIMEOUT}'`);
+    expect(values).toEqual([]);
+    // Never the unsafe variants.
+    expect(db.spies.$queryRawUnsafe).not.toHaveBeenCalled();
+    expect(db.spies.$executeRawUnsafe).not.toHaveBeenCalled();
+  });
+
+  it('is set again in the next transaction', async () => {
+    const { db, movie, inTx } = cinema();
+    await inTx((tx) => lockMovie(tx, movie.id));
+    await inTx((tx) => lockScreen(tx, SCREEN_A));
+    expect(db.lockTimeouts).toEqual([{ locksBefore: 0 }, { locksBefore: 1 }]);
+  });
+
+  it('is not set when no lock is taken', async () => {
+    const { db, inTx } = cinema();
+    await inTx((tx) => lockScreens(tx, []));
+    expect(db.lockTimeouts).toEqual([]);
+  });
+
+  it('turns a lock timeout (55P03) into a 409 without details, and rolls back', async () => {
+    const { db, movie, inTx } = cinema();
+    db.injectFault('$queryRaw', 'lock', { onCall: 2, error: lockTimeoutError() });
+
+    const error = await inTx(async (tx) => {
+      await lockMovie(tx, movie.id);
+      await tx.movie.update({ where: { id: movie.id }, data: { title: 'Never saved' } });
+      await lockScreen(tx, SCREEN_A);
+    }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error).toMatchObject({
+      status: 409,
+      code: 'CONFLICT',
+      message: LOCK_BUSY_MESSAGE,
+      details: undefined,
+    });
+    expect(LOCK_BUSY_MESSAGE).toBe('The schedule is busy. Try again in a moment.');
+    expect(db.movies.find((m) => m.id === movie.id)?.title).toBe('Dune');
+  });
+
+  const failure = (props: object) => Object.assign(new Error('driver failure'), props);
+  it.each([
+    [
+      'a P2010 for another SQLSTATE',
+      failure({ code: 'P2010', meta: { driverAdapterError: { cause: { code: '40P01' } } } }),
+    ],
+    [
+      '55P03 under another Prisma code',
+      failure({ code: 'P2034', meta: { driverAdapterError: { cause: { code: '55P03' } } } }),
+    ],
+    ['a P2010 without meta', failure({ code: 'P2010' })],
+    ['a plain error', new Error('canceling statement due to lock timeout')],
+  ])('leaves %s as it is', async (_name, thrown) => {
+    const { db, movie, inTx } = cinema();
+    db.injectFault('$queryRaw', 'lock', { error: thrown });
+    await expect(inTx((tx) => lockMovie(tx, movie.id))).rejects.toBe(thrown);
   });
 });

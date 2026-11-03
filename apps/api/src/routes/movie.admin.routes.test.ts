@@ -222,6 +222,10 @@ describe('POST /api/admin/movies', () => {
       ],
       ['a malformed slug', { title: 'Avatar', durationMinutes: 120, slug: 'Not A Slug' }],
       ['an impossible release date', { title: 'A', durationMinutes: 1, releaseDate: '2026-02-30' }],
+      // Postgres `date` refuses year 0: a 400 here, never a 500.
+      ['a year-0000 release date', { title: 'A', durationMinutes: 1, releaseDate: '0000-01-01' }],
+      ['a release date before 1900', { title: 'A', durationMinutes: 1, releaseDate: '1899-12-31' }],
+      ['a release date after 2099', { title: 'A', durationMinutes: 1, releaseDate: '2100-01-01' }],
       ['a non-YouTube trailer', { title: 'A', durationMinutes: 1, trailerUrl: 'https://evil.com' }],
       ['a JSON array body', '[]'],
     ];
@@ -1839,6 +1843,9 @@ describe('PATCH /api/admin/movies/:id (details)', () => {
       ['whitespace-only title', { title: '   ' }],
       ['a malformed slug', { slug: 'Not A Slug' }],
       ['an impossible date', { releaseDate: '2026-02-30' }],
+      ['a year-0000 date', { releaseDate: '0000-01-01' }],
+      ['a date before 1900', { releaseDate: '1899-12-31' }],
+      ['a date after 2099', { releaseDate: '2100-01-01' }],
       ['a non-YouTube trailer', { trailerUrl: 'https://evil.example/watch?v=dQw4w9WgXcQ' }],
       ['a zero duration', { durationMinutes: 0 }],
       ['status (its own endpoint)', { title: 'X', status: 'ENDED' }],

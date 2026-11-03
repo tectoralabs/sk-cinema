@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import { DEFAULT_BMS_BASE_URL } from './bms.js';
 import { calendarDateSchema } from './common.js';
-import { publicMovieSchema } from './movies.js';
+import { publicMovieSchema, releaseDateSchema } from './movies.js';
 import {
   SHOWTIME_BULK_DELETE_MAX_IDS,
   SHOWTIME_BULK_MAX_DAYS,
@@ -154,10 +154,16 @@ describe('showtimeDateSchema', () => {
     expect(showtimeDateSchema.safeParse(null).success).toBe(false);
   });
 
-  it('leaves calendarDateSchema (releaseDate) unbounded', () => {
+  it('leaves calendarDateSchema unbounded (responses and the public ?date= still read any date)', () => {
     for (const date of OUT_OF_RANGE) {
       expect(calendarDateSchema.safeParse(date).success).toBe(true);
     }
+  });
+
+  it('bounds a releaseDate in a request (1900 to 2099) with its own schema, not this one', () => {
+    // Only the movie create/update BODY schemas use releaseDateSchema; see movies.test.ts.
+    expect(releaseDateSchema.safeParse('0000-01-01').success).toBe(false);
+    expect(releaseDateSchema.safeParse('2019-12-31').success).toBe(true);
   });
 
   it('rejects a ~100 KB string quickly with one issue that does not echo it', () => {

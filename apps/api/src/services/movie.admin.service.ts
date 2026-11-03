@@ -15,7 +15,11 @@ import { toColomboDate, toColomboTime } from '../lib/colomboTime.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { escapeLikePattern } from '../lib/likePattern.js';
 import { lockMovie, lockScreens } from '../lib/locks.js';
-import { findShowtimeConflicts, type ShowtimeOverlap } from '../lib/showtimeOverlap.js';
+import {
+  findShowtimeConflicts,
+  isUsableDuration,
+  type ShowtimeOverlap,
+} from '../lib/showtimeOverlap.js';
 import { firstFreeSlug, isSlugOrSuffixed, slugify } from '../lib/slug.js';
 import { isRecordNotFound, refuseIfFutureShowtimes } from './adminGuards.js';
 import { writeAudit, type AuditActor, type AuditEntry } from './audit.service.js';
@@ -425,14 +429,26 @@ export function createMovieAdminService({
       }));
     const longer = candidatesAt(newDuration);
     // The window of the longer run contains the shorter run's, so one read serves both.
-    const existing = await findExistingShowtimeSlots(tx, longer, gapMinutes);
+    const oldLengthUsable = isUsableDuration(movie.durationMinutes);
+    const saved = await findExistingShowtimeSlots(tx, longer, gapMinutes);
+    // The movie's own started shows are saved slots with its stored length. If that length is
+    // unusable they cannot be placed on the timeline (the overlap check refuses such a slot),
+    // so they are left out; the repair then checks against every readable show.
+    const existing = oldLengthUsable
+      ? saved
+      : saved.filter((slot) => isUsableDuration(slot.durationMinutes));
 
+    // An unusable stored length (0 or less: possible only through manual SQL) caused no known
+    // clash and cannot be checked, so every clash under the new length counts as caused. That
+    // lets an admin repair such a movie with a normal length, still refused if it clashes.
     const known = new Set(
-      findShowtimeConflicts({
-        candidates: candidatesAt(movie.durationMinutes),
-        existing,
-        gapMinutes,
-      }).map(overlapPairKey),
+      oldLengthUsable
+        ? findShowtimeConflicts({
+            candidates: candidatesAt(movie.durationMinutes),
+            existing,
+            gapMinutes,
+          }).map(overlapPairKey)
+        : [],
     );
     const caused = findShowtimeConflicts({ candidates: longer, existing, gapMinutes }).filter(
       (overlap) => !known.has(overlapPairKey(overlap)),

@@ -712,12 +712,31 @@ describe('PATCH /api/admin/settings', () => {
       expectRolledBack(s, await patchSettings(s, both), seeded);
     });
 
-    it('the count failing after the writes rolls both keys and the audit rows back', async () => {
+    it('the count failing runs after the commit: both keys stay saved and audited, a generic 500', async () => {
+      // The count reads every future show, so it runs outside the transaction (a huge schedule
+      // must not time a save out). The admin sees an error, reads with GET, and finds the save.
       const seeded = [testSetting('showGapMinutes', '20')];
       const s = await setup({ settings: seeded });
       s.db.injectFault('showtime', 'findMany', { error: new Error(SECRET) });
 
-      expectRolledBack(s, await patchSettings(s, both), seeded);
+      const res = await patchSettings(s, both);
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual(INTERNAL_BODY);
+      expect(res.text).not.toContain('db.internal');
+      expect(s.db.settings.map((row) => [row.key, row.value]).sort()).toEqual([
+        ['bmsBaseUrl', NEW_BASE],
+        ['showGapMinutes', '30'],
+      ]);
+      expect(settingAudits(s.db)).toHaveLength(2);
+      expect(s.invalidate).toHaveBeenCalledExactlyOnceWith(PUBLIC_MOVIES_CACHE_PREFIX);
+
+      const after = await getSettings(s);
+      expect(after.status).toBe(200);
+      expect(adminSettingsResponseSchema.parse(after.body).settings).toMatchObject({
+        bmsBaseUrl: NEW_BASE,
+        showGapMinutes: 30,
+      });
     });
 
     it('a fault on GET is a generic 500 too', async () => {

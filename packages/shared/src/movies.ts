@@ -14,6 +14,29 @@ import {
 /* Building blocks                                                            */
 /* -------------------------------------------------------------------------- */
 
+/** The first and last year of a `releaseDate` in a request (Postgres `date` refuses year 0). */
+export const RELEASE_DATE_MIN_YEAR = 1900;
+export const RELEASE_DATE_MAX_YEAR = 2099;
+
+const RELEASE_DATE_MESSAGE = `Use a date from ${String(RELEASE_DATE_MIN_YEAR)} to ${String(RELEASE_DATE_MAX_YEAR)}, as YYYY-MM-DD`;
+
+/**
+ * A `releaseDate` in a create or update request: a real `YYYY-MM-DD` from RELEASE_DATE_MIN_YEAR to
+ * RELEASE_DATE_MAX_YEAR. Requests only: responses and the public `?date=` keep
+ * calendarDateSchema, so a stored row outside the range still reads back. The message never
+ * echoes the value.
+ *
+ * abort: the year is only read from a well-formed date, and the anchored pattern of z.iso.date()
+ * fails within a few characters on over-long input.
+ */
+export const releaseDateSchema = z.iso.date({ abort: true, message: RELEASE_DATE_MESSAGE }).refine(
+  (date) => {
+    const year = Number(date.slice(0, 4));
+    return year >= RELEASE_DATE_MIN_YEAR && year <= RELEASE_DATE_MAX_YEAR;
+  },
+  { message: RELEASE_DATE_MESSAGE },
+);
+
 /** Movie lifecycle status. Mirrors the `MovieStatus` enum in the Prisma schema. */
 export const movieStatusSchema = z.enum(['UPCOMING', 'NOW_SHOWING', 'ENDED']);
 
@@ -138,7 +161,7 @@ const movieFields = {
   rating: singleLineTextSchema(20).nullable(),
   director: singleLineTextSchema(150).nullable(),
   cast: castSchema,
-  releaseDate: calendarDateSchema.nullable(),
+  releaseDate: releaseDateSchema.nullable(),
   trailerUrl: trailerUrlSchema.nullable(),
 };
 

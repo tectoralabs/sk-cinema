@@ -24,6 +24,7 @@ import { AdminRole, AuditAction, MovieStatus } from '../generated/prisma/enums.j
 import { ADMIN_API_PATH } from '../lib/apiPaths.js';
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_NAME } from '../lib/authCookies.js';
 import { MemoryCache } from '../lib/cache.js';
+import { LOCK_TIMEOUT } from '../lib/locks.js';
 import { generateRefreshToken, hashRefreshToken } from '../lib/tokens.js';
 import { CSRF_HEADER } from '../middleware/csrf.js';
 
@@ -1292,6 +1293,41 @@ export const LOCK_SQL = {
   Screen: 'SELECT "id" FROM "Screen" WHERE "id" = $1::uuid FOR UPDATE',
 } as const;
 
+/**
+ * The one `$executeRaw` the fake understands, inside a transaction: the lock wait limit the lock
+ * helpers set before their first lock (lib/locks.ts), a parameter-free tagged template:
+ *
+ *   tx.$executeRaw`SET LOCAL lock_timeout = '5s'`
+ *
+ * Answers 0 and is recorded in `db.lockTimeouts` (not in `db.locks`).
+ */
+export const LOCK_TIMEOUT_SQL = `SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`;
+
+/** One LOCK_TIMEOUT_SQL statement: how many row locks had been taken (all transactions) before it. */
+export interface FakeLockTimeout {
+  locksBefore: number;
+}
+
+/**
+ * The error Prisma 7.10.1 + adapter-pg throw when `lock_timeout` expires (SQLSTATE 55P03): a raw
+ * query failure P2010 wrapping the driver error (the shape locks.pg.test.ts pins on Postgres).
+ * Use it with `injectFault('$queryRaw', 'lock', { error: lockTimeoutError() })`.
+ */
+export function lockTimeoutError() {
+  return knownRequestError(
+    'P2010',
+    'Raw query failed. Code: `55P03`. Message: `canceling statement due to lock timeout`',
+    {
+      driverAdapterError: driverAdapterError({
+        kind: 'postgres',
+        code: '55P03',
+        severity: 'ERROR',
+        message: 'canceling statement due to lock timeout',
+      }),
+    },
+  );
+}
+
 /** A table the fake can row-lock with LOCK_SQL. */
 export type LockTable = keyof typeof LOCK_SQL;
 
@@ -1435,8 +1471,9 @@ const includeOption = (model: ModelName): string[] =>
  * paging. Not modelled: VarChar length limits, `distinct`, Postgres' own ordering of ties.
  *
  * Raw SQL. `tx.$queryRaw` inside a transaction understands exactly the LOCK_SQL row locks,
- * recorded in `locks`; the root `$queryRaw` answers only the health check's `SELECT 1`. Any
- * other raw SQL, `$queryRawUnsafe` and `$executeRaw*` reject with UnsupportedByFakeError.
+ * recorded in `locks`; `tx.$executeRaw` exactly LOCK_TIMEOUT_SQL, recorded in `lockTimeouts`;
+ * the root `$queryRaw` answers only the health check's `SELECT 1`. Any other raw SQL,
+ * `$queryRawUnsafe` and `$executeRawUnsafe` reject with UnsupportedByFakeError.
  *
  * Transactions model exactly this:
  * - Atomicity. The callback gets its own transaction client. Every write made through it is
@@ -1496,6 +1533,8 @@ export function inMemoryAuthDb(
 
   /** Every LOCK_SQL row lock taken, in call order (never undone by a rollback). */
   const locks: FakeLock[] = [];
+  /** Every LOCK_TIMEOUT_SQL statement run, in call order. */
+  const lockTimeouts: FakeLockTimeout[] = [];
 
   /** The undo log of the transaction whose client call is running right now, if any. */
   let activeLog: Undo[] | null = null;
@@ -2080,6 +2119,25 @@ export function inMemoryAuthDb(
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
   });
+  /** `$executeRaw`: exactly LOCK_TIMEOUT_SQL, inside a transaction. */
+  const $executeRaw = vi.fn((strings: unknown, ...values: unknown[]): Promise<number> => {
+    try {
+      if (!Array.isArray(strings) || !('raw' in strings)) {
+        throw unsupported('$executeRaw without a tagged template');
+      }
+      const sql = rawSqlText(strings as readonly string[]);
+      if (sql !== LOCK_TIMEOUT_SQL || values.length > 0) {
+        throw unsupported(`$executeRaw ${show(sql)} (only ${LOCK_TIMEOUT_SQL}, in a transaction)`);
+      }
+      if (activeTx === null) {
+        throw unsupported(`$executeRaw: ${LOCK_TIMEOUT_SQL} outside an interactive transaction`);
+      }
+      lockTimeouts.push({ locksBefore: locks.length });
+      return Promise.resolve(0);
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
   const rejectRaw = (name: string) =>
     vi.fn((): Promise<never> =>
       Promise.reject(unsupported(`${name} (use LOCK_SQL via $queryRaw)`)),
@@ -2087,7 +2145,7 @@ export function inMemoryAuthDb(
   const rawSpies = {
     $queryRaw,
     $queryRawUnsafe: rejectRaw('$queryRawUnsafe'),
-    $executeRaw: rejectRaw('$executeRaw'),
+    $executeRaw,
     $executeRawUnsafe: rejectRaw('$executeRawUnsafe'),
   };
 
@@ -2189,12 +2247,13 @@ export function inMemoryAuthDb(
    * `spies` are the vi.fn delegates and raw-query functions behind `prisma` (and every
    * transaction client); the store arrays (`admins`, `refreshTokens`, `auditLogs`, `movies`,
    * `screens`, `showtimes`, `settings`) are the live tables; `locks` lists the LOCK_SQL row
-   * locks taken, in order.
+   * locks taken, in order, and `lockTimeouts` the LOCK_TIMEOUT_SQL statements.
    */
   return {
     prisma,
     ...store,
     locks,
+    lockTimeouts,
     spies: { ...delegates, ...rawSpies, $transaction },
     addMovie,
     addScreen,
