@@ -4,6 +4,7 @@ import { apiErrorSchema, ERROR_CODES } from '@sk-cinema/shared';
 import { pino, type Logger } from 'pino';
 import request from 'supertest';
 import { expect, vi } from 'vitest';
+import type { PrismaClient } from '../../generated/prisma/client.js';
 import type { AdminRole } from '../../generated/prisma/enums.js';
 import { CSRF_HEADER } from '../../middleware/csrf.js';
 import {
@@ -34,15 +35,20 @@ const ADMIN_PASSWORD = 'correct horse battery staple';
 export interface SignedInOptions {
   role?: AdminRole;
   logger?: Logger;
+  /** The client the app uses, e.g. testPrisma() wrapped by interceptDb. Default: testPrisma(). */
+  prisma?: PrismaClient;
 }
 
 /** An app on the test database and a signed-in admin: requests carry its session and CSRF token. */
-export async function signedInAdmin({ role = 'EDITOR', logger }: SignedInOptions = {}) {
+export async function signedInAdmin({ role = 'EDITOR', logger, prisma }: SignedInOptions = {}) {
   const email = `pg-${randomUUID()}@skcinema.lk`;
   const admin = await testPrisma().admin.create({
     data: { email, name: 'PG', role, passwordHash: await testPasswordHash(ADMIN_PASSWORD) },
   });
-  const { app } = buildTestApp({ prisma: testPrisma(), ...(logger !== undefined && { logger }) });
+  const { app, cache } = buildTestApp({
+    prisma: prisma ?? testPrisma(),
+    ...(logger !== undefined && { logger }),
+  });
   const client = await authClient(app);
   const login = await client.post('/auth/login', { body: { email, password: ADMIN_PASSWORD } });
   expect(login.status).toBe(200);
@@ -50,6 +56,8 @@ export async function signedInAdmin({ role = 'EDITOR', logger }: SignedInOptions
   return {
     admin,
     app,
+    /** The app's own cache, to see what a request kept or dropped. */
+    cache,
     get: (path: string) => client.get(path, [session.access]),
     post: (path: string, body: object) => client.post(path, { cookies: [session.access], body }),
     patch: (path: string, body: object) =>

@@ -2,6 +2,7 @@ import { describe } from 'vitest';
 import type { PrismaClient } from '../../generated/prisma/client.js';
 import { createPrismaClient } from '../../lib/prisma.js';
 import { assertSafeTestDatabaseUrl, resolveTestDatabaseUrl } from './guard.js';
+import { resetDatabaseOn } from './reset.js';
 
 /**
  * Helpers for real-Postgres tests (`*.pg.test.ts`, run by `pnpm --filter @sk-cinema/api test:pg`).
@@ -38,18 +39,11 @@ export function testPrisma(): PrismaClient {
   return client;
 }
 
-/**
- * Empties every app table (all tables in the current schema except `_prisma_migrations`) with
- * one TRUNCATE ... RESTART IDENTITY CASCADE. Use in beforeEach.
- */
+/** Empties every app table. Use in beforeEach. */
 export async function resetDatabase(): Promise<void> {
   const prisma = testPrisma();
-  const tables = await prisma.$queryRaw<{ tablename: string }[]>`
-    SELECT tablename FROM pg_tables
-    WHERE schemaname = current_schema() AND tablename <> '_prisma_migrations'`;
-  if (tables.length === 0) return;
-  const list = tables.map(({ tablename }) => `"${tablename.replaceAll('"', '""')}"`).join(', ');
-  await prisma.$executeRawUnsafe(`TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`);
+  if (pgTestDatabaseUrl === undefined) throw new Error('resetDatabase() needs TEST_DATABASE_URL');
+  await resetDatabaseOn(prisma, assertSafeTestDatabaseUrl(pgTestDatabaseUrl, process.env));
 }
 
 /** Closes the shared client. Use in afterAll. */

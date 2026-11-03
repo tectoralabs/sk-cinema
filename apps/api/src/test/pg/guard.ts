@@ -66,20 +66,33 @@ function parsePostgresUrl(url: string): URL | undefined {
   }
 }
 
-function targetOf(parsed: URL): DbTarget {
-  let database: string;
-  try {
-    database = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
-  } catch {
-    database = parsed.pathname.replace(/^\//, '');
-  }
+/**
+ * The database name exactly as written in the URL: the first path segment of the raw string,
+ * before any decoding or normalisation. `new URL()` is not used for this because it strips tabs
+ * and newlines and re-encodes the rest, while the pg driver and libpq decode `%00` and split the
+ * startup packet at the NUL (so a URL can be judged as one name and open another).
+ */
+function rawDatabaseName(url: string): string {
+  const afterScheme = url.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, '');
+  const pathStart = afterScheme.search(/[/?#]/);
+  if (pathStart === -1 || afterScheme[pathStart] !== '/') return '';
+  const path = afterScheme.slice(pathStart + 1);
+  const end = path.search(/[?#]/);
+  return end === -1 ? path : path.slice(0, end);
+}
+
+function targetOf(parsed: URL, rawName: string): DbTarget {
   return {
     // URL keeps IPv6 hosts bracketed ("[::1]").
     host: parsed.hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1'),
     port: parsed.port || DEFAULT_PG_PORT,
-    database,
+    database: rawName,
   };
 }
+
+/** The only shape a test database name may have: plain identifier characters, ending in _test. */
+const TEST_DATABASE_NAME = /^[A-Za-z0-9_]+_test$/;
+const PLAIN_IDENTIFIER = /^[A-Za-z0-9_]+$/;
 
 function sameTarget(a: DbTarget, b: DbTarget): boolean {
   return a.host === b.host && a.port === b.port && a.database === b.database;
@@ -109,7 +122,12 @@ export function assertSafeTestDatabaseUrl(url: string, env: Env = {}): string {
     );
   }
 
-  const target = targetOf(parsed);
+  // eslint-disable-next-line no-control-regex -- refusing control characters is the point
+  if (/[\x00-\x20\x7f]/.test(url.trim())) {
+    throw new UnsafeTestDatabaseError('the URL contains a space or control character');
+  }
+
+  const target = targetOf(parsed, rawDatabaseName(url.trim()));
   if (!ALLOWED_TEST_DB_HOSTS.includes(target.host)) {
     throw new UnsafeTestDatabaseError(
       `host "${target.host}" is not one of ${ALLOWED_TEST_DB_HOSTS.join(', ')}`,
@@ -124,7 +142,18 @@ export function assertSafeTestDatabaseUrl(url: string, env: Env = {}): string {
     }
   }
 
-  if (!target.database.endsWith('_test') || target.database === '_test') {
+  // Judged on the raw text, never on a decoded form, and never echoed: a name with an escape,
+  // NUL, dot, space or any other character may open a different database than the one judged.
+  if (target.database === '') {
+    throw new UnsafeTestDatabaseError('the URL has no database name');
+  }
+  if (!PLAIN_IDENTIFIER.test(target.database)) {
+    throw new UnsafeTestDatabaseError(
+      'the database name contains characters other than letters, digits and "_" ' +
+        '(no percent escapes, NUL, dots, spaces or lookalikes)',
+    );
+  }
+  if (!TEST_DATABASE_NAME.test(target.database)) {
     throw new UnsafeTestDatabaseError(`database name "${target.database}" does not end in "_test"`);
   }
 
@@ -132,7 +161,10 @@ export function assertSafeTestDatabaseUrl(url: string, env: Env = {}): string {
     const appUrl = env[name]?.trim();
     if (!appUrl) continue;
     const appParsed = parsePostgresUrl(appUrl);
-    if (appUrl === url.trim() || (appParsed && sameTarget(targetOf(appParsed), target))) {
+    if (
+      appUrl === url.trim() ||
+      (appParsed && sameTarget(targetOf(appParsed, rawDatabaseName(appUrl)), target))
+    ) {
       throw new UnsafeTestDatabaseError(`it points at the same database as ${name}`);
     }
   }

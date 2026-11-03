@@ -70,9 +70,8 @@ describePg('bulk showtime create at its edges through the route on real Postgres
         times: ['15:35', '23:00'],
       })
       .then((res) => res);
-    let waitedOn: string;
     try {
-      waitedOn = await untilLockWaiter(WAITING_ON_SCREEN_LOCK);
+      await untilLockWaiter(WAITING_ON_SCREEN_LOCK);
       // 15:40 in Colombo: 15:35 is gone, 23:00 is not.
       vi.setSystemTime(new Date('2026-11-01T10:10:00.000Z'));
     } finally {
@@ -81,7 +80,6 @@ describePg('bulk showtime create at its edges through the route on real Postgres
     }
     const res = await responded;
 
-    expect(waitedOn).toMatch(WAITING_ON_SCREEN_LOCK);
     expect(res.status).toBe(400);
     expect(showtimePastSlotErrorSchema.parse(res.body).error).toEqual({
       code: ERROR_CODES.VALIDATION_ERROR,

@@ -40,10 +40,17 @@ describe('assertSafeTestDatabaseUrl', () => {
 
   it.each([
     ['a bare "_test"', 'postgresql://u:p@localhost/_test'],
-    ['no database name', 'postgresql://u:p@localhost:55432'],
     ['"_test" only in a parameter', 'postgresql://u:p@localhost/sk_cinema?schema=x_test'],
   ])('refuses %s', (_label, url) => {
     expect(() => assertSafeTestDatabaseUrl(url)).toThrow(/does not end in "_test"/);
+  });
+
+  it.each([
+    ['no database name', 'postgresql://u:p@localhost:55432'],
+    ['an empty database name', 'postgresql://u:p@localhost:55432/'],
+    ['an empty name with a query', 'postgresql://u:p@localhost:55432/?schema=public'],
+  ])('refuses %s', (_label, url) => {
+    expect(() => assertSafeTestDatabaseUrl(url)).toThrow('the URL has no database name');
   });
 
   it.each([
@@ -91,6 +98,94 @@ describe('assertSafeTestDatabaseUrl', () => {
       DIRECT_URL: 'postgresql://app:secret@localhost:55432/sk_cinema',
     };
     expect(assertSafeTestDatabaseUrl(LOCAL_URL, env)).toBe('sk_cinema_test');
+  });
+
+  describe('the raw database name is what is judged (S5-05)', () => {
+    const NOT_PLAIN = /characters other than letters, digits and "_"/;
+
+    it.each([
+      [
+        'the NUL decoy that opens the real name before it',
+        'sk_cinema_test%00application_name%00decoy_test',
+      ],
+      ['%00 at the end', 'sk_cinema_test%00'],
+      ['%00 at the start', '%00sk_cinema_test'],
+      ['lower-case %00 in the middle', 'sk%00_cinema_test'],
+      ['an encoded slash', 'sk_cinema%2f_test'],
+      ['an upper-case encoded slash', 'prod%2Fsk_test'],
+      ['an encoded underscore', 'sk_cinema%5ftest'],
+      ['an encoded underscore in the suffix', 'sk_cinema%5Ftest'],
+      ['an encoded letter', 'sk_cinema_%74est'],
+      ['a name that ends _test only after an encoded part', 'production%5f%74est'],
+      ['an encoded dot', 'sk_cinema%2e_test'],
+      ['a trailing dot', 'sk_cinema_test.'],
+      ['a dot inside', 'sk.cinema_test'],
+      ['a trailing encoded space', 'sk_cinema_test%20'],
+      ['a trailing plus', 'sk_cinema_test+'],
+      ['a hyphen', 'sk-cinema_test'],
+      ['a fullwidth underscore', 'sk_cinema\uff3ftest'],
+      ['a Cyrillic "e" lookalike', 'sk_cinema_t\u0435st'],
+      ['a Cyrillic "s" lookalike', 'sk_cinema_te\u0455t'],
+      ['a literal unicode letter', 'sk_cinema_t\u00e9st'],
+      ['a literal percent', 'sk_cinema%_test'],
+    ])('refuses %s', (_label, name) => {
+      expect(() => assertSafeTestDatabaseUrl(`postgresql://u:p@localhost:55432/${name}`)).toThrow(
+        NOT_PLAIN,
+      );
+    });
+
+    it.each([
+      ['a space after the name', 'postgresql://u:p@localhost:55432/sk_cinema_test x'],
+      ['a literal tab', 'postgresql://u:p@localhost:55432/sk_cinema\t_test'],
+      ['a literal newline', 'postgresql://u:p@localhost:55432/sk_cinema_test\nx_test'],
+      ['a literal NUL', 'postgresql://u:p@localhost:55432/sk_cinema_test\u0000x_test'],
+      ['a space in the middle', 'postgresql://u:p@localhost:55432/sk cinema_test'],
+    ])('refuses %s anywhere in the URL', (_label, url) => {
+      expect(() => assertSafeTestDatabaseUrl(url)).toThrow('space or control character');
+    });
+
+    it('refuses a name hidden behind a second path segment', () => {
+      expect(() =>
+        assertSafeTestDatabaseUrl('postgresql://u:p@localhost:55432/a/sk_cinema_test'),
+      ).toThrow(NOT_PLAIN);
+    });
+
+    it('refuses a name smuggled in the fragment', () => {
+      expect(() =>
+        assertSafeTestDatabaseUrl('postgresql://u:p@localhost:55432/prod#x_test'),
+      ).toThrow(/does not end in "_test"/);
+    });
+
+    it('refuses a name smuggled in the query', () => {
+      expect(() =>
+        assertSafeTestDatabaseUrl('postgresql://u:p@localhost:55432/prod?application_name=x_test'),
+      ).toThrow(/does not end in "_test"/);
+    });
+
+    it('accepts a plain mixed-case name with digits (t18b_fresh_test style)', () => {
+      expect(assertSafeTestDatabaseUrl('postgresql://u:p@localhost:55432/T18b_fresh_2_test')).toBe(
+        'T18b_fresh_2_test',
+      );
+    });
+
+    it('judges the DATABASE_URL comparison on the raw name too', () => {
+      const env = { DATABASE_URL: 'postgresql://app:x@localhost:55432/sk_cinema%5ftest' };
+      expect(assertSafeTestDatabaseUrl(LOCAL_URL, env)).toBe('sk_cinema_test');
+    });
+
+    it('never echoes the URL, the password or the offending name', () => {
+      const url = 'postgresql://u:hunter2-secret@localhost:55432/sk_cinema_test%00decoy_test';
+      let message = '';
+      try {
+        assertSafeTestDatabaseUrl(url);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toMatch(NOT_PLAIN);
+      expect(message).not.toContain('hunter2');
+      expect(message).not.toContain('decoy');
+      expect(message).not.toContain('%00');
+    });
   });
 
   it('never echoes the password in the error message', () => {
